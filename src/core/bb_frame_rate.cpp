@@ -2,34 +2,49 @@
 // SPDX-FileCopyrightText: Copyright 2026 bbport contributors (deadinside28/bloodborne_pc)
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Ported from bbport 0.7 (gpu/shim/bbport_frame_rate.cpp and gpu/shim/bbport_guest_code.h,
-// https://github.com/deadinside28/bloodborne_pc). Its notes, shortened:
+// Bloodborne 1.09's frame rate, changed while the game runs, built on the community's 90 FPS++
+// patch (by Kyo, from shadPS4's patch repository, built in: bb_frame_rate_90fps.inc, so that it
+// does not depend on the version in a user's patch file; theirs are left out).
 //
-// The game's main loop (0x2018d20) runs its frame pacer (0x2034770: it waits for the frame time
-// its mode asks, 1/30 s, and measures the frame at [pacer + 0x264]) and then steps the game by a
-// fixed 1/30 s (0x2018e36). The hooks keep the pacer's mode at one vblank and no frame time to
-// wait for beyond the shortest frame, and step the game by the measured frame time (1/480 to
-// 1/30 s: below 30 FPS the game slows down, as it always did).
+// The 60 to 960 FPS++ patches are one patch: the same writes, of which only these depend on the
+// frame rate r (each matches all the published rates exactly): 1/r frame times (three steps, and
+// the frame pacer's target four times), counters of r/6 and r/3 frames, the pacer's wait of
+// 990000/r us, 0.5/r, 3/r (four times), the frame time as five digits (1000000/r), and a table in
+// the patch's own code area (0.8, 1.2 and 0.65 to the power 30/r; 30/r, +-1/r, +-1.5/r, +-3/r, r).
+// Besides those, the patch sets about 70 of the game's fixed 1/30 s steps (subsystems stepped
+// once a frame: scenery, effects, small simulations) to 1/60 at every rate, too fast above 60 FPS.
 //
-// What the game ties to a 30 FPS frame besides: subsystems stepped by a fixed 1/30 s, per-frame
-// steps and approaches, per-frame damping. Their instructions read the constant from a page next
-// to the image instead (the instruction's own address operand moved; the game's code is otherwise
-// as it was), where FrameStep writes the value for this frame's time: a step of 1/30 s becomes
-// the frame's time, a per-frame factor f becomes f^frames for the frame's length in 30 FPS frames.
-// Durations the game converts from 30 FPS frames into seconds stay as they are: what counts them
-// down uses the real time.
+// Here: the 90 FPS++ patch is written once at the start (as published, but for the corpses' body
+// parts: the game's own timers kept, see BodyPartWrites), and all of the values above are written
+// for the frame rate: the pacer's for the cap (FPS cap in F1, changed at once), the steps and
+// factors for the frame rate the game holds (the cap, or less while it cannot keep up). The
+// game's main loop steps by the frame's real time (the patch's), its pacer waits for the cap.
+//
+// From bbport 0.7 (https://github.com/deadinside28/bloodborne_pc, ported earlier): the guest code
+// emitter, the detours, the cloth's stiffness hook, and the per-frame ramp (0x4927fd4/0x4927fe0).
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <map>
-#include <new>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 #include "common/bb_tuning.h"
 #include "common/logging/log.h"
@@ -58,23 +73,27 @@ struct Emitter {
         }
         overflow = overflow || size > code.size();
     }
-    void U32(u32 v) {
-        u8 b[4];
-        std::memcpy(b, &v, 4);
-        Bytes({b[0], b[1], b[2], b[3]});
-    }
     void U64(u64 v) {
-        U32(u32(v));
-        U32(u32(v >> 32));
+        for (int i = 0; i < 8; ++i) {
+            Bytes({u8(v >> (i * 8))});
+        }
     }
-    /// Saves the caller-saved general registers (the handler may change them), aligns the stack.
+    /// Saves the caller-saved general registers and xmm0-7 (arguments at a function's entry),
+    /// aligns the stack.
     void SaveVolatile() {
         Bytes({0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53});
-        Bytes({0x41, 0x54});             // push r12 (holds the unaligned stack pointer)
-        Bytes({0x49, 0x89, 0xe4});       // mov r12, rsp
-        Bytes({0x48, 0x83, 0xe4, 0xf0}); // and rsp, -16
+        Bytes({0x41, 0x54});                               // push r12 (the unaligned stack)
+        Bytes({0x49, 0x89, 0xe4});                         // mov r12, rsp
+        Bytes({0x48, 0x83, 0xe4, 0xf0});                   // and rsp, -16
+        Bytes({0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00}); // sub rsp, 128
+        for (u8 x = 0; x < 8; ++x) {                       // movups [rsp + 16x], xmm<x>
+            Bytes({0x0f, 0x11, u8(0x44 | (x << 3)), 0x24, u8(x * 16)});
+        }
     }
     void RestoreVolatile() {
+        for (u8 x = 0; x < 8; ++x) { // movups xmm<x>, [rsp + 16x]
+            Bytes({0x0f, 0x10, u8(0x44 | (x << 3)), 0x24, u8(x * 16)});
+        }
         Bytes({0x4c, 0x89, 0xe4}); // mov rsp, r12
         Bytes({0x41, 0x5c});       // pop r12
         Bytes({0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58});
@@ -89,191 +108,313 @@ struct Emitter {
         Bytes({0xff, 0x25, 0x00, 0x00, 0x00, 0x00});
         U64(target);
     }
-    /// The 32-bit value at `address` into the stack frame's [rbp + offset] (rax kept).
-    void StoreToFrame(const void* address, s8 offset) {
-        Bytes({0x50, 0x48, 0xb8}); // push rax; movabs rax, address
-        U64(reinterpret_cast<u64>(address));
-        Bytes({0x8b, 0x00});                   // mov eax, [rax]
-        Bytes({0x89, 0x45, u8(offset), 0x58}); // mov [rbp + offset], eax; pop rax
-    }
 };
 
-std::atomic<bool> active{false};
-u64 image_base = 0;
+/// Image offsets are the game's addresses less 0x400000 (the patch file's are the addresses).
+constexpr u64 ImageBase = 0x400000;
+/// The farthest the patch writes (its code area's table, the frame time).
+constexpr u64 ImageReach = 0x535a940;
+/// The frame's time as the patched main loop measured it (clamped to 1/30 s), every frame.
+constexpr u64 FrameTimeCell = 0x535a908;
+/// The frame pacer's update, run once a frame on the game's thread, and its first instructions.
+constexpr u64 PacerUpdate = 0x2034770;
+constexpr u8 PacerEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                             0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
 
-constexpr float Frame30 = 1.0f / 30.0f;
-/// The highest frame rate the pacer allows. bbport: the game itself breaks above it (on loading
-/// screens at 880-1000 FPS its main loop outran its worker threads; at 480 all loads went through).
+/// The corpses' body parts (the physics moves them every frame, 0x1515ec0): the patch has their
+/// timers and the step they are given follow the frame's time, and corpses in an area just
+/// entered then move by themselves. The game's 1/30 s per frame kept (patch-file addresses).
+constexpr u64 BodyPartWrites[] = {0x1915f65, 0x1915fab, 0x1916030};
+
+/// Steps the patch sets to 1/60 that stay at it (as the patch has them at every rate): a timer
+/// read twice a frame, and one other (both stepped at 1/60 by the 60 to 960 FPS++ patches).
+constexpr u64 KeptSteps[] = {0x4d2577c, 0x4d27c4c};
+
+/// The 90 FPS++ patch, as published: its values at 90 FPS, checked before any is changed.
+constexpr float Rate90 = 90.0f;
+
+enum class Kind : u8 {
+    InvRate,       ///< 1/r (float)
+    HalfInv,       ///< 0.5/r
+    ThreeInv,      ///< 3/r
+    NegThree,      ///< -3/r
+    Sixth,         ///< r/6 frames (int, at least 5)
+    Third,         ///< r/3 frames (int, at least 10)
+    WaitUs,        ///< 990000/r us (int)
+    Pow08,         ///< 0.8^(30/r)
+    Pow12,         ///< 1.2^(30/r)
+    Pow065,        ///< 0.65^(30/r)
+    ThirtyInv,     ///< 30/r
+    NegInv,        ///< -1/r
+    OneHalfInv,    ///< 1.5/r
+    NegOneHalfInv, ///< -1.5/r
+    Rate,          ///< r
+};
+
+struct Value {
+    u64 address; ///< patch-file address
+    Kind kind;
+    bool pacer; ///< the cap's (the pacer's), else the held frame rate's
+};
+
+/// The values the 60 to 960 FPS++ patches set for their rate (besides the 1/60 steps).
+constexpr u64 Table = 0x5493000;
+constexpr Value Values[] = {
+    {0xf383ca, Kind::InvRate, false},
+    {0x1972a80, Kind::InvRate, false},
+    {0x1c0ca9a, Kind::InvRate, false},
+    {0x1929676, Kind::Sixth, false},
+    {0x192c405, Kind::Third, false},
+    {0x2434845, Kind::InvRate, true}, // the pacer's frame time (its four modes)
+    {0x243485f, Kind::InvRate, true},
+    {0x2434883, Kind::InvRate, true},
+    {0x24348b8, Kind::InvRate, true},
+    {0x25629f1, Kind::WaitUs, true},
+    {0x25df519, Kind::HalfInv, false},
+    {0x4cf6420, Kind::ThreeInv, false},
+    {0x4cf6424, Kind::ThreeInv, false},
+    {0x4cf6428, Kind::ThreeInv, false},
+    {0x4cf642c, Kind::ThreeInv, false},
+    {Table + 0, Kind::Pow08, false},
+    {Table + 16, Kind::Pow12, false},
+    {Table + 32, Kind::Pow065, false},
+    {Table + 48, Kind::ThirtyInv, false},
+    {Table + 64, Kind::NegInv, false},
+    {Table + 80, Kind::OneHalfInv, false},
+    {Table + 96, Kind::NegOneHalfInv, false},
+    {Table + 112, Kind::Rate, false},
+    {Table + 116, Kind::Rate, false},
+    {Table + 120, Kind::Rate, false},
+    {Table + 124, Kind::Rate, false},
+    {Table + 128, Kind::Rate, false},
+    {Table + 132, Kind::Rate, false},
+    {Table + 136, Kind::Rate, false},
+    {Table + 140, Kind::Rate, false},
+    {Table + 144, Kind::Rate, false},
+    {Table + 160, Kind::Rate, false},
+    {Table + 176, Kind::Rate, false},
+    {Table + 192, Kind::Rate, false},
+    {Table + 208, Kind::InvRate, false},
+    {Table + 224, Kind::InvRate, false},
+    {Table + 240, Kind::NegThree, false},
+    {Table + 256, Kind::ThreeInv, false},
+};
+/// The frame time as five digits (1000000/r us), the pacer's.
+constexpr u64 FrameTimeText = 0x4b33c51;
+/// The pacer's own target (one of the patch's 1/60 writes).
+constexpr u64 PacerTarget = 0x243460c;
+/// A value the game ramps by 0.1 a 30 FPS frame (down, up), not in the patch (bbport's).
+constexpr u64 RampDown = 0x4d27fd4, RampUp = 0x4d27fe0;
+
+/// The follow camera (0x183ac60 on): the patch's 12 jumps from its code into the patch's own
+/// routines are left out, the game's camera code kept, and the two weights its follow eases by
+/// each frame (`x += (target - x) * w`, w for 30 FPS: 0.1, read at 0x183af8c, and 1/30, read at
+/// 0x183e2b2) converted for the frame rate, 1 - (1 - w)^(30/r): the camera as the game has it.
+constexpr u64 CameraCode = 0x183a000, CameraCodeEnd = 0x1841000;
+constexpr u64 EaseDistance = 0x4d25e68, EaseChase = 0x4d25e94;
+constexpr float EaseDistanceGame = 0.1f, EaseChaseGame = 1.0f / 30.0f;
+bool camera_eases = false; ///< the game's camera kept: its weights follow the frame rate
+
+/// The patch's main step stores the frame's measured time for the rest of the game to read
+/// (`movss [0x575a908], xmm0`): it moves 15% of the way to it each frame instead, so that uneven
+/// frames do not jolt what reads it (the main step itself keeps the measured time).
+constexpr u64 FrameTimeStore = 0x2418e57;
+constexpr u8 FrameTimeStoreCode[] = {0xf3, 0x0f, 0x11, 0x05, 0xa9, 0x1a, 0x34, 0x03};
+constexpr float FrameTimeEase = 0.15f;
+
+constexpr int MinRate = 30;
+/// The highest frame rate: the game breaks above it (bbport: on loading screens at 880-1000 FPS
+/// its main loop outran its worker threads; at 480 all loads went through).
 constexpr int MaxRate = 480;
 
-/// What the redirected instructions read, rewritten by FrameStep for each frame.
-struct alignas(64) Live {
-    float dt = Frame30;              ///< the frame's time: the game steps by it
-    float shortest = 1.0f / MaxRate; ///< the pacer's frame time target
-    float pad[2] = {};
-    float decay95[4] = {0.95f, 0.95f, 0.95f, 0.95f}; ///< 0.95 per 30 FPS frame (read as four)
-    float approach30 = Frame30;                      ///< a 1/30 approach per 30 FPS frame
-    float approach10 = 0.1f;                         ///< a 0.1 approach per 30 FPS frame
-    float step_down = -0.1f;                         ///< -0.1 per 30 FPS frame
-    float step_up = 0.1f;                            ///< +0.1 per 30 FPS frame
-    float decay08 = 0.8f;                            ///< 0.8 per 30 FPS frame
-    float cloth = 1.0f;                              ///< cloth constraints' stiffness
-    float model_turn = 0.0f; ///< the model preview's turn per 30 FPS frame (per stick unit)
+u64 image_base = 0;
+std::atomic<bool> active{false};
+std::atomic<int> target{60};         ///< the cap (MaxRate: none)
+std::atomic<float> held_rate{60.0f}; ///< the frame rate the game holds (smoothed)
+std::atomic<float> step_rate{60.0f}; ///< the frame rate the steps are set for
+float held = 60.0f;
+int written_target = 0;
+float written_rate = 0.0f;
+int drift_frames = 0;
+std::vector<u64> steps; ///< the 1/60 steps set to 1/r (patch-file addresses)
+struct PatchWrite {
+    u64 address; ///< patch-file address
+    u32 size;
+    u32 at; ///< in NinetyBytes
 };
-Live* live = nullptr;
-float model_turn_base = 0.0f; ///< the game's own model_turn (its constant, read at start)
+#include "core/bb_frame_rate_90fps.inc"
 
-/// The pacer at the main loop's step (rdi: it): this frame's values. On the game's thread.
-void PS4_SYSV_ABI FrameStep(u64 pacer) {
-    const float measured = *reinterpret_cast<const float*>(pacer + 0x264);
-    const float dt =
-        std::clamp(std::isfinite(measured) ? measured : Frame30, live->shortest, Frame30);
-    const float frames = dt * 30.0f; // the frame's length in 30 FPS frames
-    live->dt = dt;
-    const float decay95 = std::pow(0.95f, frames);
-    for (float& d : live->decay95) {
-        d = decay95;
+/// The built-in 90 FPS++ patch's writes.
+std::vector<std::pair<u64, std::vector<u8>>> patch = [] {
+    std::vector<std::pair<u64, std::vector<u8>>> writes;
+    for (const PatchWrite& w : NinetyWrites) {
+        writes.emplace_back(w.address,
+                            std::vector<u8>(NinetyBytes + w.at, NinetyBytes + w.at + w.size));
     }
-    live->approach30 = 1.0f - std::pow(1.0f - Frame30, frames);
-    live->approach10 = 1.0f - std::pow(0.9f, frames);
-    live->step_down = -0.1f * frames;
-    live->step_up = 0.1f * frames;
-    live->decay08 = std::pow(0.8f, frames);
-    live->model_turn = model_turn_base * frames;
-    // The cloth setups' range checks and a few uses of 1.0 next to them: the game's 1.0. The cloth
-    // follows the frame rate by its constraints' stiffness factor instead (ClothStiffnessFactor).
-    live->cloth = 1.0f;
+    return writes;
+}();
+
+u8* At(u64 address) {
+    return reinterpret_cast<u8*>(image_base + (address - ImageBase));
 }
 
-/// The game's exponent of Havok's stiffness adaptation (0x48d7bbc: -1.725), read at start.
-float cloth_exponent = -1.725f;
-
-/// Havok's stiffness factor of a constraint set for one substep (0x1167a80, replaced): `mode` 2
-/// adapts the constraints' stiffness to how often they are solved, (substeps x a x b)^-1.725, for a
-/// set of type 8 the iteration's share instead and for types 5 and 10 only the last substep. The
-/// substeps are per frame: at 191 FPS the cloth is solved 6.4 times as often as at 30 FPS by the
-/// same factor, and stiffer by as much (it flutters). The factor here is the game's x frames (the
-/// frame's length in 30 FPS frames): the cloth is pulled as far per second as at 30 FPS. At 30 FPS
-/// it is the game's.
-float PS4_SYSV_ABI ClothStiffnessFactor(const u8* set, int mode, int iteration, int substeps,
-                                        float a, float b) {
-    const u32 type = *reinterpret_cast<const u32*>(set + 0x18);
-    const bool adapts = mode == 2 && !(substeps == 1 && a == 1.0f && b == 1.0f);
-    if (adapts && type == 8) {
-        return float(iteration + 1) / float(substeps);
-    }
-    if (adapts && (type == 5 || type == 10)) {
-        return substeps - 1 == iteration ? 1.0f : 0.0f;
-    }
-    const float game = adapts ? std::pow(float(substeps) * a * b, cloth_exponent) : 1.0f;
-    if (type == 5 || type == 8 || type == 10) {
-        return game;
-    }
-    // A constraint solved with stiffness k pulls its particles k of the way per solve: at 30 FPS
-    // k a frame, at any frame rate ~k x frames. x0.5 at 60 FPS, the community's 60 FPS value.
-    return game * (live->dt * 30.0f);
+float F32(const u8* at) {
+    float f;
+    std::memcpy(&f, at, 4);
+    return f;
 }
 
-// ---- Redirected constants: instruction (its RIP-relative operand), the constant, the value ----
-struct Redirect {
-    u64 site;
-    u64 constant;
-    std::size_t value; ///< offsetof(Live, ..)
-};
-#define LIVE(field) offsetof(Live, field)
-constexpr Redirect Redirects[] = {
-    // A fixed 1/30 s step or "one frame":
-    {0xab9f0d, 0x47efdcc, LIVE(dt)}, // a time step, one frame when unset
-    {0xdca3ed, 0x4888688, LIVE(dt)}, // a per-frame budget
-    {0xee596a, 0x48ad65c, LIVE(dt)}, // effects: a fade of at least one frame (three releases)
-    {0xee5a8a, 0x48ad660, LIVE(dt)},
-    {0xee5baa, 0x48ad664, LIVE(dt)},
-    {0xef06f1, 0x48adc08, LIVE(dt)}, // at least one frame
-    {0xef6992, 0x48add28, LIVE(dt)},
-    {0x1044943, 0x48cc3f4, LIVE(dt)}, // an update by one frame
-    {0x12a4416, 0x492577c, LIVE(dt)}, // a timer advanced by one frame each frame
-    {0x15dc1f7, 0x4926c9c, LIVE(dt)},
-    {0x173456e, 0x49270e4, LIVE(dt)}, // an update by one frame
-    {0x17f9d26, 0x4927554, LIVE(dt)},
-    {0x180f647, 0x49275f4, LIVE(dt)}, // a timer advanced by one frame each frame
-    {0x18bc4f7, 0x4927c4c, LIVE(dt)}, // an update by one frame (twice)
-    {0x18bc50d, 0x4927c4c, LIVE(dt)},
-    {0x1dbc308, 0x4928e98, LIVE(dt)}, // frames counted at one frame's time
-    {0x1f77d4a, 0x4929170, LIVE(dt)}, // an update by one frame (0 after a reset)
-    {0x227784b, 0x4929b80, LIVE(dt)}, // timers advanced by one frame (0xebbda0)
-    {0x2277892, 0x4929b80, LIVE(dt)},
-    {0x2313dad, 0x4929e70, LIVE(dt)}, // a simulation step: 1/60 in the game's 60 Hz mode,
-    {0x2313db7, 0x4929e74, LIVE(dt)}, // 1/30 otherwise
-    {0x2315d71, 0x4929e74, LIVE(dt)},
-    // Body parts the physics moves (0x1515ec0, each part every frame): their timers advanced by
-    // the step they are given, 1/30 s.
-    {0x1515fab, 0x4926364, LIVE(dt)},
-    {0x1516030, 0x4926364, LIVE(dt)},
-    // Steps and approaches per frame:
-    {0x19084f5, 0x4927fd4, LIVE(step_down)}, // a value ramped by 0.1 a frame
-    {0x1908522, 0x4927fd4, LIVE(step_down)},
-    {0x1908518, 0x4927fe0, LIVE(step_up)},
-    {0x190854c, 0x4927fe0, LIVE(step_up)},
-    {0x143e2b2, 0x4925e94, LIVE(approach30)}, // the follow camera's approaches
-    {0x143af8c, 0x4925e68, LIVE(approach10)},
-    // Damping per frame:
-    {0x1a4abca, 0x490b5b0, LIVE(decay95)}, // a character's motion (0x1a4a730, x0.95 a frame)
-    {0x1514c4d, 0x4926334, LIVE(decay08)}, // the run's wall check (x0.8 a frame while blocked)
-    // Cloth constraints' stiffness:
-    {0x47c6dc, 0x47693f0, LIVE(cloth)},
-    {0x7e45be, 0x47b63e4, LIVE(cloth)},
-    {0x7e4642, 0x47b63e4, LIVE(cloth)},
-    {0x7e6239, 0x47b63e4, LIVE(cloth)},
-    {0x7f706d, 0x47b8474, LIVE(cloth)},
-    {0x7f70ad, 0x47b8474, LIVE(cloth)},
-    {0x7f79e5, 0x47b8474, LIVE(cloth)},
-    {0x7f7be8, 0x47b8474, LIVE(cloth)},
-    {0x7f7dbd, 0x47b8474, LIVE(cloth)},
-    {0x805898, 0x47b91c0, LIVE(cloth)},
-    {0x805d18, 0x47b91c0, LIVE(cloth)},
-    {0x806269, 0x47b91c0, LIVE(cloth)},
-    {0x8062f0, 0x47b91c0, LIVE(cloth)},
-    {0x809d62, 0x47b98b8, LIVE(cloth)},
-    {0x80a4c9, 0x47b98b8, LIVE(cloth)},
-    {0x80a876, 0x47b98b8, LIVE(cloth)},
-    // The model preview (0x1db2780: the character creator, the stick turns the model): yaw and
-    // pitch += stick x the constant, per frame.
-    {0x1db27b0, 0x4928dfc, LIVE(model_turn)},
-};
-#undef LIVE
-
-/// The farthest the hooks read or write in the image (the last constant, with room).
-constexpr u64 ImageReach = 0x4929f00;
-
-u8* At(u64 offset) {
-    return reinterpret_cast<u8*>(image_base + offset);
+void Store(u64 address, const void* value, std::size_t size) {
+    std::memcpy(At(address), value, size);
 }
 
-/// The instruction at `r.site` reads `r.constant` RIP-relative (a VEX instruction, no immediate
-/// after the operand): it reads the live value instead.
-bool RedirectOperand(const Redirect& r) {
-    u8* code = At(r.site);
-    std::size_t disp_at = 0, length = 0;
-    if (code[0] == 0xc5 && (code[3] & 0xc7) == 0x05) {
-        disp_at = 4, length = 8;
-    } else if (code[0] == 0xc4 && (code[4] & 0xc7) == 0x05) {
-        disp_at = 5, length = 9;
+void StoreF32(u64 address, float f) {
+    Store(address, &f, 4);
+}
+
+float Evaluate(Kind kind, float r) {
+    switch (kind) {
+    case Kind::InvRate:
+        return 1.0f / r;
+    case Kind::HalfInv:
+        return 0.5f / r;
+    case Kind::ThreeInv:
+        return 3.0f / r;
+    case Kind::NegThree:
+        return -3.0f / r;
+    case Kind::Pow08:
+        return std::pow(0.8f, 30.0f / r);
+    case Kind::Pow12:
+        return std::pow(1.2f, 30.0f / r);
+    case Kind::Pow065:
+        return std::pow(0.65f, 30.0f / r);
+    case Kind::ThirtyInv:
+        return 30.0f / r;
+    case Kind::NegInv:
+        return -1.0f / r;
+    case Kind::OneHalfInv:
+        return 1.5f / r;
+    case Kind::NegOneHalfInv:
+        return -1.5f / r;
+    case Kind::Rate:
+        return r;
+    default:
+        return 0.0f;
+    }
+}
+
+s32 EvaluateInt(Kind kind, float r) {
+    switch (kind) {
+    case Kind::Sixth:
+        return std::max(5, int(r / 6.0f));
+    case Kind::Third:
+        return std::max(10, int(r / 3.0f));
+    case Kind::WaitUs:
+        return s32(990000.0f / r);
+    default:
+        return 0;
+    }
+}
+
+bool IsInt(Kind kind) {
+    return kind == Kind::Sixth || kind == Kind::Third || kind == Kind::WaitUs;
+}
+
+void WriteValue(const Value& v, float r) {
+    if (IsInt(v.kind)) {
+        const s32 i = EvaluateInt(v.kind, r);
+        Store(v.address, &i, 4);
     } else {
-        return false;
+        StoreF32(v.address, Evaluate(v.kind, r));
     }
-    s32 disp = 0;
-    std::memcpy(&disp, code + disp_at, 4);
-    const u64 next = image_base + r.site + length;
-    if (next + s64(disp) != image_base + r.constant) {
-        return false;
+}
+
+/// The patch as published holds its 90 FPS values where they are expected (another version of
+/// it, or another patch, would be changed blindly otherwise).
+bool PatchIsExpected() {
+    for (const Value& v : Values) {
+        if (IsInt(v.kind)) {
+            s32 i;
+            std::memcpy(&i, At(v.address), 4);
+            if (i != EvaluateInt(v.kind, Rate90)) {
+                return false;
+            }
+        } else if (std::fabs(F32(At(v.address)) - Evaluate(v.kind, Rate90)) >
+                   1e-4f * std::max(1.0f, std::fabs(Evaluate(v.kind, Rate90)))) {
+            return false;
+        }
     }
-    const s64 to = s64(reinterpret_cast<u64>(live) + r.value) - s64(next);
-    if (to != s32(to)) {
-        return false;
+    return std::memcmp(At(FrameTimeText), "11111", 5) == 0 &&
+           std::fabs(F32(At(RampDown)) + 0.1f) < 1e-6f && std::fabs(F32(At(RampUp)) - 0.1f) < 1e-6f;
+}
+
+/// The pacer's values for the cap.
+void WritePacer(int cap) {
+    const float r = float(cap);
+    for (const Value& v : Values) {
+        if (v.pacer) {
+            WriteValue(v, r);
+        }
     }
-    const s32 to32 = s32(to);
-    std::memcpy(code + disp_at, &to32, 4);
-    return true;
+    StoreF32(PacerTarget, 1.0f / r);
+    char text[8];
+    std::snprintf(text, sizeof(text), "%05d", std::min(99999, int(1000000.0f / r)));
+    Store(FrameTimeText, text, 5);
+    written_target = cap;
+}
+
+/// The steps and per-frame factors for the frame rate the game holds.
+void WriteSteps(float r) {
+    for (const Value& v : Values) {
+        if (!v.pacer) {
+            WriteValue(v, r);
+        }
+    }
+    for (const u64 address : steps) {
+        StoreF32(address, 1.0f / r);
+    }
+    StoreF32(RampDown, -3.0f / r);
+    StoreF32(RampUp, 3.0f / r);
+    if (camera_eases) {
+        StoreF32(EaseDistance, 1.0f - std::pow(1.0f - EaseDistanceGame, 30.0f / r));
+        StoreF32(EaseChase, 1.0f - std::pow(1.0f - EaseChaseGame, 30.0f / r));
+    }
+    written_rate = r;
+    step_rate.store(r, std::memory_order_relaxed);
+}
+
+/// The frame rate the steps follow: the cap while the game holds it, else what it holds (in
+/// steps of 5 FPS, so that they are not rewritten every frame).
+float Wanted(float rate, int cap) {
+    if (rate >= float(cap) * 0.95f) {
+        return float(cap);
+    }
+    return std::clamp(std::round(rate / 5.0f) * 5.0f, float(MinRate), float(cap));
+}
+
+/// Each frame, at the pacer's update (the game's thread, before the pacer's code runs).
+void PS4_SYSV_ABI FrameTick() {
+    const int cap = target.load(std::memory_order_relaxed);
+    if (cap != written_target) {
+        WritePacer(cap);
+    }
+    const float frame = F32(At(FrameTimeCell + ImageBase));
+    if (frame > 0.0f && std::isfinite(frame)) {
+        const float rate = std::clamp(1.0f / frame, float(MinRate), float(cap));
+        held += (rate - held) * 0.1f;
+        held_rate.store(held, std::memory_order_relaxed);
+    }
+    const float wanted = Wanted(held, cap);
+    if (wanted == written_rate) {
+        drift_frames = 0;
+        return;
+    }
+    // A cap change at once; a change of the held frame rate once it lasts (rising sooner).
+    const bool cap_change = written_rate > float(cap) || wanted == float(cap);
+    if (cap_change || ++drift_frames >= (wanted > written_rate ? 30 : 60)) {
+        WriteSteps(wanted);
+        drift_frames = 0;
+    }
 }
 
 // ---- Detours: the instructions at a site replaced by a jump to a stub ----
@@ -281,10 +422,10 @@ u8* stub_page = nullptr;
 std::size_t stub_used = 0;
 constexpr std::size_t StubPageSize = 4096;
 
-/// `e` into the stub page; a jump to it at `site` over `length` bytes (the rest int3) if the site
-/// holds `expected`.
+/// `e` into the stub page; a jump to it at image offset `site` over `length` bytes (the rest int3)
+/// if the site holds `expected`.
 bool Detour(u64 site, const u8* expected, std::size_t length, const Emitter& e) {
-    u8* code = At(site);
+    u8* code = reinterpret_cast<u8*>(image_base + site);
     if (length < 5 || std::memcmp(code, expected, length) != 0 || e.overflow ||
         stub_used + e.size > StubPageSize) {
         return false;
@@ -305,85 +446,78 @@ bool Detour(u64 site, const u8* expected, std::size_t length, const Emitter& e) 
     return true;
 }
 
-/// The pacer's mode, after the game chose it (0x203493d, `lea r15, [r12 + 0x268]`; r12 the
-/// pacer): one vblank (+0x10), no flip skipping (+0x14), the shortest frame as the frame time
-/// target (+0x18), no vblank counts to wait for (+0x268, +0x26c).
-bool HookPacerMode() {
-    constexpr u8 code[] = {0x4d, 0x8d, 0xbc, 0x24, 0x68, 0x02, 0x00, 0x00};
-    Emitter e;
-    e.Bytes({0x41, 0xc7, 0x44, 0x24, 0x10, 0x01, 0x00, 0x00, 0x00}); // mov dword [r12 + 0x10], 1
-    e.Bytes({0x41, 0xc6, 0x44, 0x24, 0x14, 0x00});                   // mov byte [r12 + 0x14], 0
-    e.Bytes({0x50, 0x48, 0xb8});                                     // push rax; movabs rax,
-    e.U64(reinterpret_cast<u64>(&live->shortest));                   //   &shortest
-    e.Bytes({0x8b, 0x00});                                           // mov eax, [rax]
-    e.Bytes({0x41, 0x89, 0x44, 0x24, 0x18, 0x58}); // mov [r12 + 0x18], eax; pop rax
-    e.Bytes({0x49, 0xc7, 0x84, 0x24, 0x68, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
-             0x00}); // mov qword [r12 + 0x268], 0
-    for (const u8 b : code) {
-        e.Bytes({b});
-    }
-    e.JmpAbs(image_base + 0x203493d + sizeof(code));
-    return Detour(0x203493d, code, sizeof(code), e);
-}
-
-/// The pacer keeps its one vblank when a frame came late (0x2034d96: `test dl, dl; je; mov eax,
-/// [r12 + 0x10]`, then eax is stored back: 0 when late).
-bool HookPacerLate() {
-    constexpr u8 code[] = {0x84, 0xd2, 0x74, 0x05, 0x41, 0x8b, 0x44, 0x24, 0x10};
-    Emitter e;
-    e.Bytes({0x84, 0xd2});                   // test dl, dl
-    e.Bytes({0x41, 0x8b, 0x44, 0x24, 0x10}); // mov eax, [r12 + 0x10]
-    e.JmpAbs(image_base + 0x2034d9f);
-    return Detour(0x2034d96, code, sizeof(code), e);
-}
-
-/// The main loop's step (0x2018e36: `mov dword [rbp - 0x38], 1/30`, its time; rbx the pacer):
-/// FrameStep, then the frame's time.
-bool HookStep() {
-    constexpr u8 code[] = {0xc7, 0x45, 0xc8, 0x89, 0x88, 0x08, 0x3d};
+/// FrameTick at the pacer's update, then its first instructions.
+bool HookPacer() {
     Emitter e;
     e.SaveVolatile();
-    e.Bytes({0x48, 0x89, 0xdf}); // mov rdi, rbx
-    e.CallAbs(reinterpret_cast<const void*>(&FrameStep));
+    e.CallAbs(reinterpret_cast<const void*>(&FrameTick));
     e.RestoreVolatile();
-    e.StoreToFrame(&live->dt, -0x38);
-    e.JmpAbs(image_base + 0x2018e36 + sizeof(code));
-    return Detour(0x2018e36, code, sizeof(code), e);
+    for (const u8 b : PacerEntry) {
+        e.Bytes({b});
+    }
+    e.JmpAbs(image_base + PacerUpdate + sizeof(PacerEntry));
+    return Detour(PacerUpdate, PacerEntry, sizeof(PacerEntry), e);
 }
 
-/// A subsystem stepped by a fixed 1/30 s (`mov dword [rbp + offset], 1/30` at `site`): by the
-/// frame's time.
-bool HookFixedStep(u64 site, s8 offset) {
-    const u8 code[] = {0xc7, 0x45, u8(offset), 0x89, 0x88, 0x08, 0x3d};
+/// The eased frame time at the patch's store of it (FrameTimeStore).
+bool HookFrameTimeEase() {
+    const u64 site = FrameTimeStore - ImageBase;
+    const u64 cell = image_base + FrameTimeCell;
     Emitter e;
-    e.StoreToFrame(&live->dt, offset);
-    e.JmpAbs(image_base + site + sizeof(code));
-    return Detour(site, code, sizeof(code), e);
+    e.Bytes({0x48, 0x8d, 0x64, 0x24, 0x80}); // lea rsp, [rsp - 128] (past the red zone)
+    e.Bytes({0x50});                         // push rax
+    e.Bytes({0x48, 0x8d, 0x64, 0x24, 0xe0}); // lea rsp, [rsp - 32]
+    e.Bytes({0x0f, 0x11, 0x0c, 0x24});       // movups [rsp], xmm1
+    e.Bytes({0x0f, 0x11, 0x54, 0x24, 0x10}); // movups [rsp + 16], xmm2
+    e.Bytes({0x48, 0xb8});                   // movabs rax, cell
+    e.U64(cell);
+    e.Bytes({0xf3, 0x0f, 0x10, 0x08}); // movss xmm1, [rax]
+    e.Bytes({0x0f, 0x28, 0xd0});       // movaps xmm2, xmm0
+    e.Bytes({0xf3, 0x0f, 0x5c, 0xd1}); // subss xmm2, xmm1
+    e.Bytes({0xf3, 0x0f, 0x59, 0x15}); // mulss xmm2, [rip + ease]
+    const std::size_t ease_disp = e.size;
+    e.Bytes({0, 0, 0, 0});
+    const std::size_t after_mul = e.size;
+    e.Bytes({0xf3, 0x0f, 0x58, 0xca});                         // addss xmm1, xmm2
+    e.Bytes({0xf3, 0x0f, 0x11, 0x08});                         // movss [rax], xmm1
+    e.Bytes({0x0f, 0x10, 0x0c, 0x24});                         // movups xmm1, [rsp]
+    e.Bytes({0x0f, 0x10, 0x54, 0x24, 0x10});                   // movups xmm2, [rsp + 16]
+    e.Bytes({0x48, 0x8d, 0x64, 0x24, 0x20});                   // lea rsp, [rsp + 32]
+    e.Bytes({0x58});                                           // pop rax
+    e.Bytes({0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00}); // lea rsp, [rsp + 128]
+    e.JmpAbs(image_base + site + sizeof(FrameTimeStoreCode));
+    const s32 disp = s32(e.size - after_mul);
+    u8 ease[4];
+    std::memcpy(ease, &FrameTimeEase, 4);
+    e.Bytes({ease[0], ease[1], ease[2], ease[3]});
+    std::memcpy(e.code.data() + ease_disp, &disp, 4);
+    return Detour(site, FrameTimeStoreCode, sizeof(FrameTimeStoreCode), e);
 }
 
-/// The run's wall check (0x1514c24: the distance moved this frame x 30 = a speed at 30 FPS): the
-/// distance divided by the frame's time ([rbp - 0x74], the character update's), a speed at any
-/// frame rate. Above ~90 FPS the per-frame distance fell under the check's threshold and the run
-/// dropped to half speed. 1: done by the hook, 2: a Sprint Fix patch already did it, 0: other code.
-int HookRunSpeed() {
-    constexpr u64 site = 0x1514c24;
-    const u8* code = At(site);
-    constexpr u8 patched[] = {0xc5, 0xfa, 0x5e, 0x45, 0x8c, 0x0f, 0x1f, 0x00}; // vdivss; nop
-    if (std::memcmp(code, patched, sizeof(patched)) == 0) {
-        return 2;
+/// The game's exponent of Havok's stiffness adaptation (0x48d7bbc: -1.725), read at start.
+float cloth_exponent = -1.725f;
+
+/// Havok's stiffness factor of a constraint set for one substep (0x1167a80, replaced; bbport):
+/// `mode` 2 adapts the constraints' stiffness to how often they are solved, (substeps x a x
+/// b)^-1.725, for a set of type 8 the iteration's share instead and for types 5 and 10 only the
+/// last substep. The substeps are per frame: at a higher frame rate the cloth is solved more often
+/// by the same factor and is stiffer by as much (it flutters). The factor here is the game's x
+/// the frame's length in 30 FPS frames: the cloth is pulled as far per second as at 30 FPS.
+float PS4_SYSV_ABI ClothStiffnessFactor(const u8* set, int mode, int iteration, int substeps,
+                                        float a, float b) {
+    const u32 type = *reinterpret_cast<const u32*>(set + 0x18);
+    const bool adapts = mode == 2 && !(substeps == 1 && a == 1.0f && b == 1.0f);
+    if (adapts && type == 8) {
+        return float(iteration + 1) / float(substeps);
     }
-    s32 disp = 0;
-    std::memcpy(&disp, code + 4, 4);
-    if (code[0] != 0xc5 || code[1] != 0xfa || code[2] != 0x59 || code[3] != 0x05 ||
-        image_base + site + 8 + s64(disp) != image_base + 0x492632c) {
-        return 0;
+    if (adapts && (type == 5 || type == 10)) {
+        return substeps - 1 == iteration ? 1.0f : 0.0f;
     }
-    u8 expected[8];
-    std::memcpy(expected, code, 8);
-    Emitter e;
-    e.Bytes({0xc5, 0xfa, 0x5e, 0x45, 0x8c}); // vdivss xmm0, xmm0, [rbp - 0x74]
-    e.JmpAbs(image_base + site + 8);
-    return Detour(site, expected, 8, e) ? 1 : 0;
+    const float game = adapts ? std::pow(float(substeps) * a * b, cloth_exponent) : 1.0f;
+    if (type == 5 || type == 8 || type == 10) {
+        return game;
+    }
+    return game * (30.0f / step_rate.load(std::memory_order_relaxed));
 }
 
 /// Havok's stiffness factor (0x1167a80: `push rbp; mov rbp, rsp; push r15`) by
@@ -391,7 +525,8 @@ int HookRunSpeed() {
 bool HookClothStiffness() {
     constexpr u64 site = 0x1167a80;
     constexpr u8 code[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
-    std::memcpy(&cloth_exponent, At(0x48d7bbc), sizeof(float));
+    std::memcpy(&cloth_exponent, reinterpret_cast<const void*>(image_base + 0x48d7bbc),
+                sizeof(float));
     if (!(cloth_exponent < 0.0f && cloth_exponent > -4.0f)) {
         return false;
     }
@@ -400,112 +535,38 @@ bool HookClothStiffness() {
     return Detour(site, code, sizeof(code), e);
 }
 
-/// The three core sites hold the expected code (checked before any is changed, so that the game
-/// is never left with only some of them).
-bool CoreCodeMatches() {
-    constexpr u8 mode[] = {0x4d, 0x8d, 0xbc, 0x24, 0x68, 0x02, 0x00, 0x00};
-    constexpr u8 late[] = {0x84, 0xd2, 0x74, 0x05, 0x41, 0x8b, 0x44, 0x24, 0x10};
-    constexpr u8 step[] = {0xc7, 0x45, 0xc8, 0x89, 0x88, 0x08, 0x3d};
-    return std::memcmp(At(0x203493d), mode, sizeof(mode)) == 0 &&
-           std::memcmp(At(0x2034d96), late, sizeof(late)) == 0 &&
-           std::memcmp(At(0x2018e36), step, sizeof(step)) == 0;
+/// The pages of `address` to `address + size` writable (the values are rewritten while the game
+/// runs: code and read-only data among them).
+bool Unlock(u64 address, std::size_t size) {
+    const std::uintptr_t at = reinterpret_cast<std::uintptr_t>(At(address));
+    const std::uintptr_t first = at & ~std::uintptr_t(0xfff);
+    const std::uintptr_t end = (at + size + 0xfff) & ~std::uintptr_t(0xfff);
+#ifdef _WIN32
+    DWORD before = 0;
+    return VirtualProtect(reinterpret_cast<void*>(first), end - first, PAGE_EXECUTE_READWRITE,
+                          &before) != 0;
+#else
+    return mprotect(reinterpret_cast<void*>(first), end - first,
+                    PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+#endif
 }
-
-// ---- Frame rate patches ----
-/// The code the core hooks replace (image offsets, sizes).
-constexpr std::pair<u64, u64> CoreSites[] = {{0x203493d, 8}, {0x2034d96, 9}, {0x2018e36, 7}};
 
 bool deciding = false;
-struct PatchWrites {
-    bool core = false;         ///< writes the code the core hooks replace
-    std::set<u64> constants{}; ///< the redirected constants it writes
-};
-std::map<std::string, PatchWrites, std::less<>> patch_writes;
+/// Patches of the patch file that write where the 90 FPS++ patch does: frame rate patches when in
+/// at least FrameRatePatchWrites places (the 30 to 960 FPS++ patches of any version: 80 or more;
+/// others that touch a few, Performance Patch 4, Enemy Control 2, are kept: the frame rate's values
+/// written after them).
+constexpr int FrameRatePatchWrites = 20;
+std::map<std::string, int, std::less<>> patch_overlaps;
 
-/// A frame rate patch: it changes the frame pacer the hooks replace, or more than one of the frame
-/// time constants they redirect (the 30 to 960 FPS++ and Uncap FPS++ patches, and Faster loading
-/// screens, which needs one of them). Others that write one constant (Smaller Hunter) stay, and
-/// that constant keeps the patch's value.
-bool IsFrameRatePatch(const PatchWrites& writes) {
-    return writes.core || writes.constants.size() >= 2;
-}
-
-/// A constant a kept patch writes: its instructions keep reading the patch's value.
-bool KeptPatchWrites(u64 constant) {
-    for (const auto& [name, writes] : patch_writes) {
-        if (!IsFrameRatePatch(writes) && writes.constants.contains(constant)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/// The live limit as the pacer's shortest frame time.
-float ShortestFrame(int fps) {
-    return 1.0f / float(fps > 0 ? std::clamp(fps, 30, MaxRate) : MaxRate);
+int Cap(int fps) {
+    return fps > 0 ? std::clamp(fps, MinRate, MaxRate) : MaxRate;
 }
 
 } // namespace
 
-void Install() {
-    if (!EmulatorSettings.IsBbFrameHooks() || !MemoryPatcher::g_eboot_address) {
-        return;
-    }
-    image_base = MemoryPatcher::g_eboot_address;
-    if (MemoryPatcher::g_eboot_image_size < ImageReach) {
-        LOG_WARNING(Loader, "Frame rate hooks: not installed (not Bloodborne 1.09's image)");
-        return;
-    }
-    if (!CoreCodeMatches()) {
-        LOG_WARNING(Loader, "Frame rate hooks: not installed (the game's frame pacer is not the "
-                            "expected code)");
-        return;
-    }
-    // Both within reach of the game's code: the module's trampoline area, right after its image.
-    void* data = AllocatePatchTrampolineSpace(At(0), sizeof(Live));
-    stub_page = static_cast<u8*>(AllocatePatchTrampolineSpace(At(0), StubPageSize));
-    if (!data || !stub_page) {
-        LOG_WARNING(Loader, "Frame rate hooks: not installed (no memory next to the game's code)");
-        return;
-    }
-    live = new (data) Live{};
-    std::memcpy(&model_turn_base, At(0x4928dfc), sizeof(model_turn_base));
-    live->model_turn = model_turn_base;
-    live->shortest = ShortestFrame(EmulatorSettings.GetBbFpsLimit());
-    // The core first: without all three the game keeps its own frame rate.
-    if (!(HookPacerMode() && HookPacerLate() && HookStep())) {
-        LOG_ERROR(Loader, "Frame rate hooks: the frame pacer's hooks did not fit");
-        return;
-    }
-    active.store(true, std::memory_order_release);
-    const int steps = int(HookFixedStep(0x17f9b71, -0x48)) + int(HookFixedStep(0x1572a7d, -0x30));
-    const int run = HookRunSpeed();
-    const bool cloth = HookClothStiffness();
-    int redirected = 0;
-    for (const Redirect& r : Redirects) {
-        if (KeptPatchWrites(r.constant)) {
-            LOG_INFO(Loader, "Frame rate hooks: {:#x} keeps the value an enabled patch sets",
-                     r.site);
-        } else if (RedirectOperand(r)) {
-            ++redirected;
-        } else {
-            LOG_WARNING(Loader, "Frame rate hooks: {:#x} is not the expected code, left as it is",
-                        r.site);
-        }
-    }
-    LOG_INFO(Loader,
-             "Frame rate hooks: on, limit {:.0f} FPS. {} of 2 fixed steps, {} of {} "
-             "per-frame values follow the frame's time, the run's wall check {}, the cloth's "
-             "stiffness {}",
-             1.0f / live->shortest, steps, redirected, std::size(Redirects),
-             run == 1   ? "by speed"
-             : run == 2 ? "by speed (a Sprint Fix patch did it already)"
-                        : "unchanged (not found)",
-             cloth ? "by solves per second" : "per frame (not found)");
-}
-
 void Prepare() {
-    patch_writes.clear();
+    patch_overlaps.clear();
     auto* param_sfo = Common::Singleton<PSF>::Instance();
     const auto version = param_sfo->GetString("APP_VER").value_or("");
     deciding = EmulatorSettings.IsBbFrameHooks() &&
@@ -514,27 +575,20 @@ void Prepare() {
 }
 
 void CheckPatch(std::string_view name, u64 address, u64 size) {
-    if (!deciding || address < 0x400000) {
+    if (!deciding) {
         return;
     }
-    const u64 begin = address - 0x400000;
-    const u64 end = begin + size;
-    auto it = patch_writes.find(name);
-    if (it == patch_writes.end()) {
-        it = patch_writes.emplace(std::string{name}, PatchWrites{}).first;
-    }
-    PatchWrites& writes = it->second;
-    const bool was = IsFrameRatePatch(writes);
-    for (const auto& [site, length] : CoreSites) {
-        writes.core |= begin < site + length && end > site;
-    }
-    for (const Redirect& r : Redirects) {
-        if (begin < r.constant + 4 && end > r.constant) {
-            writes.constants.insert(r.constant);
+    for (const auto& [at, bytes] : patch) {
+        if (address < at + bytes.size() && address + size > at) {
+            auto it = patch_overlaps.find(name);
+            if (it == patch_overlaps.end()) {
+                it = patch_overlaps.emplace(std::string{name}, 0).first;
+            }
+            if (++it->second == FrameRatePatchWrites) {
+                LOG_INFO(Loader, "Frame rate: patch {} skipped (a frame rate patch)", name);
+            }
+            return;
         }
-    }
-    if (!was && IsFrameRatePatch(writes)) {
-        LOG_INFO(Loader, "Frame rate hooks: patch {} skipped (a frame rate patch)", name);
     }
 }
 
@@ -542,8 +596,99 @@ bool ShouldSkipPatch(std::string_view name) {
     if (!deciding) {
         return false;
     }
-    const auto it = patch_writes.find(name);
-    return it != patch_writes.end() && IsFrameRatePatch(it->second);
+    const auto it = patch_overlaps.find(name);
+    return it != patch_overlaps.end() && it->second >= FrameRatePatchWrites;
+}
+
+void Install() {
+    if (!deciding || !MemoryPatcher::g_eboot_address) {
+        return;
+    }
+    image_base = MemoryPatcher::g_eboot_address;
+    if (MemoryPatcher::g_eboot_image_size < ImageReach) {
+        LOG_WARNING(Loader, "Frame rate: not unlocked (not Bloodborne 1.09's image)");
+        return;
+    }
+    stub_page = static_cast<u8*>(
+        AllocatePatchTrampolineSpace(reinterpret_cast<const void*>(image_base), StubPageSize));
+    if (!stub_page || std::memcmp(reinterpret_cast<const void*>(image_base + PacerUpdate),
+                                  PacerEntry, sizeof(PacerEntry)) != 0) {
+        LOG_WARNING(Loader, "Frame rate: not unlocked (the frame pacer is not the expected code)");
+        return;
+    }
+    // The patch as published, but the body parts' writes.
+    steps.clear();
+    for (const auto& [address, bytes] : patch) {
+        if (address < ImageBase || address - ImageBase + bytes.size() > ImageReach) {
+            LOG_WARNING(Loader, "Frame rate: not unlocked (90 FPS++ writes outside the game)");
+            return;
+        }
+    }
+    // The game's camera weights, before any is changed (else the patch's camera is kept).
+    const bool game_camera = std::fabs(F32(At(EaseDistance)) - EaseDistanceGame) < 1e-6f &&
+                             std::fabs(F32(At(EaseChase)) - EaseChaseGame) < 1e-6f;
+    int kept = 0, camera = 0;
+    for (const auto& [address, bytes] : patch) {
+        if (std::find(std::begin(BodyPartWrites), std::end(BodyPartWrites), address) !=
+            std::end(BodyPartWrites)) {
+            ++kept;
+            continue;
+        }
+        if (game_camera && address >= CameraCode && address < CameraCodeEnd) {
+            ++camera;
+            continue;
+        }
+        Store(address, bytes.data(), bytes.size());
+        constexpr u8 sixtieth[] = {0x89, 0x88, 0x88, 0x3c};
+        if (bytes.size() == 4 && std::memcmp(bytes.data(), sixtieth, 4) == 0 &&
+            address != PacerTarget &&
+            std::find(std::begin(KeptSteps), std::end(KeptSteps), address) == std::end(KeptSteps)) {
+            steps.push_back(address);
+        }
+    }
+    if (!PatchIsExpected()) {
+        LOG_ERROR(Loader, "Frame rate: the 90 FPS++ patch is not the expected version; it is "
+                          "applied as it is, at 90 FPS");
+        return;
+    }
+    // All the values rewritten while the game runs: their pages writable.
+    bool unlocked = Unlock(PacerTarget, 4) && Unlock(FrameTimeText, 5) && Unlock(RampDown, 4) &&
+                    Unlock(RampUp, 4) && Unlock(EaseDistance, 4) && Unlock(EaseChase, 4);
+    for (const Value& v : Values) {
+        unlocked = unlocked && Unlock(v.address, 4);
+    }
+    for (const u64 address : steps) {
+        unlocked = unlocked && Unlock(address, 4);
+    }
+    if (!unlocked) {
+        LOG_ERROR(Loader, "Frame rate: its values cannot be changed while the game runs; 90 FPS");
+        return;
+    }
+    const int cap = Cap(EmulatorSettings.GetBbFpsLimit());
+    target.store(cap, std::memory_order_relaxed);
+    held = float(cap);
+    camera_eases = game_camera;
+    StoreF32(FrameTimeCell + ImageBase, 1.0f / float(cap));
+    WritePacer(cap);
+    WriteSteps(float(cap));
+    const bool cloth = HookClothStiffness();
+    const bool eased = HookFrameTimeEase();
+    if (!HookPacer()) {
+        LOG_ERROR(Loader, "Frame rate: the frame pacer's hook did not fit; {} FPS fixed", cap);
+        return;
+    }
+    active.store(true, std::memory_order_release);
+    LOG_INFO(Loader,
+             "Frame rate: 90 FPS++ (by Kyo) with its values for {} FPS: {} writes ({} of the body "
+             "parts' kept), {} steps follow the frame rate, the camera {}, the frame time {}, the "
+             "cloth's stiffness {}",
+             cap == MaxRate ? std::string("uncapped") : std::to_string(cap),
+             patch.size() - kept - camera, kept, steps.size(),
+             game_camera && camera == 12 ? "the game's, its eases converted"
+             : game_camera               ? "the game's (not all 12 of the patch's camera writes)"
+                                         : "the patch's (the game's weights differ)",
+             eased ? "eased" : "as measured (the store is not the expected code)",
+             cloth ? "by solves per second" : "per frame (not found)");
 }
 
 bool Active() {
@@ -551,18 +696,22 @@ bool Active() {
 }
 
 float CapPeriod() {
-    if (!Active() || live->shortest <= 1.01f / MaxRate) {
+    if (!Active()) {
         return 0.0f;
     }
-    return live->shortest;
+    const int cap = target.load(std::memory_order_relaxed);
+    return cap >= MaxRate ? 0.0f : 1.0f / float(cap);
 }
 
 void SetLimit(int fps) {
-    if (!Active()) {
-        return;
+    target.store(Cap(fps), std::memory_order_relaxed);
+    if (Active()) {
+        LOG_INFO(Loader, "Frame rate: cap {}", fps > 0 ? std::to_string(Cap(fps)) : "none");
     }
-    live->shortest = ShortestFrame(fps);
-    LOG_INFO(Loader, "Frame rate hooks: limit {:.0f} FPS", 1.0f / live->shortest);
+}
+
+float HeldRate() {
+    return Active() ? held_rate.load(std::memory_order_relaxed) : 0.0f;
 }
 
 } // namespace Core::BbFrameRate

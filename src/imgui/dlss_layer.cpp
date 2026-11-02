@@ -424,26 +424,22 @@ void DlssLayer::Draw() {
     {
         namespace FrameRate = ::Core::BbFrameRate;
         bool hooks = EmulatorSettings.IsBbFrameHooks();
-        if (Checkbox("Frame rate hooks", &hooks)) {
+        if (Checkbox("Unlock frame rate", &hooks)) {
             EmulatorSettings.SetBbFrameHooks(hooks);
             EmulatorSettings.Save();
         }
         if (IsItemHovered())
-            SetTooltip("Unlocks the frame rate by hooks in the game's code instead of the frame "
-                       "rate patches:\nthe game steps by each frame's real time, and cloth, "
-                       "running, the camera and the rest follow it.\nThe frame rate patches "
-                       "(60 FPS++, Uncap FPS++ and the like) are left out while it is on.\n"
-                       "Applies at the next start.");
+            SetTooltip("90 FPS++ (by Kyo) with its values set for the FPS cap below. Your own "
+                       "frame rate patches are left out.\nApplies at the next start.");
         if (hooks != launch.frame_hooks) {
             SameLine();
             RestartHint(true, "(restart to apply)");
-            restart_needed.push_back("Frame rate hooks");
+            restart_needed.push_back("Unlock frame rate");
         }
-        static constexpr std::array<int, 8> limits = {0, 30, 60, 90, 120, 144, 165, 240};
-        static constexpr std::array<const char*, 8> labels = {"Uncapped", "30",  "60",  "90",
-                                                              "120",      "144", "165", "240"};
+        static constexpr std::array<int, 4> limits = {60, 90, 120, 0};
+        static constexpr std::array<const char*, 4> labels = {"60", "90", "120", "Uncapped"};
         const int limit = EmulatorSettings.GetBbFpsLimit();
-        int index = 0;
+        int index = int(limits.size()) - 1;
         for (int i = 0; i < int(limits.size()); ++i) {
             if (limits[i] == limit)
                 index = i;
@@ -462,9 +458,11 @@ void DlssLayer::Draw() {
         }
         EndDisabled();
         if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            SetTooltip("Changes at once, with the frame rate hooks. The game's own frame pacer "
-                       "waits for it.\nThe vblank frequency is a limit too: set it at least as "
-                       "high.");
+            SetTooltip("Changes at once. Set the vblank frequency at least as high.");
+        if (FrameRate::Active()) {
+            SameLine();
+            TextDisabled("%.0f FPS", double(FrameRate::HeldRate()));
+        }
         bool even = EmulatorSettings.IsBbEvenCappedFlips();
         BeginDisabled(!FrameRate::Active());
         if (Checkbox("Even frames with a cap", &even)) {
