@@ -431,7 +431,7 @@ private:
     /// Early write-back copies in flight on the readback queue (not waited for).
     struct CopyBack;
     void FinishCopyBack(CopyBack& copy_back);
-    static constexpr size_t CopyBackSlots = 16;
+    static constexpr size_t CopyBackSlots = 32;
     std::vector<std::unique_ptr<CopyBack>> copy_backs;
     std::deque<CopyBack*> copy_backs_in_flight; ///< in submission order
     std::vector<CopyBack*> copy_backs_free;
