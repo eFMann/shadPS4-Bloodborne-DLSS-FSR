@@ -1410,9 +1410,12 @@ void Rasterizer::OnSubmit() {
                                        std::memory_order_relaxed);
         BB::readback_queue.store(pipe_enabled && EmulatorSettings.IsBbReadbackQueue(),
                                  std::memory_order_relaxed);
-        buffer_cache.SetEarlyWriteback(pipe_enabled && EmulatorSettings.IsBbEarlyWriteback() &&
-                                       EmulatorSettings.GetReadbacksMode() !=
-                                           GpuReadbacksMode::Disabled);
+        // Its copies back to guest memory run only on the readback queue: without it (the setting
+        // off, or no spare queue) it would only mark memory hot and send batches early.
+        buffer_cache.SetEarlyWriteback(
+            pipe_enabled && EmulatorSettings.IsBbEarlyWriteback() &&
+            EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+            BB::readback_queue.load(std::memory_order_relaxed) && instance.HasReadbackQueue());
         scheduler.SetGpuTiming(diag);
         GpuProfiler::OnFrame(instance, scheduler,
                              pipe_enabled && EmulatorSettings.IsThreadedRendererGpuProfile());
