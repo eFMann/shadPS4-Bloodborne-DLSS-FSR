@@ -998,12 +998,35 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Smaller hitches entering new areas");
                 AddSettingCheckbox("    GPU readbacks on the copy queue", bbReadbackQueueSetting,
                                    "Fewer small stutters (needs a restart)");
+                // Its copies back to game memory run on that queue (nothing without it).
+                if (bbReadbackQueueSetting) {
+                    AddSettingCheckbox("        Early GPU data write-back", bbEarlyWritebackSetting,
+                                       "GPU data the game writes over is copied back before it "
+                                       "waits");
+                }
                 AddSettingCheckbox("    Faster Windows locks and sleeps", bbFastLocksSetting,
                                    "Less CPU overhead (needs a restart)");
                 AddSettingCheckbox("    Geometry in place", bbGeometryInPlaceSetting,
                                    "Static vertex/index data not copied for every draw");
                 AddSettingCheckbox("    Background copies", bbBackgroundTextureCopiesSetting,
                                    "Copies textures and new geometry for the GPU on other threads");
+                // The pool those copies run on (also used by Streaming optimisations' large
+                // uploads, so listed with Background copies off too).
+                AddSettingCombo(
+                    "        Copy threads", bbCopyThreadsSetting,
+                    {fmt::format("Auto ({})", Common::CopyPool::AutoWorkers()), "4", "6", "8"});
+                if (ImGui::IsItemHovered()) {
+                    ShowTooltip("Threads for background copies and large uploads when an area "
+                                "streams in: more copy faster but compete with the game's "
+                                "threads. Auto: half the CPU's threads, at most 8 (needs a "
+                                "restart)");
+                }
+                if (bbBackgroundTextureCopiesSetting) {
+                    AddSettingCheckbox("        Protect on a helper thread",
+                                       bbProtectHelperThreadSetting,
+                                       "New textures' memory protected by a helper thread "
+                                       "instead of the draw recorder (shorter stutter)");
+                }
                 AddSettingCheckbox("    Skip draws with no output", bbSkipEmptyDrawsSetting,
                                    "Occlusion test geometry the emulator does not use");
                 AddSettingCheckbox("    Reuse texture lookups", bbTextureSetMemoSetting,
@@ -1015,8 +1038,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("    Overlap game and GPU frames", bbOverlapFramesSetting,
                                    "The game starts its next frame while the last one finishes "
                                    "(needs a restart)");
-                AddSettingCheckbox("    Early GPU data write-back", bbEarlyWritebackSetting,
-                                   "GPU data the game writes over is copied back before it waits");
                 AddSettingCheckbox("    Occlusion results in order", bbOcclusionInOrderSetting,
                                    "Occlusion results queued behind the draws, no wait");
                 AddSettingCheckbox("    Fast pixel shader math", bbFastPixelMathSetting,
@@ -1026,7 +1047,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("    GPU interpolation where safe",
                                    bbHardwareInterpolationSetting,
                                    "NVIDIA: less pixel shader code (needs a restart)");
-                AddSettingCheckbox("    Copy thread", bbCopyThreadSetting,
+                AddSettingCheckbox("    Draw data copy thread", bbCopyThreadSetting,
                                    "Draw memory copies on their own thread (needs a restart)");
                 AddSettingCheckbox("    Keep rendering while presenting",
                                    bbRenderDuringPresentSetting,
@@ -1037,14 +1058,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Texture quality High/Medium: less data copied per upload");
                 AddSettingCheckbox("    Direct texture copies", bbDirectTextureCopiesSetting,
                                    "Texture data read straight from game memory (faster loads)");
-                AddSettingCombo(
-                    "    Copy threads", bbCopyThreadsSetting,
-                    {fmt::format("Auto ({})", Common::CopyPool::AutoWorkers()), "4", "6", "8"});
-                if (ImGui::IsItemHovered()) {
-                    ShowTooltip("Threads copying texture data when an area streams in: more "
-                                "copy faster but compete with the game's threads (needs a "
-                                "restart)");
-                }
                 AddSettingCheckbox("    Cached texture staging", bbCachedTextureStagingSetting,
                                    "Texture uploads staged in cached memory (faster copies)");
                 AddSettingCheckbox("    Lower detail first", bbLowerDetailFirstSetting,
@@ -1056,20 +1069,22 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("    Constant dumps past huge writes", bbCeSkipHugeWritesSetting,
                                    "The GPU thread keeps preparing draws in area loads instead of "
                                    "waiting for the draw recorder");
-                AddSettingCheckbox("    Cheaper buffer refill", bbEvictKeepProtectionSetting,
-                                   "With buffer eviction: evicted buffers come back without "
-                                   "protecting their memory again (shorter stutter)");
-                AddSettingCheckbox("    Keep returning buffers", bbEvictKeepReturningSetting,
-                                   "With buffer eviction: loading screens free only what VRAM "
-                                   "needs; buffers the game keeps using are freed last");
-                AddSettingCheckbox("    Protect on a helper thread", bbProtectHelperThreadSetting,
-                                   "New textures' memory protected by a helper thread instead "
-                                   "of the draw recorder (shorter stutter)");
+                // Only used when VRAM cleanup frees idle buffers.
+                if (bbVramReclaimSetting && bbBufferEvictionSetting) {
+                    AddSettingCheckbox("    Cheaper buffer refill", bbEvictKeepProtectionSetting,
+                                       "With buffer eviction: evicted buffers come back without "
+                                       "protecting their memory again (shorter stutter)");
+                    AddSettingCheckbox("    Keep returning buffers", bbEvictKeepReturningSetting,
+                                       "With buffer eviction: loading screens free only what VRAM "
+                                       "needs; buffers the game keeps using are freed last");
+                }
                 AddSettingCheckbox("    Copy shader on the CPU", bbCpuCopyShaderSetting,
                                    "The game's small GPU copies are done in game memory, so the "
                                    "game doesn't wait for the GPU (stutters while running)");
-                AddSettingCheckbox("      Skip copies that change nothing", bbCopySkipSameSetting,
-                                   "Fewer buffer uploads");
+                if (bbCpuCopyShaderSetting) {
+                    AddSettingCheckbox("        Skip copies that change nothing",
+                                       bbCopySkipSameSetting, "Fewer buffer uploads");
+                }
                 AddSettingCheckbox("    Clear shadow cube faces", bbClearOneLayerSetting,
                                    "No wedges of light in lamp shadows");
             }
