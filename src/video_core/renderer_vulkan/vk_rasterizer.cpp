@@ -1330,8 +1330,8 @@ void Rasterizer::OnSubmissionDecoded() {
     if (buffer_cache.TakeWritebackFlush()) {
         // Stutter detail: an early flush that takes long, step by step.
         const bool timed = Common::GuestStats::detail_timing.load(std::memory_order_relaxed);
-        const auto flush_start = timed ? std::chrono::steady_clock::now()
-                                       : std::chrono::steady_clock::time_point{};
+        const auto flush_start =
+            timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Flush();
         if (timed) {
             static u32 slow_flush_logs = 0;
