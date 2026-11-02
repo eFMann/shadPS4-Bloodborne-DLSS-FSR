@@ -111,6 +111,19 @@ std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& prop
     return std::nullopt;
 }
 
+/// An early write-back copy on the readback queue: the staging memory it lands in, and the
+/// range and GPU work it brings back.
+struct BufferCache::CopyBack {
+    vk::UniqueCommandBuffer cmdbuf;
+    vk::UniqueFence fence;
+    Vulkan::StagingBufferRef download{};
+    boost::container::small_vector<vk::BufferCopy, 1> copies;
+    VAddr arena_base{};
+    VAddr address{};
+    u64 size{};
+    u64 tick{};
+};
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                          TextureCache& texture_cache_, PageManager& tracker)
@@ -173,6 +186,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         }));
         readback_cmdbuf = std::move(buffers[0]);
         readback_fence = Vulkan::Check(device.createFenceUnique({}));
+        auto slots = Vulkan::Check(device.allocateCommandBuffersUnique({
+            .commandPool = *readback_pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = static_cast<u32>(CopyBackSlots),
+        }));
+        for (auto& cmdbuf : slots) {
+            auto& slot = copy_backs.emplace_back(std::make_unique<CopyBack>());
+            slot->cmdbuf = std::move(cmdbuf);
+            slot->fence = Vulkan::Check(device.createFenceUnique({}));
+            copy_backs_free.push_back(slot.get());
+        }
     }
     if (!instance.IsMaintenance6Supported()) {
         null_index_buffer = std::make_unique<Buffer>(instance, 0, NULL_INDEX_BUFFER_SIZE,
@@ -182,6 +206,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 }
 
 BufferCache::~BufferCache() {
+    // Copy-backs still running on the readback queue write into staging memory.
+    for (const CopyBack* copy_back : copy_backs_in_flight) {
+        (void)instance.GetDevice().waitForFences(*copy_back->fence, true,
+                                                 std::numeric_limits<u64>::max());
+    }
     for (const RetiredMemory& retired : retired_memory) {
         instance.GetDevice().freeMemory(retired.memory);
     }
@@ -332,20 +361,23 @@ void BufferCache::LogReadbackReport() {
         queue_ns = std::exchange(readback_queue_ns, 0);
     }
     if (EarlyWriteback()) {
-        u64 done, bytes;
+        u64 done, bytes, stale, full;
         size_t pending, hot;
         {
             std::scoped_lock lock{writeback_mutex};
             done = std::exchange(writebacks_done, 0);
             bytes = std::exchange(writeback_bytes, 0);
+            stale = std::exchange(copy_backs_stale, 0);
+            full = std::exchange(copy_backs_full, 0);
             pending = pending_writebacks.size();
             hot = hot_blocks.size();
         }
         LOG_INFO(Render,
                  "Early write-back (10 s): {} copies back to guest memory ({} KiB), {} batches "
-                 "sent early | {} waiting for the GPU, {} hot 64 KiB blocks",
+                 "sent early | {} waiting for the GPU, {} hot 64 KiB blocks | {} dropped (the "
+                 "GPU wrote the memory again first), {} retried (all {} copies busy)",
                  done, bytes >> 10, writeback_flushes.exchange(0, std::memory_order_relaxed),
-                 pending, hot);
+                 pending, hot, stale, full, CopyBackSlots);
     }
     u64 count = 0, wait = 0, blocked = 0;
     std::array<u64, 4> writer{};
@@ -460,10 +492,122 @@ void BufferCache::WriteBack(const PendingWriteback& writeback) {
         LastGpuWriteTick(writeback.address, writeback.size) > writeback.tick) {
         return;
     }
-    ReadMemory(writeback.address, writeback.size, false, false, true);
-    std::scoped_lock lock{writeback_mutex};
-    ++writebacks_done;
-    writeback_bytes += writeback.size;
+    // Whole 64 KiB blocks (the granularity of the GPU write ticks), so the memory tracker's pages
+    // are cleared only where every GPU-written byte was brought back.
+    constexpr u64 BlockSize = 64_KB;
+    const u64 first_block = writeback.address >> block_shift;
+    const u64 last_block = (writeback.address + writeback.size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    const VAddr start =
+        std::max<VAddr>(Common::AlignDown(writeback.address, BlockSize), arena->cpu_addr);
+    const VAddr end =
+        std::min<VAddr>(Common::AlignUp(writeback.address + writeback.size, BlockSize),
+                        arena->cpu_addr + arena->size_bytes);
+    // Already on its way back from the same or newer GPU work.
+    for (const CopyBack* in_flight : copy_backs_in_flight) {
+        if (in_flight->tick >= writeback.tick && in_flight->address <= start &&
+            end <= in_flight->address + in_flight->size) {
+            return;
+        }
+    }
+    if (copy_backs_free.empty()) {
+        std::scoped_lock lock{writeback_mutex};
+        ++copy_backs_full;
+        pending_writebacks.push_back(writeback);
+        return;
+    }
+    CopyBack& copy_back = *copy_backs_free.back();
+    copy_back.copies.clear();
+    const u64 total_size_bytes = GatherDownloads(arena, start, end - start, copy_back.copies);
+    if (total_size_bytes == 0) {
+        return;
+    }
+    copy_backs_free.pop_back();
+    // Held until the copy has finished (FinishCopyBack), not tied to the graphics queue.
+    copy_back.download =
+        staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 16, true);
+    for (auto& copy : copy_back.copies) {
+        copy.dstOffset += copy_back.download.offset;
+    }
+    copy_back.arena_base = arena->cpu_addr;
+    copy_back.address = start;
+    copy_back.size = end - start;
+    copy_back.tick = writeback.tick;
+    {
+        std::scoped_lock lock{readback_queue_mutex};
+        SubmitReadback(*copy_back.cmdbuf, *copy_back.fence, arena, copy_back.download.buffer,
+                       copy_back.copies, writeback.tick);
+    }
+    // Not waited for here: waiting for the readback queue on the GPU command thread took ~0.65 ms
+    // per copy, often ~12 ms, which made whole seconds judder while memory stayed hot.
+    copy_backs_in_flight.push_back(&copy_back);
+}
+
+void BufferCache::PollCopyBacks(bool wait) {
+    const auto device = instance.GetDevice();
+    // The readback queue finishes them in submission order.
+    while (!copy_backs_in_flight.empty()) {
+        CopyBack* copy_back = copy_backs_in_flight.front();
+        if (wait) {
+            Vulkan::Check(
+                device.waitForFences(*copy_back->fence, true, std::numeric_limits<u64>::max()));
+        } else if (device.getFenceStatus(*copy_back->fence) != vk::Result::eSuccess) {
+            break;
+        }
+        copy_backs_in_flight.pop_front();
+        FinishCopyBack(*copy_back);
+        copy_backs_free.push_back(copy_back);
+    }
+}
+
+void BufferCache::FinishCopyBack(CopyBack& copy_back) {
+    const auto& download = copy_back.download;
+    SCOPE_EXIT {
+        staging_pool.FreeDeferred(download);
+    };
+    // Newer GPU work wrote the memory again: its own write-back follows.
+    if (LastGpuWriteTick(copy_back.address, copy_back.size) > copy_back.tick) {
+        std::scoped_lock lock{writeback_mutex};
+        ++copy_backs_stale;
+        return;
+    }
+    download.Invalidate();
+    // Only bytes still GPU-modified: a game access in the meantime may have read them back
+    // already (the normal readback), and the game may have written them since.
+    u64 written = 0;
+    for (const auto& copy : copy_back.copies) {
+        const VAddr copy_start = copy_back.arena_base + copy.srcOffset;
+        const u8* source = download.mapped + (copy.dstOffset - download.offset);
+        bool failed = false;
+        gpu_modified_ranges.ForEachInRange(copy_start, copy.size, [&](VAddr start, VAddr end) {
+            if (failed) {
+                return;
+            }
+            if (!memory->TryWriteBacking(std::bit_cast<u8*>(start), source + (start - copy_start),
+                                         end - start)) {
+                failed = true;
+                return;
+            }
+            written += end - start;
+        });
+        if (failed) {
+            // Dirty tracking is kept; the next access reads the memory back as usual.
+            LOG_WARNING(Render, "Early write-back to guest memory failed at {:#x}", copy_start);
+            return;
+        }
+    }
+    for (const auto& copy : copy_back.copies) {
+        gpu_modified_ranges.Subtract(copy_back.arena_base + copy.srcOffset, copy.size);
+    }
+    // The pages stay GPU-modified where ranges outside these copies are left.
+    if (!gpu_modified_ranges.Intersects(copy_back.address, copy_back.size)) {
+        memory_tracker->UnmarkRegionAsGpuModified(copy_back.address, copy_back.size, false);
+    }
+    if (written != 0) {
+        std::scoped_lock lock{writeback_mutex};
+        ++writebacks_done;
+        writeback_bytes += written;
+    }
 }
 
 void BufferCache::NoteGpuWrite(VAddr device_addr, u64 size) {
@@ -500,8 +644,15 @@ u64 BufferCache::LastGpuWriteTick(VAddr device_addr, u64 size) {
 void BufferCache::ReadbackOnSecondQueue(const Buffer* arena, const Buffer* destination,
                                         std::span<const vk::BufferCopy> copies, u64 tick) {
     std::scoped_lock lock{readback_queue_mutex};
+    SubmitReadback(*readback_cmdbuf, *readback_fence, arena, destination, copies, tick);
+    Vulkan::Check(
+        instance.GetDevice().waitForFences(*readback_fence, true, std::numeric_limits<u64>::max()));
+}
+
+void BufferCache::SubmitReadback(vk::CommandBuffer cmdbuf, vk::Fence fence, const Buffer* arena,
+                                 const Buffer* destination, std::span<const vk::BufferCopy> copies,
+                                 u64 tick) {
     const auto device = instance.GetDevice();
-    const auto cmdbuf = *readback_cmdbuf;
     Vulkan::Check(cmdbuf.reset());
     Vulkan::Check(cmdbuf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
     cmdbuf.copyBuffer(arena->Handle(), destination->Handle(), static_cast<u32>(copies.size()),
@@ -529,13 +680,12 @@ void BufferCache::ReadbackOnSecondQueue(const Buffer* arena, const Buffer* desti
         .commandBufferInfoCount = 1,
         .pCommandBufferInfos = &command,
     };
-    Vulkan::Check(device.resetFences(*readback_fence));
-    Vulkan::Check(instance.GetReadbackQueue().submit2(submit, *readback_fence));
-    Vulkan::Check(device.waitForFences(*readback_fence, true, std::numeric_limits<u64>::max()));
+    Vulkan::Check(device.resetFences(fence));
+    Vulkan::Check(instance.GetReadbackQueue().submit2(submit, fence));
 }
 
-bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
-    boost::container::small_vector<vk::BufferCopy, 1> copies;
+u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
+                                 boost::container::small_vector<vk::BufferCopy, 1>& copies) {
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
     memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 size) {
@@ -554,6 +704,13 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
     });
+    return total_size_bytes;
+}
+
+bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
+    boost::container::small_vector<vk::BufferCopy, 1> copies;
+    const VAddr arena_base = arena->cpu_addr;
+    const u64 total_size_bytes = GatherDownloads(arena, device_addr, size, copies);
     if (total_size_bytes == 0) {
         return true;
     }

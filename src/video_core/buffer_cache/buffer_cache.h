@@ -8,10 +8,12 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
 #include "common/enum.h"
@@ -158,6 +160,10 @@ public:
     [[nodiscard]] std::vector<PendingWriteback> TakeFinishedWritebacks();
     /// Copies a finished hot write back to guest memory (GPU command thread, draw pipe idle).
     void WriteBack(const PendingWriteback& writeback);
+    /// Finishes the copy-backs whose second-queue copy is done (all of them, waiting, with
+    /// `wait`): the data reaches guest memory where the GPU hasn't written it again since.
+    /// Called where the draw recorder is idle, like WriteBack.
+    void PollCopyBacks(bool wait = false);
 
     /// Finds a buffer for the specified region.
     /// IgnoreStreamBuffer: a small read-only region still comes from the buffer itself, not a
@@ -413,6 +419,23 @@ private:
     /// work signalled with `tick` is done, and waits for the copy alone.
     void ReadbackOnSecondQueue(const Buffer* arena, const Buffer* destination,
                                std::span<const vk::BufferCopy> copies, u64 tick);
+    /// Records and submits that copy on the readback queue, signalling `fence` (under
+    /// readback_queue_mutex).
+    void SubmitReadback(vk::CommandBuffer cmdbuf, vk::Fence fence, const Buffer* arena,
+                        const Buffer* destination, std::span<const vk::BufferCopy> copies,
+                        u64 tick);
+    /// The GPU-modified ranges of [device_addr, device_addr + size) as copies from the arena
+    /// into a packed download buffer; returns the download size.
+    u64 GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
+                        boost::container::small_vector<vk::BufferCopy, 1>& copies);
+    /// Early write-back copies in flight on the readback queue (not waited for).
+    struct CopyBack;
+    void FinishCopyBack(CopyBack& copy_back);
+    static constexpr size_t CopyBackSlots = 16;
+    std::vector<std::unique_ptr<CopyBack>> copy_backs;
+    std::deque<CopyBack*> copy_backs_in_flight; ///< in submission order
+    std::vector<CopyBack*> copy_backs_free;
+    u64 copy_backs_stale{}, copy_backs_full{}; ///< since the last report (writeback_mutex)
     vk::UniqueCommandPool readback_pool;
     vk::UniqueCommandBuffer readback_cmdbuf;
     vk::UniqueFence readback_fence;

@@ -1326,8 +1326,34 @@ void Rasterizer::OnSubmissionDecoded() {
     if (draw_pipe && !draw_pipe->Idle()) {
         return;
     }
+    buffer_cache.PollCopyBacks();
     if (buffer_cache.TakeWritebackFlush()) {
+        // Stutter detail: an early flush that takes long, step by step.
+        const bool timed = Common::GuestStats::detail_timing.load(std::memory_order_relaxed);
+        const auto flush_start = timed ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
         Flush();
+        if (timed) {
+            static u32 slow_flush_logs = 0;
+            const u64 total = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - flush_start)
+                                                   .count());
+            if (total >= 2'000'000 && slow_flush_logs < 300) {
+                ++slow_flush_logs;
+                const auto& steps = Scheduler::LastSubmitSteps();
+                u64 in_steps = 0;
+                std::string parts;
+                for (size_t i = 0; i < steps.size(); ++i) {
+                    in_steps += steps[i];
+                    parts += fmt::format("{}{} {:.2f}", parts.empty() ? "" : ", ",
+                                         Scheduler::SubmitSteps[i], steps[i] / 1e6);
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Early write-back flush took {:.2f} ms: {} | outside the submission "
+                            "(draw recorder drain) {:.2f}",
+                            total / 1e6, parts, (total - std::min(total, in_steps)) / 1e6);
+            }
+        }
     }
     const auto finished = buffer_cache.TakeFinishedWritebacks();
     if (finished.empty()) {
@@ -1348,7 +1374,9 @@ void Rasterizer::OnSubmit() {
     ++stat_frames;
     occlusion_frame.fetch_add(1, std::memory_order_relaxed);
     DrainDrawPipe();
-    // Early write-back: the frame's finished copies, now that the draw recorder is idle anyway.
+    // Early write-back: copies that finished on the readback queue (also after the setting was
+    // turned off), then the frame's finished GPU work, now that the draw recorder is idle anyway.
+    buffer_cache.PollCopyBacks();
     if (buffer_cache.EarlyWriteback()) {
         for (const auto& writeback : buffer_cache.TakeFinishedWritebacks()) {
             buffer_cache.WriteBack(writeback);

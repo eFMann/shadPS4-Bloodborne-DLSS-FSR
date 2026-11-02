@@ -411,12 +411,46 @@ void Scheduler::EndSession() {
     Check(session.primary.end());
 }
 
+namespace {
+thread_local std::array<u64, Scheduler::SubmitSteps.size()> last_submit_steps{};
+
+// Stutter detail: times the steps of one submission (no clock reads while it is off).
+class SubmitStepTimer {
+public:
+    SubmitStepTimer() : on{Common::GuestStats::detail_timing.load(std::memory_order_relaxed)} {
+        last_submit_steps.fill(0);
+        if (on) {
+            lap = std::chrono::steady_clock::now();
+        }
+    }
+    void Step(size_t index) {
+        if (!on) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        last_submit_steps[index] += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - lap).count());
+        lap = now;
+    }
+
+private:
+    bool on;
+    std::chrono::steady_clock::time_point lap{};
+};
+} // namespace
+
+const std::array<u64, Scheduler::SubmitSteps.size()>& Scheduler::LastSubmitSteps() noexcept {
+    return last_submit_steps;
+}
+
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     Common::Crumbs::Add("GPU submit (tick)", CurrentTick());
+    SubmitStepTimer steps;
     if (recorder) {
         recorder->Sync();
         direct_mode = true;
     }
+    steps.Step(0);
     {
         // Background texture copies this submission reads (all recorded by now) must be done.
         const auto start = std::chrono::steady_clock::now();
@@ -428,7 +462,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                 std::memory_order_relaxed);
         }
     }
+    steps.Step(1);
     std::scoped_lock lk{submit_mutex};
+    steps.Step(2);
     const u64 signal_value = work_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
@@ -442,6 +478,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     if (on_submit) {
         on_submit(info);
     }
+    steps.Step(3);
 
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
         // Until the next submission's first timestamp: mostly the GPU waiting for it.
@@ -460,6 +497,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 
     EndSession();
+    steps.Step(4);
 
     std::vector<vk::CommandBuffer> cmd_buffers;
     cmd_buffers.reserve(sessions.size() * 2);
@@ -509,13 +547,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             std::memory_order_relaxed);
         ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     });
+    steps.Step(5);
 
     work_semaphore.Refresh();
     CollectGpuTiming();
+    steps.Step(6);
     BeginSession();
+    steps.Step(7);
 
     // Apply pending operations
     PopPendingOperations();
+    steps.Step(8);
 }
 
 void Scheduler::CollectGpuTiming() {

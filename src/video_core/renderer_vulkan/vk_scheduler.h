@@ -559,6 +559,14 @@ public:
     /// idle time between submissions, from timestamps. Returns {busy ns, idle ns, submissions}
     /// since the last call.
     std::array<u64, 3> TakeGpuTiming();
+
+    /// Stutter detail: the steps of the last submission on this thread, in ns (SubmitSteps order),
+    /// all zero while Stutter detail is off.
+    static constexpr std::array<const char*, 9> SubmitSteps{
+        "command recorder sync", "background copies", "submit lock", "on-submit",
+        "end session",           "queue submit",      "GPU timing",  "new session",
+        "pending operations"};
+    [[nodiscard]] static const std::array<u64, SubmitSteps.size()>& LastSubmitSteps() noexcept;
     /// Timestamps for TakeGpuTiming only while diagnostics are on.
     void SetGpuTiming(bool enabled) {
         gpu_timing = enabled;
