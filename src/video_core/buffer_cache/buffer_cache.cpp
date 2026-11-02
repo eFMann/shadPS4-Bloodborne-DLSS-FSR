@@ -349,6 +349,31 @@ void BufferCache::LogReadbackReport() {
         return;
     }
     readback_report_time = now;
+    if (const u64 seen = snapshot_seen.exchange(0, std::memory_order_relaxed); seen != 0) {
+        const auto take = [](std::atomic<u64>& value) {
+            return value.exchange(0, std::memory_order_relaxed);
+        };
+        const u64 checks = take(snapshot_checks), bytes = take(snapshot_bytes);
+        const u64 mismatches = take(snapshot_mismatches);
+        const u64 mismatch_bytes = take(snapshot_mismatch_bytes);
+        const u64 cpu_dirty = take(snapshot_all_cpu_dirty);
+        const u64 not_resident = take(snapshot_not_resident);
+        const u64 now_buffer = take(snapshot_now_buffer);
+        const u64 now_snapshot = take(snapshot_now_snapshot);
+        const u64 now_other = take(snapshot_now_other);
+        LOG_INFO(Render,
+                 "Copy shader snapshots (issue #25, 10 s): {} sources from snapshots, {} checked "
+                 "({} KiB of pages without pending CPU changes) | {} differ from the buffer "
+                 "cache ({} bytes) | game memory after the GPU ran held: the buffer's bytes {}, "
+                 "the snapshot's {}, something else {} | not checked: every page had CPU "
+                 "changes {}, not resident {} | stream buffer delivery: {} checked, {} read "
+                 "other bytes than written ({} bytes)",
+                 seen, checks, bytes >> 10, mismatches, mismatch_bytes, now_buffer, now_snapshot,
+                 now_other, cpu_dirty, not_resident,
+                 stream_checks.exchange(0, std::memory_order_relaxed),
+                 stream_mismatches.exchange(0, std::memory_order_relaxed),
+                 stream_mismatch_bytes.exchange(0, std::memory_order_relaxed));
+    }
     std::unordered_map<u64, ReadbackRegion> regions;
     std::array<u64, 4> writer_ns{};
     u64 max_wait{}, queue_count{}, queue_ns{};
@@ -482,6 +507,203 @@ std::vector<BufferCache::PendingWriteback> BufferCache::TakeFinishedWritebacks()
     std::erase_if(hot_blocks,
                   [&](const auto& block) { return now - block.second > std::chrono::seconds(30); });
     return finished;
+}
+
+void BufferCache::CheckSnapshotSource(VAddr device_addr, u64 size, u64 stream_offset) {
+    // About 1 in 32 snapshots, at most 2000 per report: a GPU copy and a deferred compare each.
+    constexpr u64 SampleEvery = 32;
+    constexpr u64 MaxChecks = 2000;
+    const u64 seen = snapshot_seen.fetch_add(1, std::memory_order_relaxed);
+    if (size == 0 || seen % SampleEvery != 0 ||
+        snapshot_checks.load(std::memory_order_relaxed) +
+                snapshot_all_cpu_dirty.load(std::memory_order_relaxed) >=
+            MaxChecks) {
+        return;
+    }
+    // 1. Delivery: the GPU copies the stream buffer range at this point of the work, as the
+    // copy shader will; it should hold the bytes written there just now. A difference means
+    // the range was reused (or not visible) before the GPU read it.
+    {
+        stream_checks.fetch_add(1, std::memory_order_relaxed);
+        std::vector<u8> written(stream_buffer.mapped_data.begin() + stream_offset,
+                                stream_buffer.mapped_data.begin() + stream_offset + size);
+        const auto read_back =
+            staging_pool.Request(size, VideoCore::MemoryType::HostCached, 16, true);
+        const vk::BufferCopy copy = {
+            .srcOffset = stream_offset, .dstOffset = read_back.offset, .size = size};
+        runtime.CopyBuffer(&stream_buffer, read_back.buffer, std::span{&copy, 1});
+        const u64 tick = scheduler.CurrentTick();
+        const u64 stream_size = stream_buffer.SizeBytes();
+        scheduler.DeferOperation([this, device_addr, size, stream_offset, stream_size, tick,
+                                  read_back, written = std::move(written)] {
+            read_back.Invalidate();
+            u64 differ = 0, first = size;
+            for (u64 i = 0; i < size; ++i) {
+                if (read_back.mapped[i] != written[i]) {
+                    first = std::min(first, i);
+                    ++differ;
+                }
+            }
+            if (differ != 0) {
+                stream_mismatches.fetch_add(1, std::memory_order_relaxed);
+                stream_mismatch_bytes.fetch_add(differ, std::memory_order_relaxed);
+                if (stream_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(Render,
+                                "Copy shader snapshot: the GPU read other bytes from the stream "
+                                "buffer than were written there: source {:#x} ({} bytes), {} "
+                                "differ, first at +{:#x} | stream buffer offset {:#x} of {} MiB, "
+                                "submission {}",
+                                device_addr, size, differ, first, stream_offset, stream_size >> 20,
+                                tick);
+                }
+            }
+            staging_pool.FreeDeferred(read_back);
+        });
+    }
+    // 2. Contents: the buffer cache's bytes for the same memory.
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    if (!resident_ranges.Contains(first_block, last_block + 1)) {
+        snapshot_not_resident.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto* arena = GetArena(first_block, last_block);
+    // Pages with CPU changes the buffer hasn't had yet are left out: the buffer path uploads
+    // those from game memory just like the snapshot. Elsewhere the buffer keeps what it has.
+    struct Piece {
+        VAddr address;
+        u64 size;
+        u64 offset; ///< into the packed download and snapshot
+    };
+    boost::container::small_vector<Piece, 8> pieces;
+    u64 total = 0;
+    constexpr u64 PageSize = 4_KB;
+    for (VAddr page = Common::AlignDown(device_addr, PageSize); page < device_addr + size;
+         page += PageSize) {
+        const VAddr start = std::max(page, device_addr);
+        const VAddr end = std::min(page + PageSize, device_addr + size);
+        if (IsRegionCpuModified(start, end - start)) {
+            continue;
+        }
+        if (!pieces.empty() && pieces.back().address + pieces.back().size == start) {
+            pieces.back().size += end - start;
+        } else {
+            pieces.push_back({start, end - start, total});
+        }
+        total += end - start;
+    }
+    if (total == 0) {
+        snapshot_all_cpu_dirty.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    snapshot_checks.fetch_add(1, std::memory_order_relaxed);
+    snapshot_bytes.fetch_add(total, std::memory_order_relaxed);
+
+    // The snapshot's bytes, kept now (the stream buffer is reused).
+    std::vector<u8> snapshot(total);
+    const auto& stream = stream_buffer.mapped_data;
+    for (const auto& piece : pieces) {
+        std::memcpy(snapshot.data() + piece.offset,
+                    stream.data() + stream_offset + (piece.address - device_addr), piece.size);
+    }
+    // The buffer's bytes at this point of the GPU work: what "Sources from buffer memory" reads.
+    const auto download = staging_pool.Request(total, VideoCore::MemoryType::HostCached, 16, true);
+    boost::container::small_vector<vk::BufferCopy, 8> copies;
+    for (const auto& piece : pieces) {
+        copies.push_back({.srcOffset = arena->Offset(piece.address),
+                          .dstOffset = download.offset + piece.offset,
+                          .size = piece.size});
+    }
+    runtime.CopyBuffer(arena, download.buffer, copies);
+
+    // What could have written the memory, as known now.
+    const u64 tick = scheduler.CurrentTick();
+    const u64 last_gpu_write = LastGpuWriteTick(device_addr, size);
+    const bool gpu_ranges = gpu_modified_ranges.Intersects(device_addr, size);
+    GpuWriter writer{};
+    {
+        std::scoped_lock lock{gpu_write_mutex};
+        if (const auto it = gpu_writers.find(device_addr >> 16); it != gpu_writers.end()) {
+            writer = it->second;
+        }
+    }
+    u32 images = 0, gpu_images = 0;
+    VAddr image_address = 0;
+    u64 image_size = 0;
+    texture_cache.ForEachImageInRegion(device_addr, size, [&](ImageId, Image& image) {
+        ++images;
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            if (gpu_images++ == 0) {
+                image_address = image.info.guest_address;
+                image_size = image.info.guest_size;
+            }
+        }
+    });
+    scheduler.DeferOperation([this, device_addr, size, total, download, pieces = std::move(pieces),
+                              snapshot = std::move(snapshot), tick, last_gpu_write, gpu_ranges,
+                              writer, images, gpu_images, image_address, image_size] {
+        download.Invalidate();
+        const u8* buffer = download.mapped;
+        u64 differ = 0;
+        u64 first_differ = total;
+        for (u64 i = 0; i < total; ++i) {
+            if (buffer[i] != snapshot[i]) {
+                first_differ = std::min(first_differ, i);
+                ++differ;
+            }
+        }
+        if (differ != 0) {
+            snapshot_mismatches.fetch_add(1, std::memory_order_relaxed);
+            snapshot_mismatch_bytes.fetch_add(differ, std::memory_order_relaxed);
+            // Game memory now, at the differing bytes: did it later get the buffer's data?
+            std::vector<u8> now(total);
+            for (const auto& piece : pieces) {
+                memory->CopySparseMemory(piece.address, now.data() + piece.offset, piece.size);
+            }
+            u64 as_buffer = 0, as_snapshot = 0;
+            for (u64 i = first_differ; i < total; ++i) {
+                if (buffer[i] != snapshot[i]) {
+                    as_buffer += now[i] == buffer[i];
+                    as_snapshot += now[i] == snapshot[i];
+                }
+            }
+            const char* now_holds = as_buffer == differ     ? "the buffer's bytes"
+                                    : as_snapshot == differ ? "the snapshot's bytes"
+                                                            : "something else";
+            (as_buffer == differ     ? snapshot_now_buffer
+             : as_snapshot == differ ? snapshot_now_snapshot
+                                     : snapshot_now_other)
+                .fetch_add(1, std::memory_order_relaxed);
+            if (snapshot_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+                VAddr differ_address = device_addr;
+                for (const auto& piece : pieces) {
+                    if (first_differ >= piece.offset && first_differ < piece.offset + piece.size) {
+                        differ_address = piece.address + (first_differ - piece.offset);
+                    }
+                }
+                LOG_WARNING(
+                    Render,
+                    "Copy shader snapshot differs from the buffer cache: source {:#x} ({} bytes), "
+                    "{} of {} checked bytes differ, first at {:#x} | game memory after the GPU "
+                    "ran holds {} | at the snapshot: submission {}, last recorded GPU write into "
+                    "these 64 KiB blocks {} ({}), GPU-written ranges here {}, last writer {} "
+                    "({:#x}, {} KiB) | images over it {}, GPU-written {}{}",
+                    device_addr, size, differ, total, differ_address, now_holds, tick,
+                    last_gpu_write,
+                    last_gpu_write == 0      ? "none known"
+                    : last_gpu_write >= tick ? "in this unsubmitted batch"
+                                             : "already submitted",
+                    gpu_ranges ? "yes" : "no",
+                    writer.shader ? fmt::format("shader {:#x}", writer.shader)
+                                  : std::string{"not a shader or none"},
+                    writer.base, writer.size >> 10, images, gpu_images,
+                    gpu_images
+                        ? fmt::format(" (first {:#x}, {} KiB)", image_address, image_size >> 10)
+                        : std::string{});
+            }
+        }
+        staging_pool.FreeDeferred(download);
+    });
 }
 
 void BufferCache::WriteBack(const PendingWriteback& writeback) {

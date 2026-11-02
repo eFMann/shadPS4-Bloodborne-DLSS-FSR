@@ -441,6 +441,9 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             if (src_buf == &buffer_cache.GetStreamBuffer()) {
                 Count(copy_stats.stream_sources);
                 Count(copy_stats.stream_bytes, src_offset_max - src_offset_min);
+                // Issue #25: is the snapshot what the buffer cache would have given?
+                buffer_cache.CheckSnapshotSource(src_buf_sharp.base_address + src_offset_min,
+                                                 src_offset_max - src_offset_min, src_buf_offset);
             }
         }
         // The whole destination span counts as GPU-written, as before 0.21.0 (which marks each

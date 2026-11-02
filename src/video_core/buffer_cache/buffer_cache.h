@@ -133,6 +133,13 @@ public:
     /// GPU work that wrote the data had been submitted or had finished), logged every 10 s.
     void LogReadbackReport();
 
+    /// Diagnostics (issue #25): a sample of the copy shader's sources read from a snapshot of
+    /// game memory in the stream buffer (`stream_offset`) is compared, once the GPU has run, with
+    /// what the buffer cache held for the same memory at that point. Only pages without CPU
+    /// changes the buffer hadn't had yet: there both ways should give the same bytes. Also
+    /// whether the GPU read from the stream buffer the bytes the snapshot wrote there.
+    void CheckSnapshotSource(VAddr device_addr, u64 size, u64 stream_offset);
+
     /// Early write-back (threaded renderer): memory a game thread had to wait for a readback of
     /// is "hot" for a while. GPU work writing hot memory asks for its batch to be sent at once,
     /// and once the GPU has finished it the data is copied back to guest memory, so the game's
@@ -397,6 +404,13 @@ private:
         u64 size{};
     };
     std::unordered_map<u64, GpuWriter> gpu_writers; ///< under gpu_write_mutex
+    /// Snapshot checks (CheckSnapshotSource) since the last report.
+    std::atomic<u64> snapshot_seen{}, snapshot_checks{}, snapshot_bytes{}, snapshot_mismatches{},
+        snapshot_mismatch_bytes{}, snapshot_all_cpu_dirty{}, snapshot_not_resident{},
+        snapshot_now_buffer{}, snapshot_now_snapshot{}, snapshot_now_other{};
+    /// The same samples: did the GPU read from the stream buffer the bytes written there?
+    std::atomic<u64> stream_checks{}, stream_mismatches{}, stream_mismatch_bytes{};
+    std::atomic<u32> snapshot_logs{}, stream_logs{};
     u32 slow_write_logs{};
     u64 readback_queue_count{}, readback_queue_ns{}; ///< readbacks on the second queue (report)
 
