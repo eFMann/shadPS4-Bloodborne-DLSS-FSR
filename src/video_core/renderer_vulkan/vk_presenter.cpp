@@ -1009,7 +1009,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     draw_scheduler.EndRendering();
-    const auto cmdbuf = draw_scheduler.CommandBuffer();
+    // The presentation passes go into a command buffer of their own, submitted after the
+    // frame's: a direct command buffer here waited for the recording thread to record the whole
+    // frame first (about 0.4 ms a frame in the heavy areas).
+    const auto cmdbuf = draw_scheduler.TailCommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &pre_barrier,
@@ -1184,11 +1187,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             });
     }
 
-    // Flush frame creation commands.
+    // Flush frame creation commands (with threaded recording, submitted by the recording thread
+    // once it has recorded them: no wait here).
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
-    draw_scheduler.Flush(info);
+    draw_scheduler.FlushFrame(info);
 
     // Threaded renderer (after bbport's BB_FRAMES_AHEAD): the GPU command thread runs at most
     // N guest frames ahead of the GPU (default 1 as in bbport; SHADPS4_BB_FRAMES_AHEAD, 0 =
@@ -1582,6 +1586,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                        game_area);
 
     SubmitInfo info{};
+    // The frame's own submission may still be on its way (FlushFrame submits on the recording
+    // thread): this one waits for it on the same queue, so it must not go first.
+    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+        draw_scheduler.WaitSubmitted(frame->ready_tick);
+    }
     // The first wait covers all commands, including Streamline's volatile input copies.
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddWait(swapchain.GetImageAcquiredSemaphore());

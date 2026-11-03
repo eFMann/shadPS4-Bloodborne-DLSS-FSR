@@ -12,6 +12,7 @@
 #include "video_core/host_shaders/bb_mirror_seed_depth_frag.h"
 #include "video_core/host_shaders/bb_mirror_seed_stencil_frag.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -308,16 +309,42 @@ void BbVelocityMirror::SetEnabled(bool enabled) {
 }
 bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
                              const GraphicsPipeline& pipeline, const RenderState& guest_state,
-                             VideoCore::Image* guest_depth, u32 depth_layer, const Capture& capture,
+                             const DepthSource* guest_depth, const Capture& capture,
                              bool& guest_pass_ended) {
+    BB_STAGE_CENSUS("BbVelocityMirror::Defer", Features);
     guest_pass_ended = false;
     if (!impl->requested || impl->stopped || impl->failed || !pipeline.VelocityMirrorHandle() ||
         guest_state.width < MinSourceWidth || guest_state.height < MinSourceHeight ||
         guest_state.num_layers != 1 || guest_state.num_color_attachments != 1 ||
-        !guest_state.depth_stencil_attachment.has_depth || !guest_depth || !guest_depth->backing ||
-        depth_layer != 0)
+        !guest_state.depth_stencil_attachment.has_depth || !guest_depth || !guest_depth->image ||
+        guest_depth->layer != 0)
         return false;
-    const auto& depth_ci = guest_depth->backing->image.image_ci;
+    const u32 depth_layer = guest_depth->layer;
+    const DepthSource& depth_ci = *guest_depth;
+    // Seeding reads the guest depth between two barriers of its own: out of the guest pass's
+    // layout and back into it (the texture cache's layout tracking stays as it was).
+    const auto guest_barrier = [&](vk::CommandBuffer command, bool to_read, vk::ImageLayout read,
+                                   vk::PipelineStageFlags2 read_stage,
+                                   vk::AccessFlags2 read_access) {
+        constexpr auto tests = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                               vk::PipelineStageFlagBits2::eLateFragmentTests;
+        constexpr auto attachment = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+        const auto pass_layout = guest_state.depth_stencil_attachment.image_layout;
+        auto range = DepthRange(depth_ci.format);
+        range.baseArrayLayer = depth_layer;
+        const vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = to_read ? tests : read_stage,
+            .srcAccessMask = to_read ? attachment : read_access,
+            .dstStageMask = to_read ? read_stage : tests,
+            .dstAccessMask = to_read ? read_access : attachment,
+            .oldLayout = to_read ? pass_layout : read,
+            .newLayout = to_read ? read : pass_layout,
+            .image = depth_ci.image,
+            .subresourceRange = range};
+        command.pipelineBarrier2(
+            vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    };
     if ((depth_ci.format != vk::Format::eD32SfloatS8Uint &&
          depth_ci.format != vk::Format::eD16Unorm) ||
         guest_state.depth_stencil_attachment.has_stencil != HasStencil(depth_ci.format) ||
@@ -361,12 +388,15 @@ bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Schedul
         std::abs(viewport.height) != float(SourceHeight))
         return false;
     if (impl->image && (impl->size != impl->target || impl->depth_format != depth_ci.format)) {
-        scheduler.Finish(); // the old images may still be in flight (pending draws flushed)
+        // The old images go once the GPU has done the work recorded so far, a batch still
+        // drawing into them recorded first. No submission here: this may run on the draw
+        // recorder's finish thread, and a submission is the resolve thread's.
+        scheduler.EndRendering();
+        FlushBatch(scheduler);
         guest_pass_ended = true;
-        impl->image.reset();
-        impl->depth.reset();
-        impl->view.reset();
-        impl->depth_view.reset();
+        scheduler.DeferOperation([image = std::move(impl->image), depth = std::move(impl->depth),
+                                  view = std::move(impl->view),
+                                  depth_view = std::move(impl->depth_view)] {});
         impl->layout = impl->depth_layout = vk::ImageLayout::eUndefined;
         impl->frame_drawn = false;
     }
@@ -448,7 +478,7 @@ bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Schedul
                 const vk::ImageViewUsageCreateInfo usage{.usage = vk::ImageUsageFlagBits::eSampled};
                 auto view = device.createImageView(
                     vk::ImageViewCreateInfo{.pNext = &usage,
-                                            .image = guest_depth->GetImage(),
+                                            .image = guest_depth->image,
                                             .viewType = vk::ImageViewType::e2D,
                                             .format = depth_ci.format,
                                             .subresourceRange = {.aspectMask = aspect,
@@ -468,10 +498,9 @@ bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Schedul
                 if (stencil_source)
                     device.destroyImageView(stencil_source);
             });
-            runtime.Transit(guest_depth, vk::ImageLayout::eDepthStencilReadOnlyOptimal,
-                            vk::PipelineStageFlagBits2::eFragmentShader,
-                            vk::AccessFlagBits2::eShaderSampledRead);
-            runtime.FlushBarriers();
+            guest_barrier(command, true, vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                          vk::PipelineStageFlagBits2::eFragmentShader,
+                          vk::AccessFlagBits2::eShaderSampledRead);
             impl->TransitDepth(command, vk::ImageLayout::eDepthStencilAttachmentOptimal,
                                vk::PipelineStageFlagBits2::eEarlyFragmentTests |
                                    vk::PipelineStageFlagBits2::eLateFragmentTests,
@@ -491,13 +520,10 @@ bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Schedul
             impl->seeder->Record(command, depth_ci.format, depth_source, stencil_source,
                                  {guest_state.width, guest_state.height}, {Width, Height});
             scheduler.EndRendering();
-            runtime.Transit(guest_depth, guest_state.depth_stencil_attachment.image_layout,
-                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                vk::PipelineStageFlagBits2::eLateFragmentTests,
-                            vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
-            runtime.FlushBarriers();
-            impl->source_depth_uid = guest_depth->image_uid;
+            guest_barrier(command, false, vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                          vk::PipelineStageFlagBits2::eFragmentShader,
+                          vk::AccessFlagBits2::eShaderSampledRead);
+            impl->source_depth_uid = guest_depth->uid;
             // The seeding draws replaced the guest's dynamic state, descriptors and push
             // constants; restore them for the replay and the guest draw after it.
             auto& dynamic = scheduler.GetDynamicState();
@@ -507,9 +533,8 @@ bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Schedul
         if (!impl->frame_drawn && blit) {
             // Seed the exact original render-area depth/stencil BEFORE the first guest draw.
             // Nearest scaling preserves its visibility tests; the original image is read only.
-            runtime.Transit(guest_depth, vk::ImageLayout::eTransferSrcOptimal,
-                            vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
-            runtime.FlushBarriers();
+            guest_barrier(command, true, vk::ImageLayout::eTransferSrcOptimal,
+                          vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
             impl->TransitDepth(command, vk::ImageLayout::eTransferDstOptimal,
                                vk::PipelineStageFlagBits2::eBlit,
                                vk::AccessFlagBits2::eTransferWrite);
@@ -528,17 +553,13 @@ bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Schedul
                     .dstOffsets =
                         std::array{vk::Offset3D{}, vk::Offset3D{s32(Width), s32(Height), 1}}};
             }
-            command.blitImage(guest_depth->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+            command.blitImage(guest_depth->image, vk::ImageLayout::eTransferSrcOptimal,
                               impl->depth->image, vk::ImageLayout::eTransferDstOptimal,
                               vk::ArrayProxy<const vk::ImageBlit>{blit_count, blits.data()},
                               vk::Filter::eNearest);
-            runtime.Transit(guest_depth, guest_state.depth_stencil_attachment.image_layout,
-                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                vk::PipelineStageFlagBits2::eLateFragmentTests,
-                            vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
-            runtime.FlushBarriers();
-            impl->source_depth_uid = guest_depth->image_uid;
+            guest_barrier(command, false, vk::ImageLayout::eTransferSrcOptimal,
+                          vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
+            impl->source_depth_uid = guest_depth->uid;
         }
         RenderState mirror{};
         mirror.width = Width;
@@ -614,25 +635,32 @@ void BbVelocityMirror::FlushBatch(Scheduler& scheduler) {
                                      vk::AccessFlagBits2::eColorAttachmentWrite);
     scheduler.BeginRendering(impl->batch_state);
     scheduler.Record([commands = std::move(commands)](vk::CommandBuffer command) mutable {
+        const auto start = std::chrono::steady_clock::now();
         for (auto& replay : commands) {
             replay(vk::CommandBuffer{command});
         }
+        RecordingCosts::mirror_ns.fetch_add(
+            (std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+        RecordingCosts::mirror_commands.fetch_add(commands.size(), std::memory_order_relaxed);
+        RecordingCosts::mirror_batches.fetch_add(1, std::memory_order_relaxed);
     });
     scheduler.EndRendering();
     // The replays changed the bound pipeline, descriptors and dynamic state.
     scheduler.GetDynamicState().Invalidate();
 }
-std::optional<BbVelocityMirror::Frame> BbVelocityMirror::ConsumeFrame(vk::CommandBuffer command) {
+std::optional<BbVelocityMirror::Frame> BbVelocityMirror::ConsumeFrame(Scheduler& scheduler) {
     if (!impl->requested || impl->stopped || impl->failed || !impl->frame_drawn || !impl->image)
         return {};
     if (impl->batch_active && impl->scheduler) {
-        // Normally flushed when the guest pass ended; the caller records directly here.
+        // Normally flushed when the guest pass ended.
         impl->scheduler->EndRendering();
         FlushBatch(*impl->scheduler);
     }
     impl->frame_drawn = false;
-    impl->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
-                  vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+    // In order through the recording thread (the caller doesn't wait for it).
+    impl->TransitRecorded<false>(scheduler, vk::ImageLayout::eShaderReadOnlyOptimal,
+                                 vk::PipelineStageFlagBits2::eComputeShader,
+                                 vk::AccessFlagBits2::eShaderRead);
     return Frame{*impl->view, impl->size};
 }
 void BbVelocityMirror::SetTargetSize(vk::Extent2D size) {

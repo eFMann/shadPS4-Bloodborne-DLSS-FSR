@@ -14,6 +14,7 @@
 #include "common/path_util.h"
 #include "core/bb_frame_rate.h"
 #include "core/bb_game_fixes.h"
+#include "core/bb_gx_draws.h"
 #include "core/bb_mouse_camera.h"
 #include "core/bb_resolution.h"
 #include "core/emulator_state.h"
@@ -332,6 +333,7 @@ void OnGameLoaded() {
     Core::BbResolution::Install();
     Core::BbGameFixes::Install();
     Core::BbFrameRate::Install();
+    Core::BbGxDraws::Install();
     // Keyboard and mouse controls: the mouse turns Bloodborne's camera directly.
     if (Input::BbKbm::Active())
         Core::BbMouseCamera::Install();

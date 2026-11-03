@@ -7,6 +7,9 @@
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include <cstring>
+#include <vector>
+
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -65,6 +68,105 @@ struct PushedWrites {
         }
     }
 };
+/// Push descriptor writes as one recorded command's data: each write's binding, type and count,
+/// then the infos (the WriteDescriptorSets are rebuilt when recorded). A few hundred bytes a draw
+/// instead of a fixed-capacity copy of the writes (~2.6 KB).
+struct CompactWrite {
+    u32 binding;
+    u32 array_element;
+    u32 count;
+    vk::DescriptorType type;
+    u32 kind; ///< 0 image infos, 1 buffer infos, 2 texel buffer views
+    u32 pad;
+};
+struct CompactWritesHeader {
+    u32 num_writes;
+    u32 num_images;
+    u32 num_buffers;
+    u32 num_texels;
+};
+
+/// Encodes `source` (false: a write this format cannot hold).
+bool EncodeWrites(const Pipeline::DescriptorWrites& source, std::vector<u8>& out) {
+    CompactWritesHeader header{u32(source.size()), 0, 0, 0};
+    for (const auto& write : source) {
+        const int kinds = (write.pImageInfo ? 1 : 0) + (write.pBufferInfo ? 1 : 0) +
+                          (write.pTexelBufferView ? 1 : 0);
+        if (write.pNext || kinds != 1) {
+            return false;
+        }
+        (write.pImageInfo ? header.num_images
+                          : write.pBufferInfo ? header.num_buffers : header.num_texels) +=
+            write.descriptorCount;
+    }
+    out.resize(sizeof(header) + header.num_writes * sizeof(CompactWrite) +
+               header.num_images * sizeof(vk::DescriptorImageInfo) +
+               header.num_buffers * sizeof(vk::DescriptorBufferInfo) +
+               header.num_texels * sizeof(vk::BufferView));
+    u8* at = out.data();
+    std::memcpy(at, &header, sizeof(header));
+    at += sizeof(header);
+    u8* images = at + header.num_writes * sizeof(CompactWrite);
+    u8* buffers = images + header.num_images * sizeof(vk::DescriptorImageInfo);
+    u8* texels = buffers + header.num_buffers * sizeof(vk::DescriptorBufferInfo);
+    for (const auto& write : source) {
+        const CompactWrite compact{write.dstBinding, write.dstArrayElement, write.descriptorCount,
+                                   write.descriptorType,
+                                   write.pImageInfo ? 0u : write.pBufferInfo ? 1u : 2u, 0};
+        std::memcpy(at, &compact, sizeof(compact));
+        at += sizeof(compact);
+        if (write.pImageInfo) {
+            const size_t bytes = write.descriptorCount * sizeof(vk::DescriptorImageInfo);
+            std::memcpy(images, write.pImageInfo, bytes);
+            images += bytes;
+        } else if (write.pBufferInfo) {
+            const size_t bytes = write.descriptorCount * sizeof(vk::DescriptorBufferInfo);
+            std::memcpy(buffers, write.pBufferInfo, bytes);
+            buffers += bytes;
+        } else {
+            const size_t bytes = write.descriptorCount * sizeof(vk::BufferView);
+            std::memcpy(texels, write.pTexelBufferView, bytes);
+            texels += bytes;
+        }
+    }
+    return true;
+}
+
+/// Records the writes EncodeWrites stored.
+void PushCompactWrites(vk::CommandBuffer cmdbuf, vk::PipelineBindPoint bind_point,
+                       vk::PipelineLayout layout, const u8* at) {
+    CompactWritesHeader header;
+    std::memcpy(&header, at, sizeof(header));
+    at += sizeof(header);
+    const auto* compact = reinterpret_cast<const CompactWrite*>(at);
+    const auto* images = reinterpret_cast<const vk::DescriptorImageInfo*>(
+        at + header.num_writes * sizeof(CompactWrite));
+    const auto* buffers = reinterpret_cast<const vk::DescriptorBufferInfo*>(
+        reinterpret_cast<const u8*>(images) + header.num_images * sizeof(vk::DescriptorImageInfo));
+    const auto* texels = reinterpret_cast<const vk::BufferView*>(
+        reinterpret_cast<const u8*>(buffers) +
+        header.num_buffers * sizeof(vk::DescriptorBufferInfo));
+    boost::container::small_vector<vk::WriteDescriptorSet, 32> writes(header.num_writes);
+    for (u32 i = 0; i < header.num_writes; ++i) {
+        const auto& c = compact[i];
+        auto& write = writes[i];
+        write.dstBinding = c.binding;
+        write.dstArrayElement = c.array_element;
+        write.descriptorCount = c.count;
+        write.descriptorType = c.type;
+        if (c.kind == 0) {
+            write.pImageInfo = images;
+            images += c.count;
+        } else if (c.kind == 1) {
+            write.pBufferInfo = buffers;
+            buffers += c.count;
+        } else {
+            write.pTexelBufferView = texels;
+            texels += c.count;
+        }
+    }
+    cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+}
 } // Anonymous namespace
 
 void Pipeline::BindResources(DescriptorWrites& set_writes,
@@ -84,6 +186,15 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     }
 
     if (uses_push_descriptors) {
+        thread_local std::vector<u8> encoded;
+        if (EncodeWrites(set_writes, encoded)) {
+            scheduler.RecordData(
+                [bind_point, layout](vk::CommandBuffer cmdbuf, const u8* data) {
+                    PushCompactWrites(cmdbuf, bind_point, layout, data);
+                },
+                encoded.data(), u32(encoded.size()));
+            return;
+        }
         scheduler.Record([bind_point, layout,
                           pushed = PushedWrites{set_writes}](vk::CommandBuffer cmdbuf) mutable {
             pushed.Fixup();

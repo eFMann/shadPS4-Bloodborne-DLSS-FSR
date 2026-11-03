@@ -105,6 +105,16 @@ public:
         game_frames.fetch_add(1, std::memory_order_relaxed);
     }
 
+    /// A pipeline the caller remembers for this draw's state (the GX pipeline memo): what
+    /// GetGraphicsPipeline does besides finding it (each stage's user data and resource tables
+    /// read for this draw, the depth target's use). Null when finished background work is
+    /// waiting: GetGraphicsPipeline then. Direct draws only.
+    const GraphicsPipeline* ReuseGraphicsPipeline(const GraphicsPipeline* pipeline);
+    /// Changes when pipelines are destroyed (shader replacement): remembered ones are void then.
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation;
+    }
+
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
@@ -207,6 +217,7 @@ private:
     std::vector<FinishedShader> finished_shaders;
     void CollectBackgroundShader(FinishedShader& done);
     std::atomic<u32> num_finished{0};
+    u64 generation{};
     tsl::robin_map<GraphicsPipelineKey, u8> pending_pipelines; ///< GPU command thread only
     /// Shaders being translated in the background (GPU command thread only): a new program,
     /// and new variants of known ones.

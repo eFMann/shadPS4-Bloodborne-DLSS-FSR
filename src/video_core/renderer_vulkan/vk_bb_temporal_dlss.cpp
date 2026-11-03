@@ -10,11 +10,13 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 #include <fmt/format.h>
 #include "common/bb_tuning.h"
 #include "common/crash_crumbs.h"
@@ -33,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_bb_library.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
@@ -269,7 +272,9 @@ struct OwnedImage {
     DlssNgx::Resource Resource() const {
         return {image.image, *view, Range, format, extent};
     }
-    void Transit(vk::CommandBuffer command, vk::ImageLayout next, vk::PipelineStageFlags2 stage,
+    /// `command`: a vk::CommandBuffer, or QueuedCommands (recorded by the recording thread).
+    template <typename Command>
+    void Transit(const Command& command, vk::ImageLayout next, vk::PipelineStageFlags2 stage,
                  vk::AccessFlags2 access) {
         const vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -288,6 +293,91 @@ struct OwnedImage {
         command.pipelineBarrier2(
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
         layout = next;
+    }
+};
+
+// Records like a vk::CommandBuffer, in order through the scheduler: the recording thread writes
+// the commands, so the caller doesn't wait for it to catch up first (as a direct command buffer
+// makes it do). Every argument is copied when the command is queued.
+struct QueuedCommands {
+    Scheduler& scheduler;
+
+    void pipelineBarrier2(const vk::DependencyInfo& info) const {
+        std::vector<vk::MemoryBarrier2> memory(info.pMemoryBarriers,
+                                               info.pMemoryBarriers + info.memoryBarrierCount);
+        std::vector<vk::BufferMemoryBarrier2> buffers(
+            info.pBufferMemoryBarriers, info.pBufferMemoryBarriers + info.bufferMemoryBarrierCount);
+        std::vector<vk::ImageMemoryBarrier2> images(
+            info.pImageMemoryBarriers, info.pImageMemoryBarriers + info.imageMemoryBarrierCount);
+        scheduler.Record([flags = info.dependencyFlags, memory = std::move(memory),
+                          buffers = std::move(buffers),
+                          images = std::move(images)](vk::CommandBuffer command) {
+            command.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = flags,
+                .memoryBarrierCount = static_cast<u32>(memory.size()),
+                .pMemoryBarriers = memory.data(),
+                .bufferMemoryBarrierCount = static_cast<u32>(buffers.size()),
+                .pBufferMemoryBarriers = buffers.data(),
+                .imageMemoryBarrierCount = static_cast<u32>(images.size()),
+                .pImageMemoryBarriers = images.data()});
+        });
+    }
+    void bindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) const {
+        scheduler.Record([point, pipeline](vk::CommandBuffer command) {
+            command.bindPipeline(point, pipeline);
+        });
+    }
+    void pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout, u32 set,
+                              std::span<const vk::WriteDescriptorSet> writes) const {
+        // The writes' image and buffer infos are copied too; the pointers are set again when
+        // the command is recorded.
+        std::vector<vk::WriteDescriptorSet> copied(writes.begin(), writes.end());
+        std::vector<vk::DescriptorImageInfo> images;
+        std::vector<vk::DescriptorBufferInfo> buffers;
+        for (const auto& write : writes) {
+            if (write.pImageInfo) {
+                images.insert(images.end(), write.pImageInfo,
+                              write.pImageInfo + write.descriptorCount);
+            }
+            if (write.pBufferInfo) {
+                buffers.insert(buffers.end(), write.pBufferInfo,
+                               write.pBufferInfo + write.descriptorCount);
+            }
+        }
+        scheduler.Record([point, layout, set, writes = std::move(copied),
+                          images = std::move(images),
+                          buffers = std::move(buffers)](vk::CommandBuffer command) mutable {
+            size_t image = 0, buffer = 0;
+            for (auto& write : writes) {
+                if (write.pImageInfo) {
+                    write.pImageInfo = images.data() + image;
+                    image += write.descriptorCount;
+                }
+                if (write.pBufferInfo) {
+                    write.pBufferInfo = buffers.data() + buffer;
+                    buffer += write.descriptorCount;
+                }
+            }
+            command.pushDescriptorSetKHR(point, layout, set, writes);
+        });
+    }
+    void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, u32 offset,
+                       u32 size, const void* values) const {
+        std::array<u8, 128> data{};
+        ASSERT(size <= data.size());
+        std::memcpy(data.data(), values, size);
+        scheduler.Record([layout, stages, offset, size, data](vk::CommandBuffer command) {
+            command.pushConstants(layout, stages, offset, size, data.data());
+        });
+    }
+    void dispatch(u32 x, u32 y, u32 z) const {
+        scheduler.Record([x, y, z](vk::CommandBuffer command) { command.dispatch(x, y, z); });
+    }
+    void copyImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
+                   vk::ImageLayout dst_layout, const vk::ImageCopy& region) const {
+        scheduler.Record([=](vk::CommandBuffer command) {
+            command.copyImage(src, src_layout, dst, dst_layout, region);
+        });
     }
 };
 
@@ -407,6 +497,9 @@ const char* BackendName(Backend backend) {
 
 struct BbTemporalDlss::Impl {
     bool requested{}, failed{}, stopped{};
+    // A DLSS evaluation the recording thread found failed (1: failed, 2: decoupled UI mode
+    // unsupported); seen at the next evaluation.
+    std::atomic<int> evaluate_failed{0};
     Tune tune;
     std::filesystem::path tune_path;
     std::filesystem::file_time_type tune_time{};
@@ -869,7 +962,7 @@ struct BbTemporalDlss::Impl {
         producer_constants = producer_depths = velocity_draw_constants = 0;
         r32_depth.reset();
         depth_fallback = false;
-        mirror.ConsumeFrame(scheduler.CommandBuffer()); // start a fresh mirror every frame
+        mirror.ConsumeFrame(scheduler); // start a fresh mirror every frame
         if (object_motion)
             object_motion->OnFrameStart();
         ++frame;
@@ -990,7 +1083,7 @@ struct BbTemporalDlss::Impl {
 
     // Copies this frame's depth and motion for frame generation and describes its camera.
     void CaptureFrameGen(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
-                         vk::CommandBuffer command, VideoCore::Image& depth, vk::Extent2D in,
+                         const QueuedCommands& command, VideoCore::Image& depth, vk::Extent2D in,
                          const DlssNgx::EvalDesc& eval) {
         frame_gen_pending.reset();
         if (!FrameGen::Active() || !frame_has_camera || !camera.valid || !previous_camera.valid ||
@@ -1326,6 +1419,11 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     Common::Crumbs::Add("upscaler: evaluate (width, height)", source.info.size.width,
                         source.info.size.height);
     auto* ngx = instance.GetDlssNgx();
+    if (const int failure = evaluate_failed.exchange(0, std::memory_order_relaxed)) {
+        (failure == 2 ? decoupled_unsupported : failed) = true;
+        LOG_ERROR(Render_Vulkan, "[DLSS-TEMPORAL] Evaluation failed; stock rendering");
+        return false;
+    }
     const vk::Extent2D in{source.info.size.width, source.info.size.height};
     VideoCore::Image* depth =
         r32_depth ? cache.TryGetImage(r32_depth->id, r32_depth->uid) : nullptr;
@@ -1465,8 +1563,10 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     }
 
     // Only now: the Finish() calls above submit the command buffer, and recording into a
-    // submitted one crashes AMD's driver.
-    const auto command = scheduler.CommandBuffer();
+    // submitted one crashes AMD's driver. Queued: a direct command buffer here made the draw
+    // recorder wait for the recording thread (about 0.5 ms a frame, mostly the velocity mirror's
+    // batch recorded just before).
+    const QueuedCommands command{scheduler};
     // Snapshot of the scene as DLSS color input (pre-HUD at the first Scaleform draw).
     VideoCore::ImageViewInfo source_info{};
     source_info.format = vk::Format::eR8G8B8A8Unorm;
@@ -1524,7 +1624,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                       vk::AccessFlagBits2::eShaderRead);
 
     // Motion: camera reprojection, replaced by object velocity where the mirror covers.
-    const auto mirror_frame = mirror.ConsumeFrame(command);
+    const auto mirror_frame = mirror.ConsumeFrame(scheduler);
     mirror.SetTargetSize(in);
     const bool use_mirror =
         tune.mirror && velocity_constants && mirror_frame && mirror_frame->extent == in;
@@ -1548,7 +1648,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     bool character_valid = false;
     vk::ImageView character_view{};
     if (object_motion && object_motion->Enabled())
-        character_view = object_motion->PrepareRead(command, in.width, in.height, character_valid);
+        character_view = object_motion->PrepareRead(in.width, in.height, character_valid);
     if (character_valid)
         ++character_motion_frames;
     {
@@ -1687,16 +1787,35 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     const DlssNgx::EvalDesc eval{(tune.swap ? applied[1] : applied[0]) * tune.sign_x,
                                  (tune.swap ? applied[0] : applied[1]) * tune.sign_y, reset,
                                  frame_ms};
-    const bool success =
-        backend == Backend::Dlss
-            ? ngx->Evaluate(command, (linear ? linear_color : snapshot)->Resource(), depth_resource,
-                            motion->Resource(), upscaled->Resource(), eval)
-        : backend == Backend::Fsr4
-            ? fsr4->Evaluate(command, (linear ? linear_color : snapshot)->Resource(),
-                             depth_resource, motion->Resource(), upscaled->Resource(), eval,
-                             FsrCamera(), hdr ? (tune.auto_exposure ? 1 : 2) : 0)
-            : fsr->Evaluate(command, (linear ? linear_color : snapshot)->Resource(), depth_resource,
-                            motion->Resource(), upscaled->Resource(), eval, FsrCamera());
+    bool success = true;
+    if (backend == Backend::Dlss) {
+        // Recorded by the recording thread like the passes around it; a failure is seen at the
+        // next evaluation (stock rendering from then on, as before).
+        scheduler.Record([ngx, color = (linear ? linear_color : snapshot)->Resource(),
+                          depth_resource, motion_resource = motion->Resource(),
+                          output_resource = upscaled->Resource(), eval,
+                          failure = &evaluate_failed,
+                          mode = upscale_to ? 2 : 1](vk::CommandBuffer cmdbuf) {
+            const auto start = std::chrono::steady_clock::now();
+            if (!ngx->Evaluate(cmdbuf, color, depth_resource, motion_resource, output_resource,
+                               eval)) {
+                failure->store(mode, std::memory_order_relaxed);
+            }
+            RecordingCosts::upscaler_ns.fetch_add(
+                (std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+            RecordingCosts::upscaler_calls.fetch_add(1, std::memory_order_relaxed);
+        });
+    } else {
+        // FSR 4 waits for and tracks its own submissions through the scheduler: recorded here.
+        const auto direct = scheduler.CommandBuffer();
+        success = backend == Backend::Fsr4
+                      ? fsr4->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
+                                       depth_resource, motion->Resource(), upscaled->Resource(),
+                                       eval, FsrCamera(), hdr ? (tune.auto_exposure ? 1 : 2) : 0)
+                      : fsr->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
+                                      depth_resource, motion->Resource(), upscaled->Resource(),
+                                      eval, FsrCamera());
+    }
     scheduler.GetDynamicState().Invalidate(); // the upscaler records its own Vulkan state
     if (!success) {
         (upscale_to ? decoupled_unsupported : failed) = true;
@@ -2142,6 +2261,7 @@ void BbTemporalDlss::SetObjectMotion(BbObjectMotion* object_motion) {
 
 void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::ImageId id,
                                     const VideoCore::ImageViewInfo& view, u64 hash, u32 slot) {
+    BB_STAGE_CENSUS("BbTemporalDlss::ObserveTexture", Features);
     if (!impl->requested || impl->failed || impl->stopped)
         return;
     if (hash == DepthProducer && slot == 0 && image.info.pixel_format == vk::Format::eR32Sfloat &&
@@ -2213,6 +2333,7 @@ void BbTemporalDlss::ObserveSceneConstants(const void* data, u64 size) {
 void BbTemporalDlss::ObserveConstants(Runtime& runtime, const Instance& instance,
                                       const VideoCore::Buffer* source, u64 offset, u64 size,
                                       u64 hash, u32 binding) {
+    BB_STAGE_CENSUS("BbTemporalDlss::ObserveConstants", Features);
     if (!impl->requested || impl->failed || impl->stopped || !source)
         return;
     impl->producer_constants += hash == DepthProducer && binding == 0;
@@ -2428,10 +2549,12 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
 }
 
 std::optional<BbTemporalDlss::DrawReplacement> BbTemporalDlss::TakeDrawReplacement() {
+    BB_STAGE_CENSUS("BbTemporalDlss::TakeDrawReplacement", Features);
     return std::exchange(impl->replacement, std::nullopt);
 }
 
 std::optional<BbTemporalDlss::DisplayCopyReplay> BbTemporalDlss::TakeDisplayCopyReplay() {
+    BB_STAGE_CENSUS("BbTemporalDlss::TakeDisplayCopyReplay", Features);
     return std::exchange(impl->display_copy_replay, std::nullopt);
 }
 

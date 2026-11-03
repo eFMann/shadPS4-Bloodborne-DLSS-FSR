@@ -51,4 +51,10 @@ static inline u64 FencedRDTSC() {
 
 u64 EstimateRDTSCFrequency();
 
+/// Nanoseconds a TSC tick, measured from the first call to now (no waiting; rough during the
+/// first few milliseconds). For converting busy times counted in ticks: reading the TSC costs a
+/// fraction of the system clock (QueryPerformanceCounter was ~2% of all CPU time at many reads
+/// a draw).
+double TscNsPerTick();
+
 } // namespace Common

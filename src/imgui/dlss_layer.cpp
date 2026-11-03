@@ -35,6 +35,7 @@
 #include "input/controller.h"
 #include "input/input_mouse.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_bb_perf_meter.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
 #include "video_core/renderer_vulkan/vk_hdr_mod.h"
@@ -280,7 +281,9 @@ public:
         const bool show_graph = EmulatorSettings.IsBbCounterGraph();
         const auto status = Vulkan::BbTemporalDlssStatus();
         // Nothing to show (only the upscaler, which isn't running): no box.
-        const bool show_line = show_fps || show_ms || (show_upscaler && status.active);
+        const bool show_meter = EmulatorSettings.IsBbPerfMeter();
+        const bool show_line =
+            show_fps || show_ms || (show_upscaler && status.active) || show_meter;
         if (!show_line && !show_graph)
             return;
         const auto stats = Vulkan::FrameGen::GetStats();
@@ -357,6 +360,30 @@ public:
                 if (EmulatorSettings.IsBbCounterResolution()) {
                     SameLine();
                     Text("%ux%u", status.output_width, status.output_height);
+                }
+            }
+            if (show_meter) {
+                // Performance meter: the stage holding the frame rate, and each stage's busy
+                // time a frame (the command thread's largest steps in brackets).
+                const auto meter = Vulkan::PerfMeter::Get();
+                if (!meter.valid) {
+                    TextDisabled("Performance meter: waiting (Bloodborne, threaded renderer)");
+                } else {
+                    const ImVec4 amber{1.0f, 0.75f, 0.3f, 1.0f};
+                    if (meter.limit_load > 0.0) {
+                        TextColored(amber, "Limit: %s %.0f%%", meter.limit.c_str(),
+                                    meter.limit_load * 100.0);
+                    } else {
+                        TextColored(amber, "Limit: %s", meter.limit.c_str());
+                    }
+                    SameLine();
+                    Text("| next: %s %.0f%%", meter.next.c_str(), meter.next_load * 100.0);
+                    const std::string gpu =
+                        meter.gpu_ms >= 0.0 ? fmt::format("{:.1f} ms", meter.gpu_ms) : "-";
+                    Text("CP %.1f ms%s | recorder %.1f ms | GPU %s | %.0f draws", meter.cmd_ms,
+                         meter.cmd_steps.empty() ? ""
+                                                 : fmt::format(" ({})", meter.cmd_steps).c_str(),
+                         meter.rec_ms, gpu.c_str(), meter.draws_per_frame);
                 }
             }
             box_min = GetWindowPos();

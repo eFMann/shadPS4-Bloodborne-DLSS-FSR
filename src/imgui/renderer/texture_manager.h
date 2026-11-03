@@ -27,4 +27,7 @@ void DecodePngFile(std::filesystem::path path, Inner* core);
 
 void Submit();
 
+/// Called once an ImGui frame is rendered: released textures are destroyed some frames later.
+void FrameRendered();
+
 }; // namespace ImGui::Core::TextureManager

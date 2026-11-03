@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/texture_cache/image.h"
 
@@ -97,6 +98,7 @@ public:
 
     /// Retrieves the stream buffer.
     [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
+        BB_STAGE_CENSUS("BufferCache::GetStreamBuffer", Caches);
         return stream_buffer;
     }
 

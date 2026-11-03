@@ -702,6 +702,31 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return it->second.get();
 }
 
+const GraphicsPipeline* PipelineCache::ReuseGraphicsPipeline(const GraphicsPipeline* pipeline) {
+    if (num_finished.load(std::memory_order_acquire) != 0) {
+        return nullptr;
+    }
+    // What GetProgram does for a known shader at every draw: its stages read this draw's user
+    // data (and the resource tables it points to) and program address.
+    const auto& regs = liverpool->regs;
+    for (const Shader::Info* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage->hw_stage));
+        if (!pgm || !pgm->Address<u32*>()) {
+            return nullptr;
+        }
+        auto& info = const_cast<Shader::Info&>(*stage);
+        info.pgm_base = pgm->Address<VAddr>();
+        info.user_data = pgm->user_data;
+        info.RefreshFlatBuf();
+    }
+    draw_indirect_params = {};
+    NoteDepthTarget();
+    return pipeline;
+}
+
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
@@ -1316,6 +1341,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         }
     }
     if (module_related_pipelines.contains(module)) {
+        ++generation;
         auto& pipeline_keys = module_related_pipelines[module];
         for (auto& key : pipeline_keys) {
             if (std::holds_alternative<GraphicsPipelineKey>(key)) {

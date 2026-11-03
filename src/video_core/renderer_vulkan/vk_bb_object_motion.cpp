@@ -287,8 +287,7 @@ void BbObjectMotion::Attach(RenderState& state) {
     state.num_color_attachments = std::max<u16>(state.num_color_attachments, slot + 1);
 }
 
-vk::ImageView BbObjectMotion::PrepareRead(vk::CommandBuffer cmd, u32 width, u32 height,
-                                          bool& valid) {
+vk::ImageView BbObjectMotion::PrepareRead(u32 width, u32 height, bool& valid) {
     valid = false;
     if (!enabled) {
         return {};
@@ -321,7 +320,10 @@ vk::ImageView BbObjectMotion::PrepareRead(vk::CommandBuffer cmd, u32 width, u32 
         .image = target->image,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
-    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    // In order through the recording thread (the caller doesn't wait for it).
+    scheduler.Record([barrier](vk::CommandBuffer cmd) {
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    });
     target->layout = vk::ImageLayout::eGeneral;
     read_target = target;
     return target->view;

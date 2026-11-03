@@ -38,6 +38,8 @@ int SettingsWindow::GetComboIndex(std::string selection, std::vector<std::string
 }
 
 void SettingsWindow::LoadSettings(std::string profile) {
+    // In game: on a copy, applied in one step (see EmulatorSettingsImpl::ReloadScope).
+    const EmulatorSettingsImpl::ReloadScope reload;
     // Global-only settings
     EmulatorSettings.Load();
     scanDepthSetting = EmulatorSettings.GetBigPictureFolderDepth();
@@ -163,6 +165,11 @@ void SettingsWindow::LoadSettings(std::string profile) {
 
 void SettingsWindow::SaveSettings(std::string profile) {
     const bool isSpecific = currentProfile != "Global";
+    // What this save changes, for the log (a save in game has crashed the GPU: which setting).
+    const auto settings_before = EmulatorSettings.Snapshot();
+    // The display mode before: it is applied again only when it changed.
+    const bool fullscreenBefore = EmulatorSettings.IsFullScreen();
+    const std::string fullscreenModeBefore = EmulatorSettings.GetFullScreenMode();
 
     /////////// General Tab
     EmulatorSettings.SetConsoleLanguage(languageMap.at(languageOptions.at(consoleLanguageSetting)),
@@ -272,15 +279,47 @@ void SettingsWindow::SaveSettings(std::string profile) {
         EmulatorSettings.SetVblankFrequency(vblankFrequencySetting, true);
     }
 
+    {
+        const auto settings_after = EmulatorSettings.Snapshot();
+        u32 changes = 0;
+        for (const auto& [layer, sections] : settings_after.items()) {
+            for (const auto& [section, keys] : sections.items()) {
+                if (!keys.is_object()) {
+                    continue;
+                }
+                for (const auto& [key, value] : keys.items()) {
+                    const auto& old_layer = settings_before[layer];
+                    const bool had = old_layer.contains(section) &&
+                                     old_layer[section].is_object() &&
+                                     old_layer[section].contains(key);
+                    if (!had || old_layer[section][key] != value) {
+                        LOG_INFO(Config, "Settings save changes {} {}.{}: {} -> {}", layer,
+                                 section, key, had ? old_layer[section][key].dump() : "(none)",
+                                 value.dump());
+                        ++changes;
+                    }
+                }
+            }
+        }
+        LOG_INFO(Config, "Settings save: {} changed ({} profile)", changes,
+                 isSpecific ? "game" : "global");
+    }
     isSpecific ? EmulatorSettings.Save(profile) : EmulatorSettings.Save();
 
-    // Switch the open window to the chosen display mode now rather than at the next launch.
-    SDL_Event event{};
-    event.type = SDL_EVENT_APPLY_DISPLAY_MODE;
-    SDL_PushEvent(&event);
+    // Switch the open window to the chosen display mode now rather than at the next launch, only
+    // when it changed: applying it again switches the screen's mode in exclusive fullscreen while
+    // the game renders (the GPU device was lost on saving other settings in game).
+    if (EmulatorSettings.IsFullScreen() != fullscreenBefore ||
+        EmulatorSettings.GetFullScreenMode() != fullscreenModeBefore) {
+        SDL_Event event{};
+        event.type = SDL_EVENT_APPLY_DISPLAY_MODE;
+        SDL_PushEvent(&event);
+    }
 }
 
 void SettingsWindow::SaveInstallDirs() {
+    // In game: on a copy, applied in one step (see EmulatorSettingsImpl::ReloadScope).
+    const EmulatorSettingsImpl::ReloadScope reload;
     std::string profile;
     const bool isGlobal = currentProfile == "Global";
     if (!isGlobal) {
@@ -376,6 +415,8 @@ bool SettingsWindow::CloseKeyPressed() const {
 }
 
 void SettingsWindow::DeInit() {
+    // In game: on a copy, applied in one step (see EmulatorSettingsImpl::ReloadScope).
+    const EmulatorSettingsImpl::ReloadScope reload;
     EmulatorSettings.Load();
     EmulatorSettings.SetBigPictureScale(static_cast<int>(uiScale * 1000));
     EmulatorSettings.Save();
@@ -800,6 +841,8 @@ void SettingsWindow::DrawGameFolderManager() {
     float buttonWidth = ImGui::GetItemRectSize().x;
     ImGui::PushItemWidth(buttonWidth);
     if (ImGui::SliderInt("Folder Scan Depth", &scanDepthSetting, 0, 5)) {
+        // In game: on a copy, applied in one step (see EmulatorSettingsImpl::ReloadScope).
+        const EmulatorSettingsImpl::ReloadScope reload;
         std::string profile;
         const bool isGlobal = currentProfile == "Global";
         if (!isGlobal) {
@@ -1096,6 +1139,49 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                "Less CPU time protecting game memory the GPU reads");
             AddSettingCheckbox("Batched texture uploads", bbBatchedUploadsSetting,
                                "New textures of a draw uploaded together");
+            {
+                // Global, saved at once (a game's profile would not keep it).
+                bool gx = EmulatorSettings.IsBbGxPipelines();
+                const bool before = gx;
+                AddSettingCheckbox(
+                    "Pipelines from the engine's objects", gx,
+                    "Experimental, Bloodborne 1.09: a draw whose engine objects were seen before "
+                    "takes the pipeline they gave\nthen, instead of working it out from the GPU's "
+                    "registers (less command thread time a draw).\nEvery 256th is checked; on "
+                    "any difference it stops by itself. Needs a restart");
+                if (gx != before) {
+                    EmulatorSettings.SetBbGxPipelines(gx);
+                    EmulatorSettings.Save();
+                }
+            }
+            {
+                // Global, saved at once (a game's profile would not keep it).
+                bool finisher = EmulatorSettings.IsBbDrawFinisher();
+                const bool before = finisher;
+                AddSettingCheckbox(
+                    "Draw recorder on two threads", finisher,
+                    "Experimental, with the threaded renderer: the draw recorder's command "
+                    "recording runs on a thread of its own,\nnext to the part that finds "
+                    "textures, buffers and render targets. Applies at once");
+                if (finisher != before) {
+                    EmulatorSettings.SetBbDrawFinisher(finisher);
+                    EmulatorSettings.Save();
+                }
+            }
+            {
+                // Global, saved at once (a game's profile would not keep it).
+                bool async_submit = EmulatorSettings.IsBbAsyncSubmit();
+                const bool before = async_submit;
+                AddSettingCheckbox(
+                    "Submit on the recording thread", async_submit,
+                    "Experimental, with the threaded renderer: the frame's GPU work is handed to "
+                    "the recording thread to submit,\nso the draw recorder and the command thread "
+                    "don't wait for it to finish recording first. Applies at once");
+                if (async_submit != before) {
+                    EmulatorSettings.SetBbAsyncSubmit(async_submit);
+                    EmulatorSettings.Save();
+                }
+            }
 
             AddSettingSection(
                 "VRAM", "Graphics card memory in long sessions and with texture mods.", false);
@@ -1129,6 +1215,37 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             // Times every draw: heavy on the CPU.
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.2f, 1.0f), "(costs fps)");
+            {
+                // Global settings, saved at once (a game's profile would not keep them).
+                const auto live = [&](const char* name, bool value, auto set, const char* tip) {
+                    bool shown = value;
+                    AddSettingCheckbox(name, shown, tip);
+                    if (shown != value) {
+                        set(shown);
+                        EmulatorSettings.Save();
+                    }
+                };
+                live(
+                    "Performance meter", EmulatorSettings.IsBbPerfMeter(),
+                    [](bool v) { EmulatorSettings.SetBbPerfMeter(v); },
+                    "Under the FPS counter: which stage holds the frame rate (the GPU, the "
+                    "command thread that\ndecodes the game's GPU commands, the draw recorder, or "
+                    "the game itself) and each one's time a\nframe; a summary in the log every 20 "
+                    "seconds. With the threaded renderer");
+                live(
+                    "Recorder split census", EmulatorSettings.IsBbRecorderCensus(),
+                    [](bool v) { EmulatorSettings.SetBbRecorderCensus(v); },
+                    "Developer map for splitting the draw recorder: which calls into the caches "
+                    "and which recorded\ncommands each half of a draw would make, in the log "
+                    "every 20 s. Costs a little CPU");
+                live(
+                    "Check GX draw capture", EmulatorSettings.IsBbGxObserve(),
+                    [](bool v) { EmulatorSettings.SetBbGxObserve(v); },
+                    "Developer check for building draws from the engine (Bloodborne 1.09): the "
+                    "game's draw calls\nare hooked and what they bind is compared with what the "
+                    "command thread decodes. Changes\nnothing drawn; results in the log every 10 "
+                    "s. Costs some CPU. Needs a restart");
+            }
             if (advanced) {
                 AddSettingCheckbox("GPU time per pass in the log",
                                    threadedRendererGpuProfileSetting,

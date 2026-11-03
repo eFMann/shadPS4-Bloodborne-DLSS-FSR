@@ -32,14 +32,25 @@ public:
     /// mirror's viewport and scissor.
     using Capture =
         std::function<void(Commands& out, const Viewports& viewports, const Scissors& scissors)>;
+    /// The guest draw's depth target as the mirror needs it: Vulkan handles and the image's
+    /// creation info, taken by the recorder's resolve half (the mirror never touches the texture
+    /// cache). Its layout is the guest pass's (the draw's barriers are recorded before Defer).
+    struct DepthSource {
+        vk::Image image;
+        vk::Format format{};
+        vk::SampleCountFlagBits samples{};
+        vk::Extent3D extent{};
+        vk::ImageUsageFlags usage{};
+        u64 uid{};
+        u32 layer{};
+    };
     /// Defers this guest draw's replay into the mirror pass of the current batch (one pass per
     /// run of mirrored draws instead of a pass break out of and back into the guest pass for
     /// each). The frame's first mirrored draw seeds the mirror depth, which records directly
     /// and ends the guest pass: `guest_pass_ended` reports it. Returns whether it deferred.
     bool Defer(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
                const GraphicsPipeline& pipeline, const RenderState& guest_state,
-               VideoCore::Image* guest_depth, u32 depth_layer, const Capture& capture,
-               bool& guest_pass_ended);
+               const DepthSource* guest_depth, const Capture& capture, bool& guest_pass_ended);
     /// Whether deferred draws wait for FlushBatch.
     [[nodiscard]] bool HasBatch() const;
     /// Batches flushed so far (a flush rebinds the pipeline, descriptors and dynamic state).
@@ -52,7 +63,7 @@ public:
         vk::Extent2D extent;
     };
     // Temporal DLSS: hands over this frame's mirror (shader-read layout) and starts a new one.
-    std::optional<Frame> ConsumeFrame(vk::CommandBuffer command);
+    std::optional<Frame> ConsumeFrame(Scheduler& scheduler);
     // Render resolution the mirror replays the game's 160x90 velocity draws at.
     void SetTargetSize(vk::Extent2D size);
     void Shutdown(Scheduler& scheduler);

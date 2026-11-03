@@ -26,6 +26,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -865,6 +866,9 @@ u64 BufferCache::LastGpuWriteTick(VAddr device_addr, u64 size) {
 
 void BufferCache::ReadbackOnSecondQueue(const Buffer* arena, const Buffer* destination,
                                         std::span<const vk::BufferCopy> copies, u64 tick) {
+    // The writer's submission may still be on its way from the recording thread (FlushFrame):
+    // this one waits for it on the GPU, so it goes after it.
+    scheduler.WaitSubmitted(tick);
     std::scoped_lock lock{readback_queue_mutex};
     SubmitReadback(*readback_cmdbuf, *readback_fence, arena, destination, copies, tick);
     Vulkan::Check(
@@ -1063,6 +1067,7 @@ bool BufferCache::DownloadMemoryFromBuffer(const Buffer* arena, VAddr device_add
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         ObtainBufferFlags flags) {
+    BB_STAGE_CENSUS("BufferCache::ObtainBuffer", Caches);
     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
     const bool is_texel_buffer = True(flags & ObtainBufferFlags::IsTexelBuffer);
     const bool skip_stream_buffer = True(flags & ObtainBufferFlags::IgnoreStreamBuffer);
@@ -1099,6 +1104,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainGeometryBuffer(VAddr device_addr, u32 size) {
+    BB_STAGE_CENSUS("BufferCache::ObtainGeometryBuffer", Caches);
     static constexpr u32 CopyBelow = 1_KB;
     if (size < CopyBelow || size > STREAM_THRESHOLD || !Common::BbTuning::Threaded() ||
         !EmulatorSettings.IsBbGeometryInPlace() || IsRegionCpuModified(device_addr, size)) {
@@ -1230,6 +1236,7 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
+    BB_STAGE_CENSUS("BufferCache::IsRegionGpuModified", Caches);
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
 
@@ -1293,6 +1300,7 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    BB_STAGE_CENSUS("BufferCache::SynchronizeDmaBuffers", Caches);
     fault_process_pending = true;
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);

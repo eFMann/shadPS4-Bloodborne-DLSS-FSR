@@ -56,6 +56,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_bb_perf_meter.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -196,6 +197,8 @@ void Emulator::Shutdown() {
     if (exit_done) {
         return;
     }
+    // The performance meter's last summary (what it gathered since its last one).
+    Vulkan::PerfMeter::Flush();
     Common::Log::Flush();
     ExitStep("stopping the save backup thread");
     Libraries::SaveData::Backup::StopThread();

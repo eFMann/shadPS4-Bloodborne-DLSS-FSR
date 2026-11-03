@@ -30,6 +30,7 @@
 #include "video_core/cache_memory_policy.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -855,6 +856,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    BB_STAGE_CENSUS("TextureCache::FindImage", Caches);
     const auto& info = desc.info;
 
     ASSERT(info.guest_address != 0);
@@ -991,6 +993,7 @@ ImageId TextureCache::FindImageLayer(VAddr address, size_t size, u32& layer) {
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    BB_STAGE_CENSUS("TextureCache::FindTexture", Caches);
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Storage};
@@ -1050,6 +1053,7 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+    BB_STAGE_CENSUS("TextureCache::FindRenderTarget", Caches);
     Image& image = slot_images[image_id];
     Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Target};
     EnsureFullDetail(image);
@@ -1094,6 +1098,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 }
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+    BB_STAGE_CENSUS("TextureCache::FindDepthTarget", Caches);
     Image& image = slot_images[image_id];
     Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Target};
     EnsureFullDetail(image);
@@ -1472,6 +1477,7 @@ bool TextureCache::DeferUpload(Image& image) {
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    BB_STAGE_CENSUS("TextureCache::RefreshImage", Caches);
     Common::Crumbs::Add("image upload (address, size)", image.info.guest_address,
                         image.info.guest_size);
     SmallVector<vk::BufferImageCopy, 14> image_copies;
@@ -1516,6 +1522,28 @@ void TextureCache::RefreshImage(Image& image) {
 }
 
 void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
+    BB_STAGE_CENSUS("TextureCache::UpdateImages", Caches);
+    // Threaded renderer: when every image is already clean this GC tick (the usual case for a
+    // remembered texture set), each one would only reach UpdateImage's clean check at the end
+    // of the passes below. One pass instead.
+    if (Common::BbTuning::Threaded()) {
+        const u64 clean = std::atomic_ref<u64>(gc_tick).load(std::memory_order_acquire) + 1;
+        bool all_clean = true;
+        for (const ImageId image_id : image_ids) {
+            if (!image_id) {
+                continue;
+            }
+            Image& image = slot_images[image_id];
+            if (image.detail_pending ||
+                std::atomic_ref<u64>(image.clean_tick).load(std::memory_order_acquire) != clean) {
+                all_clean = false;
+                break;
+            }
+        }
+        if (all_clean) {
+            return;
+        }
+    }
     for (const ImageId image_id : image_ids) {
         if (image_id && slot_images[image_id].detail_pending) {
             TryRestoreDetail(slot_images[image_id]);

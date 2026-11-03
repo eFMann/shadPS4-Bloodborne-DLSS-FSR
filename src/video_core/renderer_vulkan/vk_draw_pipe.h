@@ -26,6 +26,7 @@
 #include "common/assert.h"
 #include "common/guest_stats.h"
 #include "common/polyfill_thread.h"
+#include "common/rdtsc.h"
 #include "common/thread.h"
 #include "common/types.h"
 
@@ -38,6 +39,7 @@ public:
 
     DrawPipe(Handler handler_, void* context_) : handler{handler_}, context{context_} {
         ring = std::make_unique<u8[]>(Capacity);
+        Common::TscNsPerTick(); // starts its measurement
         const u32 threads = std::thread::hardware_concurrency();
         spin_time = std::chrono::microseconds(threads >= 12 ? 200 : 50);
         thread = std::jthread([this](std::stop_token stop) { Run(stop); });
@@ -132,7 +134,8 @@ public:
     u64 drains = 0;
     std::chrono::nanoseconds drain_time{};
     [[nodiscard]] std::chrono::nanoseconds BusyTime() const noexcept {
-        return std::chrono::nanoseconds(busy_ns.load(std::memory_order_relaxed));
+        return std::chrono::nanoseconds(
+            s64(double(busy_ticks.load(std::memory_order_relaxed)) * Common::TscNsPerTick()));
     }
 
 private:
@@ -210,12 +213,11 @@ private:
                 consumed.store(at, std::memory_order_release);
                 continue;
             }
-            const auto start = std::chrono::steady_clock::now();
+            const u64 start = Common::FencedRDTSC();
             Common::GuestStats::recorder_busy.store(true, std::memory_order_relaxed);
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
             Common::GuestStats::recorder_busy.store(false, std::memory_order_relaxed);
-            busy_ns.fetch_add((std::chrono::steady_clock::now() - start).count(),
-                              std::memory_order_relaxed);
+            busy_ticks.fetch_add(Common::FencedRDTSC() - start, std::memory_order_relaxed);
             if (const auto idle = idle_handler.load(std::memory_order_acquire);
                 idle && published.load(std::memory_order_acquire) == at + header->size) {
                 idle(context);
@@ -238,7 +240,7 @@ private:
     std::atomic<u64> consumed_packets{0};
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
-    std::atomic<s64> busy_ns{0};
+    std::atomic<u64> busy_ticks{0}; ///< TSC ticks (BusyTime converts)
     std::atomic<IdleHandler> idle_handler{nullptr};
     std::jthread thread;
 };

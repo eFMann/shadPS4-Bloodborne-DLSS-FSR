@@ -9,6 +9,7 @@
 #include <common/scm_rev.h>
 #include <toml.hpp>
 #include "common/assert.h"
+#include "common/elf_info.h"
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
 #include "emulator_settings.h"
@@ -104,14 +105,52 @@ EmulatorSettingsImpl::~EmulatorSettingsImpl() {}
 
 std::shared_ptr<EmulatorSettingsImpl> EmulatorSettingsImpl::GetInstance() {
     std::lock_guard lock(s_mutex);
-    if (!s_instance)
+    if (!s_instance) {
         s_instance = std::make_shared<EmulatorSettingsImpl>();
+        s_current.store(s_instance.get(), std::memory_order_release);
+    }
     return s_instance;
+}
+
+EmulatorSettingsImpl::ReloadScope::ReloadScope() {
+    if (t_private || Common::ElfInfo::Instance().GameSerial().empty()) {
+        return; // within another scope, or no game running
+    }
+    copy = std::make_shared<EmulatorSettingsImpl>();
+    *copy = *Instance();
+    t_private = copy.get();
+    s_private_users.fetch_add(1, std::memory_order_relaxed);
+}
+
+EmulatorSettingsImpl::ReloadScope::~ReloadScope() {
+    if (!copy) {
+        return;
+    }
+    t_private = nullptr;
+    s_private_users.fetch_sub(1, std::memory_order_relaxed);
+    const std::string running{Common::ElfInfo::Instance().GameSerial()};
+    if (copy->m_loaded_profile != running) {
+        return; // another profile (or the global one alone): only saved
+    }
+    {
+        std::lock_guard lock(s_mutex);
+        if (s_instance) {
+            copy->m_shadnet_session_disabled.store(
+                s_instance->m_shadnet_session_disabled.load(std::memory_order_relaxed));
+        }
+    }
+    SetInstance(std::move(copy));
 }
 
 void EmulatorSettingsImpl::SetInstance(std::shared_ptr<EmulatorSettingsImpl> instance) {
     std::lock_guard lock(s_mutex);
+    // Instance() hands out plain pointers: a replaced instance stays alive.
+    static std::vector<std::shared_ptr<EmulatorSettingsImpl>> replaced;
+    if (s_instance) {
+        replaced.push_back(s_instance);
+    }
     s_instance = std::move(instance);
+    s_current.store(s_instance.get(), std::memory_order_release);
 }
 
 // --------------------
@@ -230,6 +269,28 @@ void EmulatorSettingsImpl::ClearGameSpecificOverrides() {
     ClearGroupOverrides(m_audio);
     ClearGroupOverrides(m_gpu);
     ClearGroupOverrides(m_vulkan);
+}
+
+nlohmann::json EmulatorSettingsImpl::Snapshot() const {
+    json global;
+    global["General"] = m_general;
+    global["Network"] = m_network;
+    global["Log"] = m_log;
+    global["Debug"] = m_debug;
+    global["Input"] = m_input;
+    global["Audio"] = m_audio;
+    global["GPU"] = m_gpu;
+    global["Vulkan"] = m_vulkan;
+    json game = json::object();
+    SaveGroupGameSpecific(m_general, game["General"]);
+    SaveGroupGameSpecific(m_network, game["Network"]);
+    SaveGroupGameSpecific(m_log, game["Log"]);
+    SaveGroupGameSpecific(m_debug, game["Debug"]);
+    SaveGroupGameSpecific(m_input, game["Input"]);
+    SaveGroupGameSpecific(m_audio, game["Audio"]);
+    SaveGroupGameSpecific(m_gpu, game["GPU"]);
+    SaveGroupGameSpecific(m_vulkan, game["Vulkan"]);
+    return json{{"global", global}, {"game", game}};
 }
 
 bool EmulatorSettingsImpl::Save(const std::string& serial) {
@@ -452,6 +513,7 @@ bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific
 }
 
 bool EmulatorSettingsImpl::Load(const std::string& serial) {
+    m_loaded_profile = serial;
     // A newly loaded profile replaces, rather than extends, the previous profile.
     ClearGameSpecificOverrides();
 

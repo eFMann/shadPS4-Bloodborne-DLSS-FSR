@@ -19,6 +19,7 @@
 #include "common/polyfill_thread.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
+#include "core/bb_gx_draws.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -768,6 +769,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, CmdCopy cop
     std::span<const u32> commands = dcb;
     u64 commands_hash = HashCommands(commands);
     PacketTrail trail;
+    // GX draw capture check (Bloodborne): a draw packet against what the game's draw call bound,
+    // by where the packet ends in the game's command buffer (the copy's place mapped back).
+    const auto check_gx_draw = [&](const PM4Header* packet) {
+        if (!Core::BbGxDraws::Observing()) {
+            return;
+        }
+        const u32 dwords = packet->type3.NumWords() + 1;
+        const u32* words = reinterpret_cast<const u32*>(packet);
+        u64 guest = reinterpret_cast<u64>(words);
+        if (copy.guest && words >= copy.words.data() &&
+            words < copy.words.data() + copy.words.size()) {
+            guest = reinterpret_cast<u64>(copy.guest + (words - copy.words.data()));
+        }
+        const std::array<u32, 2> tail{words[dwords - 2], words[dwords - 1]};
+        Core::BbGxDraws::CheckDraw(guest + u64(dwords) * 4, tail, regs);
+    };
     while (!dcb.empty()) {
         current_packet_opcode = ~0u;
         ProcessCommands();
@@ -1036,6 +1053,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, CmdCopy cop
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                check_gx_draw(header);
                 if (!rasterizer) {
                     break;
                 }
@@ -1056,6 +1074,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, CmdCopy cop
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                check_gx_draw(header);
                 if (!rasterizer) {
                     break;
                 }
@@ -1074,6 +1093,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, CmdCopy cop
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                check_gx_draw(header);
                 if (!rasterizer) {
                     break;
                 }
@@ -1089,6 +1109,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, CmdCopy cop
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                check_gx_draw(header);
                 if (!rasterizer) {
                     break;
                 }
@@ -1152,6 +1173,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, CmdCopy cop
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                check_gx_draw(header);
                 if (!rasterizer) {
                     break;
                 }

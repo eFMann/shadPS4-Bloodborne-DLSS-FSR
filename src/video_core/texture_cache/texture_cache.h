@@ -27,6 +27,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -307,6 +308,7 @@ public:
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
+        BB_STAGE_CENSUS("TextureCache::GetImage", Caches);
         auto& image = slot_images[id];
         TouchImage(image);
         return image;

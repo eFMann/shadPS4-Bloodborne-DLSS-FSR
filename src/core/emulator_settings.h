@@ -15,7 +15,9 @@
 #include "common/logging/log.h"
 #include "common/types.h"
 
-#define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())
+// The settings, without the singleton's lock and reference count (read many times a draw on the
+// GPU threads: the lock and the shared count's cache line were a few percent of all CPU time).
+#define EmulatorSettings (*EmulatorSettingsImpl::Instance())
 
 enum HideCursorState : int {
     Never,
@@ -799,6 +801,27 @@ struct VulkanSettings {
     Setting<bool> bb_counter_mode{false};
     Setting<bool> bb_counter_resolution{false};
     Setting<bool> bb_counter_graph{false}; // a frame time graph under the counter
+    // Performance meter (F3, Diagnostics): which stage holds the frame rate, under the counter and
+    // in the log every 20 seconds. Global only.
+    Setting<bool> bb_perf_meter{false};
+    // GX draw capture check (F3, Diagnostics; Bloodborne 1.09, applies at a start): the engine's
+    // draw calls are hooked and what they bind is checked against what the command thread decodes
+    // from the packets. Changes nothing drawn. Global only.
+    Setting<bool> bb_gx_observe{false};
+    // Pipelines from the engine's objects (F3, Performance; Bloodborne 1.09, applies at a start):
+    // a draw whose GX objects were seen before takes the pipeline they gave then, instead of
+    // working it out from the registers. Global only.
+    Setting<bool> bb_gx_pipelines{false};
+    // Recorder split census (F3, Diagnostics): which of the recorder's calls each half of a
+    // split recorder would make, in the log every 20 s. Global only.
+    Setting<bool> bb_recorder_census{false};
+    // Draw recorder on two threads (F3, Performance; with the threaded renderer, applies at
+    // once): the recorder's command recording on a thread of its own. Global only.
+    Setting<bool> bb_draw_finisher{false};
+    // Submit on the recording thread (F3, Performance; with the threaded renderer, applies at
+    // once): the frame's and the guest submissions' command buffers are ended and submitted by
+    // the recording thread, so the GPU threads don't wait for it to catch up. Global only.
+    Setting<bool> bb_async_submit{false};
     Setting<int> bb_counter_corner{0};
     // With an FPS cap ("Show frames when ready"): frames are shown one cap period apart, an early
     // one held until its turn, instead of each as soon as it is ready. Global only.
@@ -864,8 +887,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_ssr_mode, bb_ssr_full_res, bb_ssr_rough_rays, bb_ssr_min_gloss, bb_ssr_sharp_frames,
     bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_f1_scale, bb_f1_pos_x, bb_f1_pos_y,
     bb_counter_fps, bb_counter_ms, bb_counter_upscaler, bb_counter_preset, bb_counter_mode,
-    bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_even_capped_flips,
-    bb_merged_no_stream_sources, bb_merged_large_batches)
+    bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_perf_meter, bb_gx_observe,
+    bb_gx_pipelines, bb_recorder_census, bb_draw_finisher, bb_async_submit, bb_even_capped_flips, bb_merged_no_stream_sources,
+    bb_merged_large_batches)
 
 // -------------------------------
 // Main manager
@@ -876,9 +900,43 @@ public:
     ~EmulatorSettingsImpl();
 
     static std::shared_ptr<EmulatorSettingsImpl> GetInstance();
+    /// The current instance without locking (instances replaced by SetInstance are kept alive).
+    static EmulatorSettingsImpl* Instance() {
+        if (s_private_users.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            if (auto* const own = t_private) {
+                return own;
+            }
+        }
+        if (auto* const instance = s_current.load(std::memory_order_acquire)) [[likely]] {
+            return instance;
+        }
+        return GetInstance().get();
+    }
     static void SetInstance(std::shared_ptr<EmulatorSettingsImpl> instance);
 
+    /// While a game runs, the settings window reloads the settings from the files (on opening,
+    /// on saving, on closing, switching profiles): in place, that cleared the running game's
+    /// profile and rewrote every setting while the GPU threads read them, so they recorded a
+    /// frame with other settings mid-way (the device was lost on Save in F3). Within this scope
+    /// this thread works on a copy; at its end the copy replaces the settings in one step (the
+    /// replaced ones kept alive) when it holds the running game's profile, and is dropped when
+    /// it holds another one (that profile is only saved, for that game's next start). No game
+    /// running: no copy, as before.
+    class ReloadScope {
+    public:
+        ReloadScope();
+        ~ReloadScope();
+        ReloadScope(const ReloadScope&) = delete;
+        ReloadScope& operator=(const ReloadScope&) = delete;
+
+    private:
+        std::shared_ptr<EmulatorSettingsImpl> copy;
+    };
+
     bool Save(const std::string& serial = "");
+    /// Every setting's global value and game-specific override, by section (to log what a save
+    /// changed).
+    nlohmann::json Snapshot() const;
     bool Load(const std::string& serial = "");
     void SetDefaultValues();
     bool TransferSettings();
@@ -933,9 +991,14 @@ private:
     // Runtime-only override: when true, IsShadNetEnabled() reports false for the
     // rest of this run regardless of the persisted setting
     std::atomic<bool> m_shadnet_session_disabled{false};
+    // ReloadScope: the profile the last Load loaded ("" for the global one).
+    std::string m_loaded_profile;
+    static inline std::atomic<int> s_private_users{0};
+    static inline thread_local EmulatorSettingsImpl* t_private = nullptr;
 
     static std::shared_ptr<EmulatorSettingsImpl> s_instance;
     static std::mutex s_mutex;
+    static inline std::atomic<EmulatorSettingsImpl*> s_current{nullptr};
 
     /// Apply overrideable fields from groupJson into group.game_specific_value.
     template <typename Group>
@@ -979,6 +1042,7 @@ public:
             m_gpu = other.m_gpu;
             m_vulkan = other.m_vulkan;
             m_configMode = other.m_configMode;
+            m_loaded_profile = other.m_loaded_profile;
         }
         return *this;
     }
@@ -1198,6 +1262,12 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, BbCounterMode, bb_counter_mode)
     SETTING_FORWARD_BOOL(m_vulkan, BbCounterResolution, bb_counter_resolution)
     SETTING_FORWARD_BOOL(m_vulkan, BbCounterGraph, bb_counter_graph)
+    SETTING_FORWARD_BOOL(m_vulkan, BbPerfMeter, bb_perf_meter)
+    SETTING_FORWARD_BOOL(m_vulkan, BbGxObserve, bb_gx_observe)
+    SETTING_FORWARD_BOOL(m_vulkan, BbGxPipelines, bb_gx_pipelines)
+    SETTING_FORWARD_BOOL(m_vulkan, BbRecorderCensus, bb_recorder_census)
+    SETTING_FORWARD_BOOL(m_vulkan, BbDrawFinisher, bb_draw_finisher)
+    SETTING_FORWARD_BOOL(m_vulkan, BbAsyncSubmit, bb_async_submit)
     SETTING_FORWARD(m_vulkan, BbCounterCorner, bb_counter_corner)
     SETTING_FORWARD_BOOL(m_vulkan, BbEvenCappedFlips, bb_even_capped_flips)
     SETTING_FORWARD_BOOL(m_vulkan, BbMergedNoStreamSources, bb_merged_no_stream_sources)

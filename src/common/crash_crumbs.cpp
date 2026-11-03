@@ -9,6 +9,7 @@
 #include <string>
 
 #include "common/crash_crumbs.h"
+#include "common/rdtsc.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 
@@ -36,12 +37,10 @@ struct ThreadRing {
 std::array<ThreadRing, MaxThreads> g_rings;
 std::atomic<u32> g_claimed{0};
 std::atomic<bool> g_dumped{false};
-const auto g_start = std::chrono::steady_clock::now();
-
-u64 NowUs() {
-    return u64(std::chrono::duration_cast<std::chrono::microseconds>(
-                   std::chrono::steady_clock::now() - g_start)
-                   .count());
+/// Steps are stamped with the TSC (a few ns; the system clock cost ~25 ns a step, several steps a
+/// draw), converted to time when printed.
+u64 NowTicks() {
+    return Common::FencedRDTSC();
 }
 
 ThreadRing* CurrentRing() {
@@ -69,7 +68,7 @@ void Add(const char* what, u64 a, u64 b) noexcept {
     const u32 n = ring->next.load(std::memory_order_relaxed);
     Entry& e = ring->entries[n % RingSize];
     e.what.store(nullptr, std::memory_order_relaxed); // half-written while printed: skipped
-    e.time_us.store(NowUs(), std::memory_order_relaxed);
+    e.time_us.store(NowTicks(), std::memory_order_relaxed);
     e.a.store(a, std::memory_order_relaxed);
     e.b.store(b, std::memory_order_relaxed);
     e.what.store(what, std::memory_order_release);
@@ -80,7 +79,8 @@ void Dump() noexcept {
     if (g_dumped.exchange(true)) {
         return;
     }
-    const u64 now = NowUs();
+    const u64 now = NowTicks();
+    const double ms_per_tick = Common::TscNsPerTick() / 1e6;
     const u32 threads = std::min(g_claimed.load(std::memory_order_acquire), MaxThreads);
     LOG_CRITICAL(Debug,
                  "Crash breadcrumbs: the last steps of {} threads (ms before the crash):", threads);
@@ -103,7 +103,7 @@ void Dump() noexcept {
             }
             const u64 at = e.time_us.load(std::memory_order_relaxed);
             LOG_CRITICAL(Debug, "    -{:.3f} {} {:#x} {:#x}",
-                         double(now > at ? now - at : 0) / 1000.0, what,
+                         double(now > at ? now - at : 0) * ms_per_tick, what,
                          e.a.load(std::memory_order_relaxed), e.b.load(std::memory_order_relaxed));
         }
     }

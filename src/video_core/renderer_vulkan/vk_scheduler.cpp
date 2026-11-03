@@ -3,16 +3,24 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/copy_pool.h"
 #include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/guest_stats.h"
+#include "common/logging/log.h"
 #include "common/thread.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace Vulkan {
 
@@ -49,7 +57,8 @@ void Scheduler::EndDeferringQueueOps() {
 }
 
 Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore},
+      tail_pool{instance, &work_semaphore} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -65,6 +74,8 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    CatchUp();
+    BB_STAGE_CENSUS("Scheduler::BeginRendering", Commands);
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -125,6 +136,8 @@ void Scheduler::RecordBeginRendering(vk::CommandBuffer cmdbuf, const RenderState
 }
 
 void Scheduler::EndRendering() {
+    BB_STAGE_CENSUS("Scheduler::EndRendering", Commands);
+    CatchUp();
     if (!is_rendering) {
         return;
     }
@@ -246,14 +259,104 @@ void CommandRecorder::Kick(bool force) {
     }
 }
 
-void CommandRecorder::Sync() {
+void CommandRecorder::Sync(std::source_location where) {
+    const auto start = std::chrono::steady_clock::now();
+    const bool asleep = sleeping.load(std::memory_order_relaxed);
+    const u64 bytes = current ? current->used : 0;
     Kick(true);
     const u64 target = head.load(std::memory_order_relaxed);
+    const u64 chunks = target - tail.load(std::memory_order_acquire);
     for (u32 spins = 0; tail.load(std::memory_order_acquire) < target; ++spins) {
         if (spins >= 1024) {
             std::this_thread::yield();
         }
     }
+    NoteSyncWait(where, (std::chrono::steady_clock::now() - start).count(), chunks, bytes,
+                 asleep);
+}
+
+void CommandRecorder::NoteSyncWait(const std::source_location& where, s64 ns, u64 chunks,
+                                   u64 bytes, bool asleep) {
+    std::scoped_lock lk{sync_wait_mutex};
+    ++sync_waits;
+    sync_wait_ns += ns;
+    sync_wait_max_ns = std::max(sync_wait_max_ns, ns);
+    sync_chunks += chunks;
+    sync_bytes += bytes;
+    sync_asleep += asleep ? 1 : 0;
+    auto site = std::ranges::find_if(sync_wait_sites, [&](const SyncSite& s) {
+        return s.file == where.file_name() && s.line == where.line();
+    });
+    if (site == sync_wait_sites.end()) {
+        sync_wait_sites.push_back({where.file_name(), where.line()});
+        site = sync_wait_sites.end() - 1;
+    }
+    ++site->count;
+    site->ns += ns;
+    const auto now = std::chrono::steady_clock::now();
+    if (sync_log_time == std::chrono::steady_clock::time_point{}) {
+        sync_log_time = now;
+        sync_busy_mark = busy_ns.load(std::memory_order_relaxed);
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - sync_log_time).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const s64 busy = busy_ns.load(std::memory_order_relaxed);
+    std::ranges::sort(sync_wait_sites,
+                      [](const SyncSite& a, const SyncSite& b) { return a.ns > b.ns; });
+    std::string sites;
+    for (size_t i = 0; i < std::min<size_t>(sync_wait_sites.size(), 4); ++i) {
+        const auto& s = sync_wait_sites[i];
+        std::string_view file{s.file};
+        if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+            file.remove_prefix(slash + 1);
+        }
+        sites += fmt::format("{}{}:{} {}x {:.0f} us", i ? ", " : "", file, s.line, s.count,
+                             double(s.ns) / 1e3 / double(std::max<u64>(s.count, 1)));
+    }
+    const double n = double(std::max<u64>(sync_waits, 1));
+    const s64 mirror_ns = RecordingCosts::mirror_ns.exchange(0, std::memory_order_relaxed);
+    const u64 mirror_commands =
+        RecordingCosts::mirror_commands.exchange(0, std::memory_order_relaxed);
+    const u64 mirror_batches = RecordingCosts::mirror_batches.exchange(0, std::memory_order_relaxed);
+    const s64 upscaler_ns = RecordingCosts::upscaler_ns.exchange(0, std::memory_order_relaxed);
+    const u64 upscaler_calls = RecordingCosts::upscaler_calls.exchange(0, std::memory_order_relaxed);
+    std::array<u64, RecordingCosts::sync_submits.size()> sync_submits{};
+    for (size_t i = 0; i < sync_submits.size(); ++i) {
+        sync_submits[i] = RecordingCosts::sync_submits[i].exchange(0, std::memory_order_relaxed);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Recording thread jobs ({:.0f} s): velocity mirror replays {:.2f} ms a second "
+             "({} batches, {:.0f} us and {:.0f} commands each), DLSS evaluations {:.2f} ms a "
+             "second ({:.0f} us each); frame and guest submissions on the recording thread {}, "
+             "waited for it {} (setting off {}, upload command buffer {}, several sessions {}, "
+             "capture or GPU profile {}, recording thread far behind {})",
+             seconds, double(mirror_ns) / 1e6 / seconds, mirror_batches,
+             double(mirror_ns) / 1e3 / double(std::max<u64>(mirror_batches, 1)),
+             double(mirror_commands) / double(std::max<u64>(mirror_batches, 1)),
+             double(upscaler_ns) / 1e6 / seconds,
+             double(upscaler_ns) / 1e3 / double(std::max<u64>(upscaler_calls, 1)),
+             RecordingCosts::async_submits.exchange(0, std::memory_order_relaxed),
+             sync_submits[0] + sync_submits[1] + sync_submits[2] + sync_submits[3] +
+                 sync_submits[4],
+             sync_submits[0], sync_submits[1], sync_submits[2], sync_submits[3],
+             sync_submits[4]);
+    LOG_INFO(Render_Vulkan,
+             "Recording thread syncs ({:.0f} s): {} waits, avg {:.0f} us, max {:.0f} us, "
+             "{:.2f} ms a second in all; at a wait {:.1f} chunks were still to record and "
+             "{:.1f} KB not yet handed over, the recording thread asleep at {} of them; "
+             "recording thread busy {:.0f}%; by caller (avg wait): {}",
+             seconds, sync_waits, double(sync_wait_ns) / 1e3 / n, double(sync_wait_max_ns) / 1e3,
+             double(sync_wait_ns) / 1e6 / seconds, double(sync_chunks) / n,
+             double(sync_bytes) / 1024.0 / n, sync_asleep,
+             double(busy - sync_busy_mark) / 1e7 / seconds, sites);
+    sync_waits = sync_asleep = sync_chunks = sync_bytes = 0;
+    sync_wait_ns = sync_wait_max_ns = 0;
+    sync_wait_sites.clear();
+    sync_busy_mark = busy;
+    sync_log_time = now;
 }
 
 void CommandRecorder::Run(std::stop_token stop) {
@@ -270,6 +373,13 @@ void CommandRecorder::Run(std::stop_token stop) {
                 if (stop.stop_requested()) {
                     return;
                 }
+                // A pause between polls: without it this loop took a full core's issue slots,
+                // half of them from the draw recorder when both run on one physical core.
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
                 if ((spins & 255) == 0 && std::chrono::steady_clock::now() >= spin_until) {
                     sleeping.store(true, std::memory_order_seq_cst);
                     if (head.load(std::memory_order_seq_cst) == at && !stop.stop_requested()) {
@@ -303,10 +413,10 @@ void CommandRecorder::Run(std::stop_token stop) {
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+    CatchUp();
     // The command pool is shared with the recording thread's command buffer.
     if (recorder && !direct_mode) {
-        recorder->Sync();
-        direct_mode = true;
+        SyncRecorder();
     }
     auto& upload_cmdbuf = sessions.back().upload;
     if (upload_cmdbuf) {
@@ -321,16 +431,19 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
+    CatchUp();
     // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info);
 }
 
 void Scheduler::Flush() {
+    CatchUp();
     SubmitInfo info{};
     Flush(info);
 }
 
 void Scheduler::Finish(std::source_location where) {
+    CatchUp();
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
@@ -358,8 +471,7 @@ void Scheduler::PopPendingOperations() {
 
 void Scheduler::BeginSession() {
     if (recorder) {
-        recorder->Sync();
-        direct_mode = true;
+        SyncRecorder();
     }
     EndSession();
 
@@ -409,6 +521,9 @@ void Scheduler::EndSession() {
 
     EndRendering();
     Check(session.primary.end());
+    if (session.tail) {
+        Check(session.tail.end());
+    }
 }
 
 namespace {
@@ -447,8 +562,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     Common::Crumbs::Add("GPU submit (tick)", CurrentTick());
     SubmitStepTimer steps;
     if (recorder) {
-        recorder->Sync();
-        direct_mode = true;
+        SyncRecorder();
     }
     steps.Step(0);
     {
@@ -507,6 +621,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             cmd_buffers.push_back(session.upload);
         }
         cmd_buffers.push_back(session.primary);
+        if (session.tail) {
+            cmd_buffers.push_back(session.tail);
+        }
     }
     sessions.clear();
 
@@ -515,6 +632,25 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // A copy of the submission: it may run after this returns (Keep rendering while presenting).
     QueueOp([queue = instance.GetGraphicsQueue(), info, cmd_buffers = std::move(cmd_buffers)] {
+        QueueSubmit(queue, info, cmd_buffers);
+    });
+    NoteSubmitted(signal_value);
+    steps.Step(5);
+
+    work_semaphore.Refresh();
+    CollectGpuTiming();
+    steps.Step(6);
+    BeginSession();
+    steps.Step(7);
+
+    // Apply pending operations
+    PopPendingOperations();
+    steps.Step(8);
+}
+
+void Scheduler::QueueSubmit(vk::Queue queue, const SubmitInfo& info,
+                            std::vector<vk::CommandBuffer> cmd_buffers) {
+    {
         std::array<vk::PipelineStageFlags, std::tuple_size_v<decltype(info.wait_semas)>>
             wait_stage_masks;
         wait_stage_masks.fill(vk::PipelineStageFlagBits::eAllCommands);
@@ -546,18 +682,166 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                 .count(),
             std::memory_order_relaxed);
         ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
-    });
-    steps.Step(5);
+    }
+}
 
+void Scheduler::NoteSubmitted(u64 tick) {
+    if (submitted_tick.load(std::memory_order_relaxed) < tick) {
+        submitted_tick.store(tick, std::memory_order_release);
+        submitted_tick.notify_all();
+    }
+}
+
+void Scheduler::WaitSubmitted(u64 tick) const {
+    u64 seen = submitted_tick.load(std::memory_order_acquire);
+    while (seen < tick) {
+        submitted_tick.wait(seen, std::memory_order_acquire);
+        seen = submitted_tick.load(std::memory_order_acquire);
+    }
+}
+
+vk::CommandBuffer Scheduler::TailCommandBuffer() {
+    CatchUp();
+    auto& session = sessions.back();
+    if (!session.tail) {
+        session.tail = tail_pool.Commit();
+        Check(session.tail.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+    }
+    return session.tail;
+}
+
+void Scheduler::FlushFrame(SubmitInfo& info) {
+    CatchUp();
+    // F3, Performance, "Submit on the recording thread" (off: waits for the recording thread
+    // as before).
+    const bool async = EmulatorSettings.IsBbAsyncSubmit();
+    if (!async && recorder) {
+        RecordingCosts::sync_submits[0].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!async || !TrySubmitOnRecorder(info)) {
+        SubmitExecution(info);
+    }
+}
+
+bool Scheduler::TrySubmitOnRecorder(SubmitInfo& info) {
+#if TRACY_GPU_ENABLED
+    return false;
+#else
+    // Only the plain case: one session without an upload command buffer and no capture.
+    // (Direct mode at the flip: nobody holds a CommandBuffer() here, as at KickRecording.)
+    const auto fall_back = [](size_t why) {
+        RecordingCosts::sync_submits[why].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!recorder) {
+        return false;
+    }
+    if (sessions.back().upload) {
+        return fall_back(1);
+    }
+    if (sessions.size() != 1) {
+        return fall_back(2);
+    }
+    if (capture || on_session) {
+        return fall_back(3);
+    }
+    if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
+        return fall_back(3);
+    }
+    // The on-submit callback records under submit_mutex, which a submission still queued on the
+    // recording thread waits for: the ring must not be able to fill (Kick would wait for it).
+    if (!recorder->FarFromFull()) {
+        return fall_back(4);
+    }
+    RecordingCosts::async_submits.fetch_add(1, std::memory_order_relaxed);
+    Common::Crumbs::Add("GPU submit on the recording thread (tick)", CurrentTick());
+    direct_mode = false;
+    u64 signal_value;
+    {
+        std::scoped_lock lk{submit_mutex};
+        signal_value = work_semaphore.NextTick();
+        if (on_submit) {
+            on_submit(info);
+        }
+    }
+    // As EndSession: the pass ends (the velocity mirror's batch with it) in the queue.
+    EndRendering();
+    const vk::CommandBuffer tail = sessions.back().tail;
+    if (tail) {
+        Check(tail.end());
+    }
+    info.AddSignal(work_semaphore.Handle(), signal_value);
+    // GPU timing (the performance meter's GPU load): as SubmitExecution and BeginSession, the
+    // timestamps written by the recording thread.
+    const vk::QueryPool timer = timer_pool ? *timer_pool : vk::QueryPool{};
+    const bool end_stamp = timer && timer_open;
+    const u32 end_slot = timer_slot;
+    if (end_stamp) {
+        if (pending_timings.size() >= TimerPairs - 1) {
+            pending_timings.pop_front(); // never read: its slot is about to be reused
+        }
+        pending_timings.push_back({signal_value, timer_slot});
+        timer_slot = (timer_slot + 1) % TimerPairs;
+        timer_open = false;
+    }
+    const bool begin_stamp = timer && gpu_timing;
+    const u32 begin_slot = timer_slot;
+    if (begin_stamp) {
+        timer_open = true;
+    }
+    sessions.clear();
+    sessions.emplace_back();
+    primary_pending = true;
+    // After the commands queued before it: ends this submission's command buffer, submits it
+    // (and the tail), then begins the next one, which the commands queued after it go into.
+    recorder->Push([this, info, tail, signal_value, timer, end_stamp, end_slot, begin_stamp,
+                    begin_slot](vk::CommandBuffer cmdbuf) {
+        if (end_stamp) {
+            cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timer,
+                                  end_slot * 2 + 1);
+        }
+        Check(cmdbuf.end());
+        {
+            // Background texture copies this submission reads must be done.
+            const auto start = std::chrono::steady_clock::now();
+            if (Common::CopyPool::WaitAsync()) {
+                Common::GuestStats::async_copy_wait_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count(),
+                    std::memory_order_relaxed);
+            }
+        }
+        std::vector<vk::CommandBuffer> cmd_buffers{cmdbuf};
+        if (tail) {
+            cmd_buffers.push_back(tail);
+        }
+        {
+            std::scoped_lock lk{submit_mutex};
+            QueueOp([queue = instance.GetGraphicsQueue(), info,
+                     cmd_buffers = std::move(cmd_buffers)] {
+                QueueSubmit(queue, info, cmd_buffers);
+            });
+        }
+        NoteSubmitted(signal_value);
+        // The command pool is this thread's while the other one doesn't sync with it.
+        const vk::CommandBuffer next = command_pool.Commit();
+        Check(next.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+        if (begin_stamp) {
+            next.resetQueryPool(timer, begin_slot * 2, 2);
+            next.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timer, begin_slot * 2);
+        }
+        recorder_primary = next;
+        recorder->SetCommandBuffer(next);
+    });
+    recorder->Kick(true);
+    // As BeginSession: the new command buffer starts without dynamic state.
+    dynamic_state.Invalidate();
     work_semaphore.Refresh();
     CollectGpuTiming();
-    steps.Step(6);
-    BeginSession();
-    steps.Step(7);
-
-    // Apply pending operations
     PopPendingOperations();
-    steps.Step(8);
+    return true;
+#endif
 }
 
 void Scheduler::CollectGpuTiming() {

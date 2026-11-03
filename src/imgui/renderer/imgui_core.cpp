@@ -262,6 +262,7 @@ ImGuiID NewFrame(bool is_reusing_frame) {
 void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
             const vk::Extent2D& extent) {
     ImGui::Render();
+    TextureManager::FrameRendered();
     ImDrawData* draw_data = GetDrawData();
     // Font atlas uploads are recorded ahead of the render pass that samples them.
     Vulkan::UpdateTextures(*draw_data, cmdbuf);

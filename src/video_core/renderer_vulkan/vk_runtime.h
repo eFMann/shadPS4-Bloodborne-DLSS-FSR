@@ -85,6 +85,21 @@ public:
 
     void FlushBarriers();
 
+    /// The barriers collected so far, taken out (the buffer access tracking reset, as by
+    /// FlushBarriers): the draw recorder's resolve half hands them to its finish half, which
+    /// records them (RecordBarriers) - FlushBarriers split in two.
+    struct TakenBarriers {
+        vk::MemoryBarrier2 memory{};
+        bool has_memory = false;
+        VideoCore::Image::Barriers images;
+        [[nodiscard]] bool Empty() const {
+            return !has_memory && images.empty();
+        }
+    };
+    /// Into `out` (its storage reused draw after draw).
+    void TakeBarriers(TakenBarriers& out);
+    void RecordBarriers(const TakenBarriers& barriers);
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 

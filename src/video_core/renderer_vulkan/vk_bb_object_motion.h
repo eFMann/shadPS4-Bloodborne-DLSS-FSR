@@ -67,7 +67,7 @@ public:
     void OnFrameStart();
     // The motion image for the upscaler, in GENERAL layout; `valid` when it was written this
     // frame at this size. Records its barrier on `cmd` (outside a render pass).
-    vk::ImageView PrepareRead(vk::CommandBuffer cmd, u32 width, u32 height, bool& valid);
+    vk::ImageView PrepareRead(u32 width, u32 height, bool& valid);
 
 private:
     struct Target {

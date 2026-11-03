@@ -5,6 +5,7 @@
 #include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -144,8 +145,11 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.fillBuffer(dst->Handle(), offset, size, value);
+    // Through the recording thread: a direct command buffer made the draw recorder wait for it.
+    scheduler.RecordUncaptured(
+        [handle = dst->Handle(), offset, size, value](vk::CommandBuffer cmdbuf) {
+            cmdbuf.fillBuffer(handle, offset, size, value);
+        });
 
     AccessBuffer(dst, offset, size, vk::PipelineStageFlagBits2::eClear,
                  vk::AccessFlagBits2::eTransferWrite);
@@ -158,8 +162,9 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.updateBuffer(dst->Handle(), offset, sizeof(value), &value);
+    scheduler.RecordUncaptured([handle = dst->Handle(), offset, value](vk::CommandBuffer cmdbuf) {
+        cmdbuf.updateBuffer(handle, offset, sizeof(value), &value);
+    });
 
     AccessBuffer(dst, offset, sizeof(value), vk::PipelineStageFlagBits2::eCopy,
                  vk::AccessFlagBits2::eTransferWrite);
@@ -168,6 +173,7 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
+    BB_STAGE_CENSUS("Runtime::Transit (image layouts)", Caches);
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
     return image_barriers.size() != prev_num_barriers;
@@ -231,9 +237,14 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->Handle(),
-                             download_copies);
+    // Through the recording thread (a few a frame): a direct command buffer made the draw
+    // recorder wait for it.
+    scheduler.RecordUncaptured(
+        [image = src->GetImage(), buffer = dst->Handle(),
+         copies = boost::container::small_vector<vk::BufferImageCopy, 4>(
+             download_copies.begin(), download_copies.end())](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer, copies);
+        });
 
     for (const auto& copy : download_copies) {
         const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
@@ -340,9 +351,12 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
-                     vk::ImageLayout::eTransferDstOptimal, regions);
+    // Through the recording thread: a direct command buffer made the draw recorder wait for it.
+    scheduler.RecordUncaptured([src_image = src->GetImage(), dst_image = dst->GetImage(),
+                                regions = std::move(regions)](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
+                         vk::ImageLayout::eTransferDstOptimal, regions);
+    });
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -399,28 +413,32 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
-                             buffer->Handle(), download_copies);
-
-    const vk::MemoryBarrier2 post_copy_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .memoryBarrierCount = 1u,
-        .pMemoryBarriers = &post_copy_barrier,
-    });
-
     auto upload_copies = download_copies;
     for (auto& copy : upload_copies) {
         copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
     }
-    cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
-                             vk::ImageLayout::eTransferDstOptimal, upload_copies);
+    // Through the recording thread (a few a frame): a direct command buffer made the draw
+    // recorder wait for it.
+    scheduler.RecordUncaptured([src_image = src->GetImage(), dst_image = dst->GetImage(),
+                                handle = buffer->Handle(),
+                                download_copies = std::move(download_copies),
+                                upload_copies = std::move(upload_copies)](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyImageToBuffer(src_image, vk::ImageLayout::eTransferSrcOptimal, handle,
+                                 download_copies);
+        const vk::MemoryBarrier2 post_copy_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .memoryBarrierCount = 1u,
+            .pMemoryBarriers = &post_copy_barrier,
+        });
+        cmdbuf.copyBufferToImage(handle, dst_image, vk::ImageLayout::eTransferDstOptimal,
+                                 upload_copies);
+    });
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -644,9 +662,12 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         .baseArrayLayer = host_range.base.layer,
         .layerCount = host_range.extent.layers,
     };
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
-                           vk_range);
+    // Through the recording thread (a few thousand clears a second): a direct command buffer
+    // made the draw recorder wait for it.
+    scheduler.RecordUncaptured([image = dst->GetImage(), color = clear_value.color,
+                                vk_range](vk::CommandBuffer cmdbuf) {
+        cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
+    });
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -736,6 +757,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
+    BB_STAGE_CENSUS("Runtime::IsBufferAccessed", Caches);
     MakeCurrent(handle);
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
@@ -746,6 +768,7 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    BB_STAGE_CENSUS("Runtime::AccessBuffer (buffer tracking)", Caches);
     MakeCurrent(handle);
 
     const Interval range = {
@@ -776,7 +799,43 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
 
+void Runtime::TakeBarriers(TakenBarriers& taken) {
+    taken.has_memory = static_cast<bool>(memory_barrier.srcStageMask);
+    taken.memory = memory_barrier;
+    taken.images = image_barriers;
+    memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
+    memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+    image_barriers.clear();
+    for (auto& tracked : resources) {
+        tracked.read_ranges.Clear();
+        tracked.write_ranges.Clear();
+    }
+    resources.clear();
+    resource = nullptr;
+}
+
+void Runtime::RecordBarriers(const TakenBarriers& barriers) {
+    BB_STAGE_CENSUS("Runtime::RecordBarriers", Commands);
+    if (barriers.Empty()) {
+        return;
+    }
+    scheduler.EndRendering();
+    scheduler.Record(
+        [memory = barriers.memory, has_memory = barriers.has_memory,
+         images = boost::container::small_vector<vk::ImageMemoryBarrier2, 8>(
+             barriers.images.begin(), barriers.images.end())](vk::CommandBuffer cmdbuf) {
+            const vk::DependencyInfo dep{
+                .memoryBarrierCount = has_memory ? 1U : 0U,
+                .pMemoryBarriers = has_memory ? &memory : nullptr,
+                .imageMemoryBarrierCount = static_cast<u32>(images.size()),
+                .pImageMemoryBarriers = images.empty() ? nullptr : images.data(),
+            };
+            cmdbuf.pipelineBarrier2(dep);
+        });
+}
+
 void Runtime::FlushBarriers() {
+    BB_STAGE_CENSUS("Runtime::FlushBarriers", Commands);
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {
