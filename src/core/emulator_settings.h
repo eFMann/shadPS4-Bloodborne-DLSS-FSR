@@ -783,6 +783,12 @@ struct VulkanSettings {
     // The frame rate limit with the frame rate hooks (30..480; 0: none), changed while the game
     // runs. Global only.
     Setting<int> bb_fps_limit{0};
+    // The F1 panel's size in percent (its text, spacing and default window size). Global only.
+    Setting<int> bb_f1_scale{100};
+    // Where the F1 panel was last left, in thousandths of the free room across and down (500:
+    // centred), so it stays on screen at any resolution. Global only.
+    Setting<int> bb_f1_pos_x{500};
+    Setting<int> bb_f1_pos_y{500};
     // With an FPS cap ("Show frames when ready"): frames are shown one cap period apart, an early
     // one held until its turn, instead of each as soon as it is ready. Global only.
     Setting<bool> bb_even_capped_flips{true};
@@ -845,8 +851,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same, bb_clear_one_layer,
     bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius, bb_vbao_half_res,
     bb_ssr_mode, bb_ssr_full_res, bb_ssr_rough_rays, bb_ssr_min_gloss, bb_ssr_sharp_frames,
-    bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_even_capped_flips,
-    bb_merged_no_stream_sources, bb_merged_large_batches)
+    bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_f1_scale, bb_f1_pos_x, bb_f1_pos_y,
+    bb_even_capped_flips, bb_merged_no_stream_sources, bb_merged_large_batches)
 
 // -------------------------------
 // Main manager
@@ -1169,6 +1175,9 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, BbShowThreadedSettings, bb_show_threaded_settings)
     SETTING_FORWARD_BOOL(m_vulkan, BbFrameHooks, bb_frame_hooks)
     SETTING_FORWARD(m_vulkan, BbFpsLimit, bb_fps_limit)
+    SETTING_FORWARD(m_vulkan, BbF1Scale, bb_f1_scale)
+    SETTING_FORWARD(m_vulkan, BbF1PosX, bb_f1_pos_x)
+    SETTING_FORWARD(m_vulkan, BbF1PosY, bb_f1_pos_y)
     SETTING_FORWARD_BOOL(m_vulkan, BbEvenCappedFlips, bb_even_capped_flips)
     SETTING_FORWARD_BOOL(m_vulkan, BbMergedNoStreamSources, bb_merged_no_stream_sources)
     SETTING_FORWARD_BOOL(m_vulkan, BbMergedLargeBatches, bb_merged_large_batches)

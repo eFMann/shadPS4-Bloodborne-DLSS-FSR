@@ -24,6 +24,7 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/bb_hdr_compat.h"
+#include "imgui/bb_settings_file.h"
 #include "imgui/big_picture/settings_dialog_layer.h"
 #include "imgui/dlss_layer.h"
 #include "imgui/friends_layer.h"
@@ -43,42 +44,7 @@ namespace ImGui::Dlss {
 namespace {
 
 // The panel edits the same settings file the renderer polls, so it needs no renderer access.
-class SettingsFile {
-public:
-    void Load() {
-        lines.clear();
-        std::ifstream file{Path()};
-        for (std::string line; std::getline(file, line);)
-            lines.push_back(line);
-    }
-    std::string Get(const std::string& key, const std::string& fallback) const {
-        for (const auto& line : lines)
-            if (line.rfind(key + "=", 0) == 0)
-                return line.substr(key.size() + 1);
-        return fallback;
-    }
-    void Set(const std::string& key, const std::string& value) {
-        Load(); // keep edits made to the file while the panel was open
-        for (auto& line : lines)
-            if (line.rfind(key + "=", 0) == 0) {
-                line = key + "=" + value;
-                return Save();
-            }
-        lines.push_back(key + "=" + value);
-        Save();
-    }
-
-private:
-    static std::filesystem::path Path() {
-        return Vulkan::BbDlssSettingsPath();
-    }
-    void Save() const {
-        std::ofstream file{Path(), std::ios::trunc};
-        for (const auto& line : lines)
-            file << line << '\n';
-    }
-    std::vector<std::string> lines;
-};
+using SettingsFile = ImGui::BbSettingsFile;
 
 constexpr std::array RecommendedPatches{"Disable AA", "Disable Chromatic Aberration",
                                         "Disable DoF"};
@@ -157,6 +123,13 @@ void RestartHint(bool pending, const char* text) {
         TextDisabled("%s", text);
 }
 
+// This menu's UI scale (F1's Other tab, apart from F3's): its text, spacing and widths
+// together.
+float menu_scale = 1.0f;
+float Px(float size) {
+    return size * menu_scale;
+}
+
 // Relaunches the game for settings that apply at a start, after a confirmation: it goes back to
 // the last autosave, like quitting from the system menu.
 void RestartButton() {
@@ -167,7 +140,7 @@ void RestartButton() {
     if (pressed)
         OpenPopup("Restart the game?");
     SetNextWindowPos(GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {0.5f, 0.5f});
-    SetNextWindowSize({360.0f, 0.0f});
+    SetNextWindowSize({Px(360.0f), 0.0f});
     if (BeginPopupModal("Restart the game?", nullptr,
                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
         TextWrapped("The game restarts with the new settings. You continue from your last "
@@ -246,7 +219,12 @@ private:
         bool taken{};
         SettingsFile file;
         bool frame_hooks{};
+        int anisotropy{};
     } launch;
+    void DrawWindow();
+    float drawn_scale = 0.0f; // the size the window was last drawn at
+    ImVec2 window_size{};
+    int menu_size_edit = -1; // the UI scale slider's value while it is dragged
     bool patches_changed{};
     // Settings changed that apply at the next start (this frame's, and the last frame's for the
     // footer's height).
@@ -341,6 +319,7 @@ void DlssLayer::Draw() {
         launch.taken = true;
         launch.file.Load();
         launch.frame_hooks = EmulatorSettings.IsBbFrameHooks();
+        launch.anisotropy = EmulatorSettings.GetBbAnisotropy();
     }
     UpdateMouseLook();
     if (toggle_requested.exchange(false)) {
@@ -355,16 +334,68 @@ void DlssLayer::Draw() {
         SetNextWindowFocus();
         focus = false;
     }
+    // UI scale: the text through the font size, the spacing through the style, the fixed widths
+    // through Px(). Saved, so it stays from one launch to the next.
+    menu_scale = float(std::clamp(EmulatorSettings.GetBbF1Scale(), 50, 250)) * 0.01f;
+    const ImGuiStyle& style = GetStyle();
+    const auto scaled = [](ImVec2 v) { return ImVec2{v.x * menu_scale, v.y * menu_scale}; };
+    PushFont(nullptr, style.FontSizeBase * menu_scale);
+    PushStyleVar(ImGuiStyleVar_WindowPadding, scaled(style.WindowPadding));
+    PushStyleVar(ImGuiStyleVar_FramePadding, scaled(style.FramePadding));
+    PushStyleVar(ImGuiStyleVar_ItemSpacing, scaled(style.ItemSpacing));
+    PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, scaled(style.ItemInnerSpacing));
+    PushStyleVar(ImGuiStyleVar_IndentSpacing, style.IndentSpacing * menu_scale);
+    PushStyleVar(ImGuiStyleVar_ScrollbarSize, style.ScrollbarSize * menu_scale);
+    PushStyleVar(ImGuiStyleVar_GrabMinSize, style.GrabMinSize * menu_scale);
+    DrawWindow();
+    PopStyleVar(7);
+    PopFont();
+}
+
+void DlssLayer::DrawWindow() {
     // Resizable, never taller or wider than the screen; the content scrolls inside it.
     const ImVec2 screen = GetMainViewport()->WorkSize;
-    SetNextWindowSizeConstraints({420.0f, 240.0f}, {screen.x * 0.95f, screen.y * 0.9f});
-    SetNextWindowSize({520.0f, screen.y * 0.75f}, ImGuiCond_FirstUseEver);
-    SetNextWindowPos(GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {0.5f, 0.5f});
+    SetNextWindowSizeConstraints(
+        {std::min(Px(420.0f), screen.x * 0.95f), std::min(Px(240.0f), screen.y * 0.9f)},
+        {screen.x * 0.95f, screen.y * 0.9f});
+    SetNextWindowSize({Px(520.0f), screen.y * 0.75f}, ImGuiCond_FirstUseEver);
+    // A new menu size: the window grows or shrinks with it.
+    if (drawn_scale > 0.0f && drawn_scale != menu_scale && window_size.x > 0.0f) {
+        const float ratio = menu_scale / drawn_scale;
+        SetNextWindowSize({window_size.x * ratio, window_size.y * ratio});
+    }
+    drawn_scale = menu_scale;
+    // Where it was last left, as a share of the free room left and right, above and below (0: at
+    // the left or top edge, 1: at the right or bottom, 0.5: centred), so it stays on screen at
+    // another resolution: one moved to the top right at 4K opens at the top right at 1080p too.
+    const ImVec2 origin = GetMainViewport()->WorkPos;
+    const ImVec2 place{float(std::clamp(EmulatorSettings.GetBbF1PosX(), 0, 1000)) * 0.001f,
+                       float(std::clamp(EmulatorSettings.GetBbF1PosY(), 0, 1000)) * 0.001f};
+    SetNextWindowPos({origin.x + screen.x * place.x, origin.y + screen.y * place.y},
+                     ImGuiCond_Appearing, place);
     bool keep_open = true;
     if (!Begin("Upscaling  (F1 / Esc to close)", &keep_open,
                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
         End();
         return;
+    }
+    window_size = GetWindowSize();
+    // Moved or resized: the new place is saved once the mouse is let go.
+    if (!IsMouseDown(ImGuiMouseButton_Left)) {
+        const ImVec2 pos = GetWindowPos();
+        const auto share = [](float at, float start, float room) {
+            return room > 0.0f
+                       ? std::clamp(int(std::lround((at - start) / room * 1000.0f)), 0, 1000)
+                       : 500;
+        };
+        const int x = share(pos.x, origin.x, screen.x - window_size.x);
+        const int y = share(pos.y, origin.y, screen.y - window_size.y);
+        if (std::abs(x - EmulatorSettings.GetBbF1PosX()) > 1 ||
+            std::abs(y - EmulatorSettings.GetBbF1PosY()) > 1) {
+            EmulatorSettings.SetBbF1PosX(x);
+            EmulatorSettings.SetBbF1PosY(y);
+            EmulatorSettings.Save();
+        }
     }
     if (!keep_open ||
         (capture_action < 0 && IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
@@ -399,7 +430,7 @@ void DlssLayer::Draw() {
         PushStyleColor(ImGuiCol_Text, ImVec4{1.0f, 0.4f, 0.4f, 1.0f});
         TextWrapped("The Disable Motion Blur patch is on. It removes the depth and motion data "
                     "the upscaler needs: turn it off below and restart the game. To get rid of "
-                    "motion blur, leave Game motion blur (at the bottom) unticked instead.");
+                    "motion blur, leave Game motion blur (Graphics tab) unticked instead.");
         PopStyleColor();
     }
     if (patches.performance_patch) {
@@ -423,758 +454,873 @@ void DlssLayer::Draw() {
         PopStyleColor();
     }
 
-    SeparatorText("Frame rate");
-    {
-        namespace FrameRate = ::Core::BbFrameRate;
-        bool hooks = EmulatorSettings.IsBbFrameHooks();
-        if (Checkbox("Unlock frame rate", &hooks)) {
-            EmulatorSettings.SetBbFrameHooks(hooks);
-            EmulatorSettings.Save();
-        }
-        if (IsItemHovered())
-            SetTooltip("90 FPS++ (by Kyo) with its values set for the FPS cap below. Your own "
-                       "frame rate patches are left out.\nApplies at the next start.");
-        if (hooks != launch.frame_hooks) {
-            SameLine();
-            RestartHint(true, "(restart to apply)");
-            restart_needed.push_back("Unlock frame rate");
-        }
-        static constexpr std::array<int, 4> limits = {60, 90, 120, 0};
-        static constexpr std::array<const char*, 4> labels = {"60", "90", "120", "Uncapped"};
-        const int limit = EmulatorSettings.GetBbFpsLimit();
-        int index = int(limits.size()) - 1;
-        for (int i = 0; i < int(limits.size()); ++i) {
-            if (limits[i] == limit)
-                index = i;
-        }
-        BeginDisabled(!FrameRate::Active());
-        SetNextItemWidth(200.0f);
-        if (BeginCombo("FPS cap", labels[index])) {
-            for (int i = 0; i < int(limits.size()); ++i) {
-                if (Selectable(labels[i], i == index)) {
-                    EmulatorSettings.SetBbFpsLimit(limits[i]);
-                    EmulatorSettings.Save();
-                    FrameRate::SetLimit(limits[i]);
-                }
-            }
-            EndCombo();
-        }
-        EndDisabled();
-        if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            SetTooltip("Changes at once. Set the vblank frequency at least as high.");
-        if (FrameRate::Active()) {
-            SameLine();
-            TextDisabled("%.0f FPS", double(FrameRate::HeldRate()));
-        }
-        bool even = EmulatorSettings.IsBbEvenCappedFlips();
-        BeginDisabled(!FrameRate::Active());
-        if (Checkbox("Even frames with a cap", &even)) {
-            EmulatorSettings.SetBbEvenCappedFlips(even);
-            EmulatorSettings.Save();
-        }
-        EndDisabled();
-        if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            SetTooltip("With an FPS cap the game moves by exactly the cap's frame time every "
-                       "frame, but finishes its frames a millisecond or two early or late.\nOn: "
-                       "each frame is shown one cap period after the last (an early one waits "
-                       "for its turn).\nOff: each as soon as it is ready. Changes at once.");
+    // Tabs. Display: frame rate and resolution. Graphics: textures and the image features, the same
+    // settings as F3's (Bloodborne, Graphics), both always showing the same. Other: this menu's UI
+    // scale, keyboard and mouse, the benchmark route.
+    bool main_tab = true, display_tab = false, graphics_tab = false, other_tab = false;
+    if (BeginTabBar("##f1_tabs")) {
+        main_tab = BeginTabItem("Main");
+        if (main_tab)
+            EndTabItem();
+        display_tab = BeginTabItem("Display");
+        if (display_tab)
+            EndTabItem();
+        graphics_tab = BeginTabItem("Graphics");
+        if (graphics_tab)
+            EndTabItem();
+        other_tab = BeginTabItem("Other");
+        if (other_tab)
+            EndTabItem();
+        EndTabBar();
     }
-
-    SeparatorText("Resolution");
-    {
-        namespace Res = ::Core::BbResolution;
-        bool res_control = settings.Get("res_control", "0") == "1";
-        if (Checkbox("Set the resolution here (restart)", &res_control))
-            settings.Set("res_control", res_control ? "1" : "0");
-        if (IsItemHovered())
-            SetTooltip("The game's output resolution (its frame, post-processing and UI) and the "
-                       "render resolution of\nthe 3D scene, which the upscaler brings up to the "
-                       "output. Patches that set the same sizes (Resolution, Decoupled,\nHD "
-                       "Motion Blur) are skipped while this is on. Bloodborne 1.09.");
-        const auto next = Res::Preview();
-        BeginDisabled(!res_control);
+    if (display_tab) {
+        SeparatorText("Frame rate");
         {
-            static constexpr std::array OutputValues{"auto",      "1280x720",  "1600x900",
-                                                     "1920x1080", "2560x1440", "3840x2160"};
-            const auto output = settings.Get("res_output", "auto");
-            int index = 0;
-            for (size_t i = 0; i < OutputValues.size(); ++i)
-                if (output == OutputValues[i])
-                    index = int(i);
-            const std::string window_name =
-                index == 0 ? fmt::format("Window ({}x{})", next.output_width, next.output_height)
-                           : std::string{"Window"};
-            std::array<const char*, OutputValues.size()> names{};
-            names[0] = window_name.c_str();
-            for (size_t i = 1; i < OutputValues.size(); ++i)
-                names[i] = OutputValues[i];
-            SetNextItemWidth(200.0f);
-            if (Combo("Output resolution", &index, names.data(), int(names.size())))
-                settings.Set("res_output", OutputValues[index]);
-        }
-        {
-            // Native, then the usual 16:9 sizes below the output, largest first. Above 1080p the
-            // scene needs the bigger graphics heap: more VRAM and extra dmem.
-            auto heights = Res::RenderHeights(next.output_height);
-            std::ranges::reverse(heights);
-            const auto vram = [](u32 h) { return h > Res::HeapRenderHeight ? ", more VRAM" : ""; };
-            std::vector<std::string> values{"native"}, labels;
-            labels.push_back(next.output_height > Res::HeapRenderHeight
-                                 ? "Native (DLAA / FSR Native AA, more VRAM)"
-                                 : "Native (DLAA / FSR Native AA)");
-            for (const u32 h : heights) {
-                values.push_back(std::to_string(h));
-                labels.push_back(fmt::format("{}x{} ({}%{})", h * 16 / 9, h,
-                                             h * 100 / next.output_height, vram(h)));
-            }
-            int index = 0;
-            for (size_t i = 1; i < values.size(); ++i)
-                if (std::stoul(values[i]) == next.render_height)
-                    index = int(i);
-            std::vector<const char*> names;
-            for (const auto& label : labels)
-                names.push_back(label.c_str());
-            SetNextItemWidth(200.0f);
-            if (Combo("Upscale from", &index, names.data(), int(names.size())))
-                settings.Set("res_render", values[index]);
-        }
-        {
-            // Decoupled: the game's frame (post-processing, UI) at the output size, only the 3D
-            // scene lower. Regular: all of it lower, as a Resolution Patch: faster.
-            static constexpr std::array ModeValues{"decoupled", "regular"};
-            static constexpr std::array ModeNames{"Output (sharp UI)",
-                                                  "Render resolution (faster)"};
-            int index = next.regular ? 1 : 0;
-            SetNextItemWidth(200.0f);
-            if (Combo("UI and effects at", &index, ModeNames.data(), int(ModeNames.size())))
-                settings.Set("res_mode", ModeValues[index]);
-            if (IsItemHovered())
-                SetTooltip("Output: only the 3D scene renders at the lower resolution; the game's "
-                           "post-processing and UI\nstay at the output resolution (Decoupled UI). "
-                           "Sharpest.\nRender resolution: the whole frame renders at the lower "
-                           "resolution, as a regular Resolution Patch,\nand the upscaler brings "
-                           "it up to the output. Faster on slower GPUs, the UI is a little "
-                           "softer.");
-        }
-        {
-            // The game's graphics heap, raised for a scene above 1080p (Res::Install).
-            static constexpr std::array HeapValues{"auto", "full", "first", "smaller", "off"};
-            static constexpr std::array HeapNames{"Auto", "Full Heap Patch", "First Heap Only",
-                                                  "Smaller 2nd Heap", "Off"};
-            const auto heap = next.heap;
-            int index = 0;
-            for (size_t i = 0; i < HeapValues.size(); ++i)
-                if (heap == HeapValues[i])
-                    index = int(i);
-            SetNextItemWidth(200.0f);
-            if (Combo("Graphics Heap Size", &index, HeapNames.data(), int(HeapNames.size())))
-                settings.Set("res_heap", HeapValues[index]);
-            if (IsItemHovered())
-                SetTooltip(
-                    "Memory the game sets aside for graphics. A scene above 1080p needs "
-                    "more than its own.\nAuto: raised above 1080p, when a heap size patch is "
-                    "on in the patch file, or with texture packs (BB PC Remaster);\nboth heaps (as "
-                    "Smaller 2nd "
-                    "Heap) on cards with 8 GB or more, otherwise the first heap only.\nFull Heap "
-                    "Patch: the Increased Graphics Heap Sizes "
-                    "patch. First Heap Only: only the first heap raised.\nSmaller 2nd "
-                    "Heap: the second heap a little less than the full patch (the full patch can "
-                    "cause missing "
-                    "textures\nand flicker on some cards).\nOff: the game's own sizes, unless a "
-                    "heap size patch is enabled in the patch file.");
-        }
-        EndDisabled();
-        const auto& now = Res::Applied();
-        if (res_control) {
-            Text("%ux%u -> %ux%u", next.render_width, next.render_height, next.output_width,
-                 next.output_height);
-            SameLine();
-            const bool in_use = now.enabled && now.output_width == next.output_width &&
-                                now.output_height == next.output_height &&
-                                now.render_width == next.render_width &&
-                                now.render_height == next.render_height && now.heap == next.heap &&
-                                now.regular == next.regular;
-            if (in_use) {
-                TextDisabled("(in use)");
-            } else {
-                RestartHint(now.problem.empty(), "(restart the game to apply)");
-                if (now.problem.empty())
-                    restart_needed.push_back("Resolution");
-            }
-            if (!now.problem.empty())
-                TextDisabled("%s", now.problem.c_str());
-            // A scene above 1080p raises the game's graphics heap: it needs extra dmem.
-            if (next.render_height > Res::HeapRenderHeight &&
-                EmulatorSettings.GetExtraDmemInMBytes() < 4000)
-                TextColored({1.0f, 0.75f, 0.3f, 1.0f},
-                            "Above 1080p needs extra dmem of 4000 MB or more (game settings).");
-            // Patches from the patch file or launcher that set the same sizes: not applied.
-            if (now.enabled && !Res::SkippedPatches().empty())
-                TextWrapped("Ignored while this is on: %s",
-                            fmt::format("{}", fmt::join(Res::SkippedPatches(), ", ")).c_str());
-        } else {
-            if (now.enabled) {
-                RestartHint(true, "Restart the game to use the patch file's resolution again.");
-                restart_needed.push_back("Resolution");
-            }
-            TextWrapped("Off: the render resolution comes from the Resolution Patch you enable "
-                        "for Bloodborne (shadPS4 patches or BBLauncher), upscaled to your window.");
-        }
-    }
-
-    SeparatorText("Settings");
-    bool enabled = settings.Get("enabled", "1") != "0";
-    if (Checkbox("Upscaling enabled", &enabled))
-        settings.Set("enabled", enabled ? "1" : "0");
-
-    const auto upscaler = settings.Get("upscaler", "auto");
-    int upscaler_index = 0;
-    for (size_t i = 0; i < UpscalerValues.size(); ++i)
-        if (upscaler.starts_with(UpscalerValues[i]))
-            upscaler_index = int(i); // "fsr4" also starts with "fsr" and comes later
-    // FSR 4 is listed only when its add-on is installed.
-    const int upscaler_count = int(UpscalerNames.size()) - (status.fsr4_installed ? 0 : 1);
-    if (Combo("Upscaler", &upscaler_index, UpscalerNames.data(), upscaler_count))
-        settings.Set("upscaler", UpscalerValues[upscaler_index]);
-    if (!status.dlss_problem.empty() && upscaler_index != 2)
-        TextDisabled("%s", status.dlss_problem.c_str());
-
-    const int preset = std::atoi(settings.Get("preset", "13").c_str());
-    int preset_index = 0;
-    for (size_t i = 0; i < PresetValues.size(); ++i)
-        if (PresetValues[i] == preset)
-            preset_index = int(i);
-    BeginDisabled(status.backend != "DLSS" || upscaler_index >= 2);
-    if (Combo("DLSS model", &preset_index, PresetNames.data(), int(PresetNames.size())))
-        settings.Set("preset", std::to_string(PresetValues[preset_index]));
-    EndDisabled();
-
-    float sharpness = float(std::atof(settings.Get("sharpness", "0.6").c_str()));
-    if (SliderFloat("Sharpness", &sharpness, 0.0f, 1.0f, "%.2f"))
-        settings.Set("sharpness", fmt::format("{:.2f}", sharpness));
-
-    if (Vulkan::RenoDxLoaded()) {
-        bool hdr_compat = settings.Get("hdr_mod_compat", "1") != "0";
-        if (Checkbox("Remaster HDR compatibility (restart)", &hdr_compat))
-            settings.Set("hdr_mod_compat", hdr_compat ? "1" : "0");
-        BeginDisabled(!hdr_compat);
-        bool moon_restore = settings.Get("hdr_moon_restore", "0") == "1";
-        if (Checkbox("Restore original moon lighting (restart)", &moon_restore))
-            settings.Set("hdr_moon_restore", moon_restore ? "1" : "0");
-        EndDisabled();
-        if (changed("hdr_mod_compat", "1"))
-            restart_needed.push_back("Remaster HDR compatibility");
-        if (changed("hdr_moon_restore", "0"))
-            restart_needed.push_back("Moon lighting");
-    }
-
-    bool frame_gen = settings.Get("frame_gen", "0") != "0";
-    if (Checkbox("Frame generation", &frame_gen))
-        settings.Set("frame_gen", frame_gen ? "1" : "0");
-    if (frame_gen && !Vulkan::FrameGen::Requested())
-        restart_needed.push_back("Frame generation");
-    if (!Vulkan::FrameGen::Active()) {
-        const auto problem = Vulkan::FrameGen::Problem();
-        if (frame_gen && !problem.empty()) {
-            TextDisabled("%s", problem.c_str());
-        } else {
-            SameLine();
-            RestartHint(frame_gen, frame_gen ? "(restart the game to turn it on)"
-                                             : "(DLSS on RTX 40/50, FSR on other GPUs)");
-        }
-    } else {
-        const auto stats = Vulkan::FrameGen::GetStats();
-        SameLine();
-        if (stats.generating)
-            TextColored({0.4f, 1.0f, 0.4f, 1.0f}, "%s  %.0f -> %.0f fps",
-                        Vulkan::FrameGen::BackendName(), stats.base_fps, stats.output_fps);
-        else
-            TextDisabled("%s  %.0f fps, not generating", Vulkan::FrameGen::BackendName(),
-                         stats.base_fps);
-    }
-
-    // Which frame generation runs; Streamline or FSR's swapchain is set up at launch.
-    {
-        static constexpr std::array BackendNames{"Automatic", "DLSS (RTX 40/50)", "FSR"};
-        static constexpr std::array BackendValues{"auto", "dlss", "fsr"};
-        const auto backend = settings.Get("fg_backend", "auto");
-        int index = 0;
-        for (size_t i = 0; i < BackendValues.size(); ++i)
-            if (backend == BackendValues[i])
-                index = int(i);
-        SetNextItemWidth(200.0f);
-        if (Combo("Frame gen type", &index, BackendNames.data(), int(BackendNames.size())))
-            settings.Set("fg_backend", BackendValues[index]);
-        if (index != 2 && std::string_view{Vulkan::FrameGen::BackendName()} == "FSR" &&
-            Vulkan::RenoDxLoaded())
-            TextDisabled("RenoDX HDR is loaded: DLSS frame generation does not work with its HDR "
-                         "output, FSR is used.");
-        SameLine();
-        RestartHint(changed("fg_backend", "auto"), "(restart to apply)");
-        if (changed("fg_backend", "auto"))
-            restart_needed.push_back("Frame gen type");
-    }
-    if (Vulkan::FrameGen::Active()) {
-        // 3x and up only where Streamline offers them (RTX 50 series).
-        const int max = int(Vulkan::FrameGen::MaxMultiplier());
-        const int chosen = std::clamp(std::atoi(settings.Get("fg_multiplier", "2").c_str()), 2, 6);
-        if (max > 2 || chosen > 2) {
-            int index = std::min(chosen, max) - 2;
-            static constexpr std::array Names{"2x", "3x", "4x", "5x", "6x"};
-            SetNextItemWidth(120.0f);
-            if (Combo("Frame gen multiplier", &index, Names.data(), max - 1))
-                settings.Set("fg_multiplier", std::to_string(index + 2));
-            if (chosen > max) {
-                SameLine();
-                TextDisabled("(%dx needs an RTX 50 card)", chosen);
-            }
-        }
-    }
-
-    // DLSS frame generation's model, set in the NVIDIA driver's profile for shadPS4.exe when the
-    // game starts (as the NVIDIA app's model override does).
-    {
-        static constexpr std::array ModelNames{"Default", "B", "C (faster)"};
-        static constexpr std::array ModelValues{"default", "b", "c"};
-        const auto model = settings.Get("fg_model", "default");
-        int index = 0;
-        for (size_t i = 0; i < ModelValues.size(); ++i)
-            if (model == ModelValues[i])
-                index = int(i);
-        BeginDisabled(std::string_view{Vulkan::FrameGen::BackendName()} == "FSR");
-        SetNextItemWidth(200.0f);
-        if (Combo("DLSS frame gen model", &index, ModelNames.data(), int(ModelNames.size())))
-            settings.Set("fg_model", ModelValues[index]);
-        EndDisabled();
-        if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            SetTooltip("Default: the driver's choice (the NVIDIA app's override, if set).\n"
-                       "B: the standard model. C: a lighter model, faster, a little softer on "
-                       "the UI;\nneeds DLSS frame generation 310.9.16 or newer (nvngx_dlssg.dll), "
-                       "older ones use B.\nWritten to the NVIDIA driver profile for shadPS4.exe "
-                       "when the game starts.");
-        SameLine();
-        RestartHint(changed("fg_model", "default"), "(restart to apply)");
-        if (changed("fg_model", "default"))
-            restart_needed.push_back("DLSS frame gen model");
-    }
-
-    // NVIDIA Reflex's wait before each frame: less input delay with frame generation, but on
-    // some setups a lower base frame rate. Takes effect within a second.
-    bool reflex_sleep = settings.Get("fg_reflex_sleep", "0") != "0";
-    BeginDisabled(std::string_view{Vulkan::FrameGen::BackendName()} != "DLSS");
-    if (Checkbox("Lower input delay (Reflex)", &reflex_sleep))
-        settings.Set("fg_reflex_sleep", reflex_sleep ? "1" : "0");
-    EndDisabled();
-    SameLine();
-    TextDisabled("(less input delay, may lower fps)");
-
-    bool fps_counter = settings.Get("fps_counter", "0") != "0";
-    if (Checkbox("Frame gen FPS counter", &fps_counter))
-        settings.Set("fps_counter", fps_counter ? "1" : "0");
-    SameLine();
-    TextDisabled("(top-left corner)");
-
-    bool menu_fix = settings.Get("menu_fix", "1") != "0";
-    if (Checkbox("Menu fix", &menu_fix))
-        settings.Set("menu_fix", menu_fix ? "1" : "0");
-    if (IsItemHovered())
-        SetTooltip("Draws the HUD, menus and dialogue (health bar, blood echoes, inventory, "
-                   "NPCs) as their own layer\nover the upscaled scene, so the scene doesn't "
-                   "flicker or shimmer through their see-through parts.\nThe scene stays "
-                   "upscaled. Upscaled to a higher resolution or DLAA; not with Decoupled UI.");
-    SameLine();
-    TextDisabled("(steady HUD and menus)");
-
-    bool texture_lod_bias = settings.Get("texture_lod_bias", "1") != "0";
-    if (Checkbox("Sharper textures", &texture_lod_bias))
-        settings.Set("texture_lod_bias", texture_lod_bias ? "1" : "0");
-    if (IsItemHovered())
-        SetTooltip("While upscaling, the scene's textures are sampled for the output resolution, "
-                   "not the lower render\nresolution (NVIDIA's DLSS guide). Off: the game's own "
-                   "texture detail. Can add a little shimmer\non fine patterns.");
-    SameLine();
-    TextDisabled("(texture detail of the output resolution)");
-
-    bool object_motion = settings.Get("object_motion", "1") != "0";
-    if (Checkbox("Object motion vectors", &object_motion))
-        settings.Set("object_motion", object_motion ? "1" : "0");
-    if (IsItemHovered())
-        SetTooltip("Motion of moving objects (doors, elevators, enemies) for the upscaler. Off: "
-                   "only the camera's motion\nis used. Turn it off to check whether ghosting "
-                   "comes from it.");
-    SameLine();
-    TextDisabled("(less ghosting on moving objects)");
-
-    const bool renodx = Vulkan::RenoDxLoaded();
-    bool character_motion = !renodx && settings.Get("character_motion", "1") != "0";
-    BeginDisabled(renodx);
-    if (Checkbox("Character motion vectors", &character_motion))
-        settings.Set("character_motion", character_motion ? "1" : "0");
-    EndDisabled();
-    if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        SetTooltip(renodx ? "Off while RenoDX is loaded: RenoDX finds the shaders it replaces by "
-                            "their exact code,\nand the motion code would hide the character "
-                            "shaders from it."
-                          : "Per-vertex motion of animated characters, cloth and weapons for the "
-                            "upscaler. Off: they get\nthe object or camera motion instead. Turn "
-                            "it off to check whether ghosting comes from it.");
-    SameLine();
-    TextDisabled(renodx ? "(off with RenoDX)" : "(sharper moving characters)");
-
-    SeparatorText("SDR to HDR");
-    namespace RetroHdr = ::Vulkan::RetroHdr;
-    const auto& retro_hdr = RetroHdr::GetSession();
-    BeginDisabled(retro_hdr.state != RetroHdr::State::Active &&
-                  retro_hdr.state != RetroHdr::State::Disabled);
-    bool retro_hdr_on = std::atoi(settings.Get("retro_hdr", "0").c_str()) != 0;
-    if (Checkbox("SDR to HDR", &retro_hdr_on))
-        settings.Set("retro_hdr", retro_hdr_on ? "1" : "0");
-    if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        SetTooltip("Brightens the finished SDR image into HDR, like Special K's SDR to HDR. Works "
-                   "on any GPU, with frame generation.\nUnlike RenoDX it can't recover detail the "
-                   "game already clipped: very bright lights stay flat white,\nand the HUD is "
-                   "brightened too. For the best HDR, use RenoDX where it works (NVIDIA, "
-                   "2.1.0-pre.1 or 1.8.6).");
-    SameLine();
-    if (retro_hdr.state == RetroHdr::State::Active)
-        TextDisabled(retro_hdr_on ? "(untick to compare with SDR)" : "(showing SDR)");
-    else if (retro_hdr.state == RetroHdr::State::Disabled)
-        RestartHint(retro_hdr_on, retro_hdr_on ? "(restart the game to turn it on)"
-                                               : "(Special K style HDR from the SDR image)");
-    if (retro_hdr_on && retro_hdr.state == RetroHdr::State::Disabled)
-        restart_needed.push_back("SDR to HDR");
-    else
-        TextDisabled("(%s)", RetroHdr::Describe(retro_hdr.state).data());
-
-    int peak_override = int(RetroHdr::ParseFloat(settings.Get("retro_hdr_peak", "0"), 0.0f));
-    const float peak = RetroHdr::PeakNits(float(peak_override));
-    const float max_brightness = RetroHdr::MaxBrightness(peak);
-    float brightness = RetroHdr::ParseFloat(settings.Get("retro_hdr_brightness", "2.00"),
-                                            RetroHdr::DefaultBrightness);
-    brightness = std::clamp(brightness, RetroHdr::MinBrightness, max_brightness);
-    if (SliderFloat("HDR brightness", &brightness, RetroHdr::MinBrightness, max_brightness,
-                    "%.2fx"))
-        settings.Set("retro_hdr_brightness", fmt::format("{:.2f}", brightness));
-    SameLine();
-    if (Button("Default##retro_hdr_brightness"))
-        settings.Set("retro_hdr_brightness",
-                     fmt::format("{:.2f}", std::min(RetroHdr::DefaultBrightness, max_brightness)));
-    TextDisabled("white %.0f nits, 18%% gray %.0f nits", brightness * RetroHdr::BoostedNits(1.0f),
-                 brightness * RetroHdr::BoostedNits(0.18f));
-    if (SliderInt("HDR peak", &peak_override, 0, 4000, peak_override < 100 ? "auto" : "%d nits"))
-        settings.Set("retro_hdr_peak", std::to_string(peak_override < 100 ? 0 : peak_override));
-    SameLine();
-    if (Button("Default##retro_hdr_peak"))
-        settings.Set("retro_hdr_peak", "0");
-    SameLine();
-    if (retro_hdr.windows_peak_nits >= 100.0f)
-        TextDisabled("(Windows reports %.0f nits)", retro_hdr.windows_peak_nits);
-    else
-        TextDisabled("(no Windows value, %.0f nits used)", peak);
-    EndDisabled();
-
-    SeparatorText("Keyboard & mouse");
-    if (!Input::BbKbm::Active()) {
-        TextWrapped("Bloodborne PC controls: WASD to move, the mouse for the camera, left click to "
-                    "attack, all rebindable. Your current controls are kept as a backup.");
-        if (Button("Use keyboard & mouse controls"))
-            kbm_message = Input::BbKbm::Apply()
-                              ? "Done. The mouse turns the camera when this panel is closed."
-                              : "Could not write the input config.";
-    } else {
-        bool mouse_look = Input::BbKbm::MouseLookWanted();
-        if (Checkbox("Mouse look", &mouse_look))
-            Input::BbKbm::SetMouseLook(mouse_look);
-        SameLine();
-        TextDisabled("(F7 toggles it in game)");
-        float sensitivity =
-            std::clamp(RetroHdr::ParseFloat(settings.Get("mouse_sensitivity", "1.50"),
-                                            Input::BbKbm::DefaultSensitivity),
-                       Input::BbKbm::MinSensitivity, Input::BbKbm::MaxSensitivity);
-        if (SliderFloat("Mouse sensitivity", &sensitivity, Input::BbKbm::MinSensitivity,
-                        Input::BbKbm::MaxSensitivity, "%.2f"))
-            settings.Set("mouse_sensitivity", fmt::format("{:.2f}", sensitivity));
-        if (IsItemDeactivatedAfterEdit())
-            Input::BbKbm::Apply();
-        SameLine();
-        if (Button("Default##mouse_sensitivity")) {
-            settings.Set("mouse_sensitivity",
-                         fmt::format("{:.2f}", Input::BbKbm::DefaultSensitivity));
-            Input::BbKbm::Apply();
-        }
-        bool invert_y = settings.Get("mouse_invert_y", "0") == "1";
-        if (Checkbox("Invert mouse Y", &invert_y))
-            settings.Set("mouse_invert_y", invert_y ? "1" : "0");
-        SameLine();
-        bool invert_x = settings.Get("mouse_invert_x", "0") == "1";
-        if (Checkbox("Invert mouse X", &invert_x))
-            settings.Set("mouse_invert_x", invert_x ? "1" : "0");
-        bool auto_rotation = settings.Get("camera_auto_rotation", "0") == "1";
-        if (Checkbox("Camera auto-rotation (restart)", &auto_rotation))
-            settings.Set("camera_auto_rotation", auto_rotation ? "1" : "0");
-        if (changed("camera_auto_rotation", "0"))
-            restart_needed.push_back("Camera auto-rotation");
-        if (IsItemHovered())
-            SetTooltip("The game turning the camera by itself as you move. Off with keyboard and "
-                       "mouse: it fights\nevery mouse turn.");
-        if (::Core::BbMouseCamera::Installed())
-            TextDisabled("Native mouse camera: on");
-        else
-            TextDisabled("Native mouse camera: restart the game to turn it on (Bloodborne 1.09)");
-        if (TreeNode("Key bindings")) {
-            DrawKeyBindings();
-            TreePop();
-        }
-        if (Button("Restore previous controls"))
-            kbm_message = Input::BbKbm::Restore() ? "Previous controls restored."
-                                                  : "Could not restore the input config.";
-    }
-    if (!kbm_message.empty())
-        TextWrapped("%s", kbm_message.c_str());
-
-    SeparatorText("Benchmark route");
-    {
-        namespace Route = ::Input::BbRoute;
-        const auto mode = Route::GetMode();
-        TextWrapped("Record a route once, then play it back to repeat the same movement and "
-                    "measure the frame rate. Start each run from the same spot (rest at a lamp "
-                    "or load the same save). Enemies can act differently each run.");
-        switch (mode) {
-        case Route::Mode::Idle:
-            if (Button("Record route"))
-                Route::StartRecording();
-            if (IsItemHovered())
-                SetTooltip("Records from when F1 is closed. Open F1 again to stop.\nThe "
-                           "controller, keys and mouse camera are recorded; loading screens are "
-                           "left out.");
-            SameLine();
-            BeginDisabled(!Route::HasRoute());
-            if (Button("Play route"))
-                Route::Play();
-            EndDisabled();
-            if (Route::HasRoute()) {
-                SameLine();
-                TextDisabled("(%.0f s recorded)", Route::RouteSeconds());
-            }
-            break;
-        case Route::Mode::Recording:
-            TextColored(RestartColor, "Recording: %.0f s", Route::ElapsedSeconds());
-            SameLine();
-            if (Button("Stop recording"))
-                Route::StopRecording();
-            break;
-        case Route::Mode::Armed:
-            TextColored(RestartColor, "Close F1 to start the replay");
-            SameLine();
-            if (Button("Cancel"))
-                Route::Stop();
-            break;
-        case Route::Mode::Playing:
-            TextColored(RestartColor, "Playing: %.0f of %.0f s", Route::ElapsedSeconds(),
-                        Route::RouteSeconds());
-            SameLine();
-            if (Button("Stop"))
-                Route::Stop();
-            break;
-        }
-        if (const auto r = Route::LastResult(); r.valid) {
-            Text("Last replay: %.1f FPS average, %.1f FPS 1%% low, worst frame %.1f ms, %u "
-                 "stutters",
-                 r.average_fps, r.low_fps, r.worst_ms, r.stutters);
-            TextDisabled("(each replay is added to routes/results.csv in the user folder)");
-        }
-    }
-
-    SeparatorText("Recommended game patches");
-    if (!patches.file_found) {
-        TextWrapped("Bloodborne patch file not found. Download patches in shadPS4 first.");
-    } else {
-        bool all = true;
-        for (size_t i = 0; i < RecommendedPatches.size(); ++i) {
-            const bool skipped =
-                patches.enabled[i] &&
-                ::Core::FileSys::BbHdrCompat::ShouldSkipPatch(RecommendedPatches[i]);
-            const bool good = (patches.enabled[i] && !skipped) == Wanted(i);
-            all &= good;
-            TextColored(good ? ImVec4{0.4f, 1.0f, 0.4f, 1.0f} : ImVec4{1.0f, 0.75f, 0.3f, 1.0f},
-                        "%s  %s%s", patches.enabled[i] && !skipped ? "on " : "off",
-                        RecommendedPatches[i],
-                        skipped     ? " (ignored for HDR)"
-                        : Wanted(i) ? ""
-                                    : " (must be off with RenoDX HDR)");
-        }
-        if (patches.motion_blur_disabled) {
-            all = false;
-            TextColored({1.0f, 0.4f, 0.4f, 1.0f}, "on   Disable Motion Blur (must be off)");
-        }
-        if (!all) {
-            TextWrapped("The game's own anti-aliasing, chromatic aberration and depth of field "
-                        "blur the image before the upscaler sees it.");
-            if (Button("Apply recommended patches")) {
-                patches_changed = EnableRecommendedPatches();
-                patch_message = patches_changed ? "Done. Restart the game to apply."
-                                                : "Could not write the patch file.";
-                patches = ReadPatches();
-            }
-        }
-        if (patches_changed)
-            RestartHint(true, patch_message.c_str());
-        else if (!patch_message.empty())
-            TextWrapped("%s", patch_message.c_str());
-    }
-    if (patches_changed)
-        restart_needed.push_back("Game patches");
-
-    // Applies at once: toggled while watching the game.
-    SeparatorText("Ambient occlusion");
-    {
-        bool vbao = EmulatorSettings.IsBbVbao();
-        if (Checkbox("Better ambient occlusion (GT-VBAO)", &vbao)) {
-            EmulatorSettings.SetBbVbao(vbao);
-            EmulatorSettings.Save();
-        }
-        if (IsItemHovered())
-            SetTooltip("The game's ambient occlusion replaced with GT-VBAO: deeper, cleaner "
-                       "contact shadows in corners,\nunder objects and in carvings, without "
-                       "the game's dark halos around thin things.");
-        BeginDisabled(!vbao);
-        // Stored as hundredths; saved when the slider is let go.
-        const auto slider = [](const char* name, int value, auto set) {
-            float shown = float(value) * 0.01f;
-            SetNextItemWidth(200.0f);
-            if (SliderFloat(name, &shown, 0.25f, 4.0f, "%.2f"))
-                set(int(std::lround(shown * 100.0f)));
-            if (IsItemDeactivatedAfterEdit())
+            namespace FrameRate = ::Core::BbFrameRate;
+            bool hooks = EmulatorSettings.IsBbFrameHooks();
+            if (Checkbox("Unlock frame rate", &hooks)) {
+                EmulatorSettings.SetBbFrameHooks(hooks);
                 EmulatorSettings.Save();
-        };
-        slider("Strength", EmulatorSettings.GetBbVbaoStrength(),
-               [](int v) { EmulatorSettings.SetBbVbaoStrength(v); });
-        if (IsItemHovered())
-            SetTooltip("How dark occluded places get (1.50 by default).");
-        slider("Reach (metres)", EmulatorSettings.GetBbVbaoRadius(),
-               [](int v) { EmulatorSettings.SetBbVbaoRadius(v); });
-        if (IsItemHovered())
-            SetTooltip("How far away something can be and still shade a surface (1.50 by "
-                       "default).");
-        bool half_res = EmulatorSettings.IsBbVbaoHalfRes();
-        if (Checkbox("Half resolution (faster)", &half_res)) {
-            EmulatorSettings.SetBbVbaoHalfRes(half_res);
-            EmulatorSettings.Save();
-        }
-        if (IsItemHovered())
-            SetTooltip("Computed at half the scene's size and upscaled along the edges: about a "
-                       "quarter of the cost,\nslightly softer fine detail.");
-        if (Button("Defaults")) {
-            EmulatorSettings.SetBbVbaoHalfRes(true);
-            EmulatorSettings.SetBbVbaoStrength(150);
-            EmulatorSettings.SetBbVbaoRadius(150);
-            EmulatorSettings.Save();
-        }
-        EndDisabled();
-    }
-
-    if (ShowReflections) {
-        SeparatorText("Reflections");
-        {
-            static constexpr std::array<const char*, 3> modes = {"Game's", "Better", "Off"};
-            const int mode = std::clamp(EmulatorSettings.GetBbSsrMode(), 0, 2);
-            SetNextItemWidth(200.0f);
-            if (BeginCombo("Screen space reflections", modes[mode])) {
-                for (int i = 0; i < int(modes.size()); ++i) {
-                    if (Selectable(modes[i], i == mode)) {
-                        EmulatorSettings.SetBbSsrMode(i);
+            }
+            if (IsItemHovered())
+                SetTooltip("90 FPS++ (by Kyo) with its values set for the FPS cap below. Your own "
+                           "frame rate patches are left out.\nApplies at the next start.");
+            if (hooks != launch.frame_hooks) {
+                SameLine();
+                RestartHint(true, "(restart to apply)");
+                restart_needed.push_back("Unlock frame rate");
+            }
+            static constexpr std::array<int, 4> limits = {60, 90, 120, 0};
+            static constexpr std::array<const char*, 4> labels = {"60", "90", "120", "Uncapped"};
+            const int limit = EmulatorSettings.GetBbFpsLimit();
+            int index = int(limits.size()) - 1;
+            for (int i = 0; i < int(limits.size()); ++i) {
+                if (limits[i] == limit)
+                    index = i;
+            }
+            BeginDisabled(!FrameRate::Active());
+            SetNextItemWidth(Px(200.0f));
+            if (BeginCombo("FPS cap", labels[index])) {
+                for (int i = 0; i < int(limits.size()); ++i) {
+                    if (Selectable(labels[i], i == index)) {
+                        EmulatorSettings.SetBbFpsLimit(limits[i]);
                         EmulatorSettings.Save();
+                        FrameRate::SetLimit(limits[i]);
                     }
                 }
                 EndCombo();
             }
+            EndDisabled();
+            if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                SetTooltip("Changes at once. Set the vblank frequency at least as high.");
+            if (FrameRate::Active()) {
+                SameLine();
+                TextDisabled("%.0f FPS", double(FrameRate::HeldRate()));
+            }
+            bool even = EmulatorSettings.IsBbEvenCappedFlips();
+            BeginDisabled(!FrameRate::Active());
+            if (Checkbox("Even frames with a cap", &even)) {
+                EmulatorSettings.SetBbEvenCappedFlips(even);
+                EmulatorSettings.Save();
+            }
+            EndDisabled();
+            if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                SetTooltip(
+                    "With an FPS cap the game moves by exactly the cap's frame time every "
+                    "frame, but finishes its frames a millisecond or two early or late.\nOn: "
+                    "each frame is shown one cap period after the last (an early one waits "
+                    "for its turn).\nOff: each as soon as it is ready. Changes at once.");
+        }
+
+        SeparatorText("Resolution");
+        {
+            namespace Res = ::Core::BbResolution;
+            bool res_control = settings.Get("res_control", "0") == "1";
+            if (Checkbox("Set the resolution here (restart)", &res_control))
+                settings.Set("res_control", res_control ? "1" : "0");
             if (IsItemHovered())
-                SetTooltip("With the game's \"Enable Screen Space Reflections\" patch. Game's: as "
-                           "the game draws them.\nBetter: traced more precisely, sharper, to the "
-                           "screen's edges. Off: no screen-space reflections at all.");
-            BeginDisabled(mode != 1);
-            bool full_res = EmulatorSettings.IsBbSsrFullRes();
-            if (Checkbox("Full resolution", &full_res)) {
-                EmulatorSettings.SetBbSsrFullRes(full_res);
+                SetTooltip(
+                    "The game's output resolution (its frame, post-processing and UI) and the "
+                    "render resolution of\nthe 3D scene, which the upscaler brings up to the "
+                    "output. Patches that set the same sizes (Resolution, Decoupled,\nHD "
+                    "Motion Blur) are skipped while this is on. Bloodborne 1.09.");
+            const auto next = Res::Preview();
+            BeginDisabled(!res_control);
+            {
+                static constexpr std::array OutputValues{"auto",      "1280x720",  "1600x900",
+                                                         "1920x1080", "2560x1440", "3840x2160"};
+                const auto output = settings.Get("res_output", "auto");
+                int index = 0;
+                for (size_t i = 0; i < OutputValues.size(); ++i)
+                    if (output == OutputValues[i])
+                        index = int(i);
+                const std::string window_name =
+                    index == 0
+                        ? fmt::format("Window ({}x{})", next.output_width, next.output_height)
+                        : std::string{"Window"};
+                std::array<const char*, OutputValues.size()> names{};
+                names[0] = window_name.c_str();
+                for (size_t i = 1; i < OutputValues.size(); ++i)
+                    names[i] = OutputValues[i];
+                SetNextItemWidth(Px(200.0f));
+                if (Combo("Output resolution", &index, names.data(), int(names.size())))
+                    settings.Set("res_output", OutputValues[index]);
+            }
+            {
+                // Native, then the usual 16:9 sizes below the output, largest first. Above 1080p
+                // the scene needs the bigger graphics heap: more VRAM and extra dmem.
+                auto heights = Res::RenderHeights(next.output_height);
+                std::ranges::reverse(heights);
+                const auto vram = [](u32 h) {
+                    return h > Res::HeapRenderHeight ? ", more VRAM" : "";
+                };
+                std::vector<std::string> values{"native"}, labels;
+                labels.push_back(next.output_height > Res::HeapRenderHeight
+                                     ? "Native (DLAA / FSR Native AA, more VRAM)"
+                                     : "Native (DLAA / FSR Native AA)");
+                for (const u32 h : heights) {
+                    values.push_back(std::to_string(h));
+                    labels.push_back(fmt::format("{}x{} ({}%{})", h * 16 / 9, h,
+                                                 h * 100 / next.output_height, vram(h)));
+                }
+                int index = 0;
+                for (size_t i = 1; i < values.size(); ++i)
+                    if (std::stoul(values[i]) == next.render_height)
+                        index = int(i);
+                std::vector<const char*> names;
+                for (const auto& label : labels)
+                    names.push_back(label.c_str());
+                SetNextItemWidth(Px(200.0f));
+                if (Combo("Upscale from", &index, names.data(), int(names.size())))
+                    settings.Set("res_render", values[index]);
+            }
+            {
+                // Decoupled: the game's frame (post-processing, UI) at the output size, only the 3D
+                // scene lower. Regular: all of it lower, as a Resolution Patch: faster.
+                static constexpr std::array ModeValues{"decoupled", "regular"};
+                static constexpr std::array ModeNames{"Output (sharp UI)",
+                                                      "Render resolution (faster)"};
+                int index = next.regular ? 1 : 0;
+                SetNextItemWidth(Px(200.0f));
+                if (Combo("UI and effects at", &index, ModeNames.data(), int(ModeNames.size())))
+                    settings.Set("res_mode", ModeValues[index]);
+                if (IsItemHovered())
+                    SetTooltip(
+                        "Output: only the 3D scene renders at the lower resolution; the game's "
+                        "post-processing and UI\nstay at the output resolution (Decoupled UI). "
+                        "Sharpest.\nRender resolution: the whole frame renders at the lower "
+                        "resolution, as a regular Resolution Patch,\nand the upscaler brings "
+                        "it up to the output. Faster on slower GPUs, the UI is a little "
+                        "softer.");
+            }
+            {
+                // The game's graphics heap, raised for a scene above 1080p (Res::Install).
+                static constexpr std::array HeapValues{"auto", "full", "first", "smaller", "off"};
+                static constexpr std::array HeapNames{"Auto", "Full Heap Patch", "First Heap Only",
+                                                      "Smaller 2nd Heap", "Off"};
+                const auto heap = next.heap;
+                int index = 0;
+                for (size_t i = 0; i < HeapValues.size(); ++i)
+                    if (heap == HeapValues[i])
+                        index = int(i);
+                SetNextItemWidth(Px(200.0f));
+                if (Combo("Graphics Heap Size", &index, HeapNames.data(), int(HeapNames.size())))
+                    settings.Set("res_heap", HeapValues[index]);
+                if (IsItemHovered())
+                    SetTooltip(
+                        "Memory the game sets aside for graphics. A scene above 1080p needs "
+                        "more than its own.\nAuto: raised above 1080p, when a heap size patch is "
+                        "on in the patch file, or with texture packs (BB PC Remaster);\nboth heaps "
+                        "(as "
+                        "Smaller 2nd "
+                        "Heap) on cards with 8 GB or more, otherwise the first heap only.\nFull "
+                        "Heap "
+                        "Patch: the Increased Graphics Heap Sizes "
+                        "patch. First Heap Only: only the first heap raised.\nSmaller 2nd "
+                        "Heap: the second heap a little less than the full patch (the full patch "
+                        "can "
+                        "cause missing "
+                        "textures\nand flicker on some cards).\nOff: the game's own sizes, unless "
+                        "a "
+                        "heap size patch is enabled in the patch file.");
+            }
+            EndDisabled();
+            const auto& now = Res::Applied();
+            if (res_control) {
+                Text("%ux%u -> %ux%u", next.render_width, next.render_height, next.output_width,
+                     next.output_height);
+                SameLine();
+                const bool in_use = now.enabled && now.output_width == next.output_width &&
+                                    now.output_height == next.output_height &&
+                                    now.render_width == next.render_width &&
+                                    now.render_height == next.render_height &&
+                                    now.heap == next.heap && now.regular == next.regular;
+                if (in_use) {
+                    TextDisabled("(in use)");
+                } else {
+                    RestartHint(now.problem.empty(), "(restart the game to apply)");
+                    if (now.problem.empty())
+                        restart_needed.push_back("Resolution");
+                }
+                if (!now.problem.empty())
+                    TextDisabled("%s", now.problem.c_str());
+                // A scene above 1080p raises the game's graphics heap: it needs extra dmem.
+                if (next.render_height > Res::HeapRenderHeight &&
+                    EmulatorSettings.GetExtraDmemInMBytes() < 4000)
+                    TextColored({1.0f, 0.75f, 0.3f, 1.0f},
+                                "Above 1080p needs extra dmem of 4000 MB or more (game settings).");
+                // Patches from the patch file or launcher that set the same sizes: not applied.
+                if (now.enabled && !Res::SkippedPatches().empty())
+                    TextWrapped("Ignored while this is on: %s",
+                                fmt::format("{}", fmt::join(Res::SkippedPatches(), ", ")).c_str());
+            } else {
+                if (now.enabled) {
+                    RestartHint(true, "Restart the game to use the patch file's resolution again.");
+                    restart_needed.push_back("Resolution");
+                }
+                TextWrapped(
+                    "Off: the render resolution comes from the Resolution Patch you enable "
+                    "for Bloodborne (shadPS4 patches or BBLauncher), upscaled to your window.");
+            }
+        }
+    }
+    if (main_tab) {
+        SeparatorText("Settings");
+        bool enabled = settings.Get("enabled", "1") != "0";
+        if (Checkbox("Upscaling enabled", &enabled))
+            settings.Set("enabled", enabled ? "1" : "0");
+
+        const auto upscaler = settings.Get("upscaler", "auto");
+        int upscaler_index = 0;
+        for (size_t i = 0; i < UpscalerValues.size(); ++i)
+            if (upscaler.starts_with(UpscalerValues[i]))
+                upscaler_index = int(i); // "fsr4" also starts with "fsr" and comes later
+        // FSR 4 is listed only when its add-on is installed.
+        const int upscaler_count = int(UpscalerNames.size()) - (status.fsr4_installed ? 0 : 1);
+        if (Combo("Upscaler", &upscaler_index, UpscalerNames.data(), upscaler_count))
+            settings.Set("upscaler", UpscalerValues[upscaler_index]);
+        if (!status.dlss_problem.empty() && upscaler_index != 2)
+            TextDisabled("%s", status.dlss_problem.c_str());
+
+        const int preset = std::atoi(settings.Get("preset", "13").c_str());
+        int preset_index = 0;
+        for (size_t i = 0; i < PresetValues.size(); ++i)
+            if (PresetValues[i] == preset)
+                preset_index = int(i);
+        BeginDisabled(status.backend != "DLSS" || upscaler_index >= 2);
+        if (Combo("DLSS model", &preset_index, PresetNames.data(), int(PresetNames.size())))
+            settings.Set("preset", std::to_string(PresetValues[preset_index]));
+        EndDisabled();
+
+        float sharpness = float(std::atof(settings.Get("sharpness", "0.6").c_str()));
+        if (SliderFloat("Sharpness", &sharpness, 0.0f, 1.0f, "%.2f"))
+            settings.Set("sharpness", fmt::format("{:.2f}", sharpness));
+
+        if (Vulkan::RenoDxLoaded()) {
+            bool hdr_compat = settings.Get("hdr_mod_compat", "1") != "0";
+            if (Checkbox("Remaster HDR compatibility (restart)", &hdr_compat))
+                settings.Set("hdr_mod_compat", hdr_compat ? "1" : "0");
+            BeginDisabled(!hdr_compat);
+            bool moon_restore = settings.Get("hdr_moon_restore", "0") == "1";
+            if (Checkbox("Restore original moon lighting (restart)", &moon_restore))
+                settings.Set("hdr_moon_restore", moon_restore ? "1" : "0");
+            EndDisabled();
+            if (changed("hdr_mod_compat", "1"))
+                restart_needed.push_back("Remaster HDR compatibility");
+            if (changed("hdr_moon_restore", "0"))
+                restart_needed.push_back("Moon lighting");
+        }
+
+        bool frame_gen = settings.Get("frame_gen", "0") != "0";
+        if (Checkbox("Frame generation", &frame_gen))
+            settings.Set("frame_gen", frame_gen ? "1" : "0");
+        if (frame_gen && !Vulkan::FrameGen::Requested())
+            restart_needed.push_back("Frame generation");
+        if (!Vulkan::FrameGen::Active()) {
+            const auto problem = Vulkan::FrameGen::Problem();
+            if (frame_gen && !problem.empty()) {
+                TextDisabled("%s", problem.c_str());
+            } else {
+                SameLine();
+                RestartHint(frame_gen, frame_gen ? "(restart the game to turn it on)"
+                                                 : "(DLSS on RTX 40/50, FSR on other GPUs)");
+            }
+        } else {
+            const auto stats = Vulkan::FrameGen::GetStats();
+            SameLine();
+            if (stats.generating)
+                TextColored({0.4f, 1.0f, 0.4f, 1.0f}, "%s  %.0f -> %.0f fps",
+                            Vulkan::FrameGen::BackendName(), stats.base_fps, stats.output_fps);
+            else
+                TextDisabled("%s  %.0f fps, not generating", Vulkan::FrameGen::BackendName(),
+                             stats.base_fps);
+        }
+
+        // Which frame generation runs; Streamline or FSR's swapchain is set up at launch.
+        {
+            static constexpr std::array BackendNames{"Automatic", "DLSS (RTX 40/50)", "FSR"};
+            static constexpr std::array BackendValues{"auto", "dlss", "fsr"};
+            const auto backend = settings.Get("fg_backend", "auto");
+            int index = 0;
+            for (size_t i = 0; i < BackendValues.size(); ++i)
+                if (backend == BackendValues[i])
+                    index = int(i);
+            SetNextItemWidth(Px(200.0f));
+            if (Combo("Frame gen type", &index, BackendNames.data(), int(BackendNames.size())))
+                settings.Set("fg_backend", BackendValues[index]);
+            if (index != 2 && std::string_view{Vulkan::FrameGen::BackendName()} == "FSR" &&
+                Vulkan::RenoDxLoaded())
+                TextDisabled(
+                    "RenoDX HDR is loaded: DLSS frame generation does not work with its HDR "
+                    "output, FSR is used.");
+            SameLine();
+            RestartHint(changed("fg_backend", "auto"), "(restart to apply)");
+            if (changed("fg_backend", "auto"))
+                restart_needed.push_back("Frame gen type");
+        }
+        if (Vulkan::FrameGen::Active()) {
+            // 3x and up only where Streamline offers them (RTX 50 series).
+            const int max = int(Vulkan::FrameGen::MaxMultiplier());
+            const int chosen =
+                std::clamp(std::atoi(settings.Get("fg_multiplier", "2").c_str()), 2, 6);
+            if (max > 2 || chosen > 2) {
+                int index = std::min(chosen, max) - 2;
+                static constexpr std::array Names{"2x", "3x", "4x", "5x", "6x"};
+                SetNextItemWidth(Px(120.0f));
+                if (Combo("Frame gen multiplier", &index, Names.data(), max - 1))
+                    settings.Set("fg_multiplier", std::to_string(index + 2));
+                if (chosen > max) {
+                    SameLine();
+                    TextDisabled("(%dx needs an RTX 50 card)", chosen);
+                }
+            }
+        }
+
+        // DLSS frame generation's model, set in the NVIDIA driver's profile for shadPS4.exe when
+        // the game starts (as the NVIDIA app's model override does).
+        {
+            static constexpr std::array ModelNames{"Default", "B", "C (faster)"};
+            static constexpr std::array ModelValues{"default", "b", "c"};
+            const auto model = settings.Get("fg_model", "default");
+            int index = 0;
+            for (size_t i = 0; i < ModelValues.size(); ++i)
+                if (model == ModelValues[i])
+                    index = int(i);
+            BeginDisabled(std::string_view{Vulkan::FrameGen::BackendName()} == "FSR");
+            SetNextItemWidth(Px(200.0f));
+            if (Combo("DLSS frame gen model", &index, ModelNames.data(), int(ModelNames.size())))
+                settings.Set("fg_model", ModelValues[index]);
+            EndDisabled();
+            if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                SetTooltip(
+                    "Default: the driver's choice (the NVIDIA app's override, if set).\n"
+                    "B: the standard model. C: a lighter model, faster, a little softer on "
+                    "the UI;\nneeds DLSS frame generation 310.9.16 or newer (nvngx_dlssg.dll), "
+                    "older ones use B.\nWritten to the NVIDIA driver profile for shadPS4.exe "
+                    "when the game starts.");
+            SameLine();
+            RestartHint(changed("fg_model", "default"), "(restart to apply)");
+            if (changed("fg_model", "default"))
+                restart_needed.push_back("DLSS frame gen model");
+        }
+
+        // NVIDIA Reflex's wait before each frame: less input delay with frame generation, but on
+        // some setups a lower base frame rate. Takes effect within a second.
+        bool reflex_sleep = settings.Get("fg_reflex_sleep", "0") != "0";
+        BeginDisabled(std::string_view{Vulkan::FrameGen::BackendName()} != "DLSS");
+        if (Checkbox("Lower input delay (Reflex)", &reflex_sleep))
+            settings.Set("fg_reflex_sleep", reflex_sleep ? "1" : "0");
+        EndDisabled();
+        SameLine();
+        TextDisabled("(less input delay, may lower fps)");
+
+        bool fps_counter = settings.Get("fps_counter", "0") != "0";
+        if (Checkbox("Frame gen FPS counter", &fps_counter))
+            settings.Set("fps_counter", fps_counter ? "1" : "0");
+        SameLine();
+        TextDisabled("(top-left corner)");
+
+        bool menu_fix = settings.Get("menu_fix", "1") != "0";
+        if (Checkbox("Menu fix", &menu_fix))
+            settings.Set("menu_fix", menu_fix ? "1" : "0");
+        if (IsItemHovered())
+            SetTooltip("Draws the HUD, menus and dialogue (health bar, blood echoes, inventory, "
+                       "NPCs) as their own layer\nover the upscaled scene, so the scene doesn't "
+                       "flicker or shimmer through their see-through parts.\nThe scene stays "
+                       "upscaled. Upscaled to a higher resolution or DLAA; not with Decoupled UI.");
+        SameLine();
+        TextDisabled("(steady HUD and menus)");
+
+        bool texture_lod_bias = settings.Get("texture_lod_bias", "1") != "0";
+        if (Checkbox("Sharper textures", &texture_lod_bias))
+            settings.Set("texture_lod_bias", texture_lod_bias ? "1" : "0");
+        if (IsItemHovered())
+            SetTooltip(
+                "While upscaling, the scene's textures are sampled for the output resolution, "
+                "not the lower render\nresolution (NVIDIA's DLSS guide). Off: the game's own "
+                "texture detail. Can add a little shimmer\non fine patterns.");
+        SameLine();
+        TextDisabled("(texture detail of the output resolution)");
+
+        bool object_motion = settings.Get("object_motion", "1") != "0";
+        if (Checkbox("Object motion vectors", &object_motion))
+            settings.Set("object_motion", object_motion ? "1" : "0");
+        if (IsItemHovered())
+            SetTooltip(
+                "Motion of moving objects (doors, elevators, enemies) for the upscaler. Off: "
+                "only the camera's motion\nis used. Turn it off to check whether ghosting "
+                "comes from it.");
+        SameLine();
+        TextDisabled("(less ghosting on moving objects)");
+
+        const bool renodx = Vulkan::RenoDxLoaded();
+        bool character_motion = !renodx && settings.Get("character_motion", "1") != "0";
+        BeginDisabled(renodx);
+        if (Checkbox("Character motion vectors", &character_motion))
+            settings.Set("character_motion", character_motion ? "1" : "0");
+        EndDisabled();
+        if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            SetTooltip(renodx
+                           ? "Off while RenoDX is loaded: RenoDX finds the shaders it replaces by "
+                             "their exact code,\nand the motion code would hide the character "
+                             "shaders from it."
+                           : "Per-vertex motion of animated characters, cloth and weapons for the "
+                             "upscaler. Off: they get\nthe object or camera motion instead. Turn "
+                             "it off to check whether ghosting comes from it.");
+        SameLine();
+        TextDisabled(renodx ? "(off with RenoDX)" : "(sharper moving characters)");
+
+        SeparatorText("SDR to HDR");
+        namespace RetroHdr = ::Vulkan::RetroHdr;
+        const auto& retro_hdr = RetroHdr::GetSession();
+        BeginDisabled(retro_hdr.state != RetroHdr::State::Active &&
+                      retro_hdr.state != RetroHdr::State::Disabled);
+        bool retro_hdr_on = std::atoi(settings.Get("retro_hdr", "0").c_str()) != 0;
+        if (Checkbox("SDR to HDR", &retro_hdr_on))
+            settings.Set("retro_hdr", retro_hdr_on ? "1" : "0");
+        if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            SetTooltip(
+                "Brightens the finished SDR image into HDR, like Special K's SDR to HDR. Works "
+                "on any GPU, with frame generation.\nUnlike RenoDX it can't recover detail the "
+                "game already clipped: very bright lights stay flat white,\nand the HUD is "
+                "brightened too. For the best HDR, use RenoDX where it works (NVIDIA, "
+                "2.1.0-pre.1 or 1.8.6).");
+        SameLine();
+        if (retro_hdr.state == RetroHdr::State::Active)
+            TextDisabled(retro_hdr_on ? "(untick to compare with SDR)" : "(showing SDR)");
+        else if (retro_hdr.state == RetroHdr::State::Disabled)
+            RestartHint(retro_hdr_on, retro_hdr_on ? "(restart the game to turn it on)"
+                                                   : "(Special K style HDR from the SDR image)");
+        if (retro_hdr_on && retro_hdr.state == RetroHdr::State::Disabled)
+            restart_needed.push_back("SDR to HDR");
+        else
+            TextDisabled("(%s)", RetroHdr::Describe(retro_hdr.state).data());
+
+        int peak_override = int(RetroHdr::ParseFloat(settings.Get("retro_hdr_peak", "0"), 0.0f));
+        const float peak = RetroHdr::PeakNits(float(peak_override));
+        const float max_brightness = RetroHdr::MaxBrightness(peak);
+        float brightness = RetroHdr::ParseFloat(settings.Get("retro_hdr_brightness", "2.00"),
+                                                RetroHdr::DefaultBrightness);
+        brightness = std::clamp(brightness, RetroHdr::MinBrightness, max_brightness);
+        if (SliderFloat("HDR brightness", &brightness, RetroHdr::MinBrightness, max_brightness,
+                        "%.2fx"))
+            settings.Set("retro_hdr_brightness", fmt::format("{:.2f}", brightness));
+        SameLine();
+        if (Button("Default##retro_hdr_brightness"))
+            settings.Set(
+                "retro_hdr_brightness",
+                fmt::format("{:.2f}", std::min(RetroHdr::DefaultBrightness, max_brightness)));
+        TextDisabled("white %.0f nits, 18%% gray %.0f nits",
+                     brightness * RetroHdr::BoostedNits(1.0f),
+                     brightness * RetroHdr::BoostedNits(0.18f));
+        if (SliderInt("HDR peak", &peak_override, 0, 4000,
+                      peak_override < 100 ? "auto" : "%d nits"))
+            settings.Set("retro_hdr_peak", std::to_string(peak_override < 100 ? 0 : peak_override));
+        SameLine();
+        if (Button("Default##retro_hdr_peak"))
+            settings.Set("retro_hdr_peak", "0");
+        SameLine();
+        if (retro_hdr.windows_peak_nits >= 100.0f)
+            TextDisabled("(Windows reports %.0f nits)", retro_hdr.windows_peak_nits);
+        else
+            TextDisabled("(no Windows value, %.0f nits used)", peak);
+        EndDisabled();
+
+        SeparatorText("Recommended game patches");
+        if (!patches.file_found) {
+            TextWrapped("Bloodborne patch file not found. Download patches in shadPS4 first.");
+        } else {
+            bool all = true;
+            for (size_t i = 0; i < RecommendedPatches.size(); ++i) {
+                const bool skipped =
+                    patches.enabled[i] &&
+                    ::Core::FileSys::BbHdrCompat::ShouldSkipPatch(RecommendedPatches[i]);
+                const bool good = (patches.enabled[i] && !skipped) == Wanted(i);
+                all &= good;
+                TextColored(good ? ImVec4{0.4f, 1.0f, 0.4f, 1.0f} : ImVec4{1.0f, 0.75f, 0.3f, 1.0f},
+                            "%s  %s%s", patches.enabled[i] && !skipped ? "on " : "off",
+                            RecommendedPatches[i],
+                            skipped     ? " (ignored for HDR)"
+                            : Wanted(i) ? ""
+                                        : " (must be off with RenoDX HDR)");
+            }
+            if (patches.motion_blur_disabled) {
+                all = false;
+                TextColored({1.0f, 0.4f, 0.4f, 1.0f}, "on   Disable Motion Blur (must be off)");
+            }
+            if (!all) {
+                TextWrapped("The game's own anti-aliasing, chromatic aberration and depth of field "
+                            "blur the image before the upscaler sees it.");
+                if (Button("Apply recommended patches")) {
+                    patches_changed = EnableRecommendedPatches();
+                    patch_message = patches_changed ? "Done. Restart the game to apply."
+                                                    : "Could not write the patch file.";
+                    patches = ReadPatches();
+                }
+            }
+            if (patches_changed)
+                RestartHint(true, patch_message.c_str());
+            else if (!patch_message.empty())
+                TextWrapped("%s", patch_message.c_str());
+        }
+        if (patches_changed)
+            restart_needed.push_back("Game patches");
+
+        // Applies at once: toggled while watching the game.
+    }
+    if (other_tab) {
+        SeparatorText("F1 menu");
+        // Its own UI scale, apart from F3's. Applied when let go, so the slider doesn't move under
+        // the mouse while dragged.
+        {
+            float size =
+                float(menu_size_edit >= 0 ? menu_size_edit : EmulatorSettings.GetBbF1Scale()) *
+                0.01f;
+            SetNextItemWidth(Px(200.0f));
+            if (SliderFloat("UI scale", &size, 0.5f, 2.5f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
+                menu_size_edit = int(std::lround(size * 20.0f)) * 5; // steps of 0.05
+            if (IsItemDeactivated() && menu_size_edit >= 0) {
+                EmulatorSettings.SetBbF1Scale(menu_size_edit);
+                EmulatorSettings.Save();
+                menu_size_edit = -1;
+            }
+            if (IsItemHovered())
+                SetTooltip(
+                    "The size of this menu's text and controls (F3 has its own), kept for the "
+                    "next launch.\nCtrl+click to type a value.");
+            SameLine();
+            if (Button("Default##ui_scale")) {
+                EmulatorSettings.SetBbF1Scale(100);
+                EmulatorSettings.Save();
+            }
+        }
+
+        SeparatorText("Keyboard & mouse");
+        if (!Input::BbKbm::Active()) {
+            TextWrapped(
+                "Bloodborne PC controls: WASD to move, the mouse for the camera, left click to "
+                "attack, all rebindable. Your current controls are kept as a backup.");
+            if (Button("Use keyboard & mouse controls"))
+                kbm_message = Input::BbKbm::Apply()
+                                  ? "Done. The mouse turns the camera when this panel is closed."
+                                  : "Could not write the input config.";
+        } else {
+            bool mouse_look = Input::BbKbm::MouseLookWanted();
+            if (Checkbox("Mouse look", &mouse_look))
+                Input::BbKbm::SetMouseLook(mouse_look);
+            SameLine();
+            TextDisabled("(F7 toggles it in game)");
+            float sensitivity =
+                std::clamp(::Vulkan::RetroHdr::ParseFloat(settings.Get("mouse_sensitivity", "1.50"),
+                                                          Input::BbKbm::DefaultSensitivity),
+                           Input::BbKbm::MinSensitivity, Input::BbKbm::MaxSensitivity);
+            if (SliderFloat("Mouse sensitivity", &sensitivity, Input::BbKbm::MinSensitivity,
+                            Input::BbKbm::MaxSensitivity, "%.2f"))
+                settings.Set("mouse_sensitivity", fmt::format("{:.2f}", sensitivity));
+            if (IsItemDeactivatedAfterEdit())
+                Input::BbKbm::Apply();
+            SameLine();
+            if (Button("Default##mouse_sensitivity")) {
+                settings.Set("mouse_sensitivity",
+                             fmt::format("{:.2f}", Input::BbKbm::DefaultSensitivity));
+                Input::BbKbm::Apply();
+            }
+            bool invert_y = settings.Get("mouse_invert_y", "0") == "1";
+            if (Checkbox("Invert mouse Y", &invert_y))
+                settings.Set("mouse_invert_y", invert_y ? "1" : "0");
+            SameLine();
+            bool invert_x = settings.Get("mouse_invert_x", "0") == "1";
+            if (Checkbox("Invert mouse X", &invert_x))
+                settings.Set("mouse_invert_x", invert_x ? "1" : "0");
+            bool auto_rotation = settings.Get("camera_auto_rotation", "0") == "1";
+            if (Checkbox("Camera auto-rotation (restart)", &auto_rotation))
+                settings.Set("camera_auto_rotation", auto_rotation ? "1" : "0");
+            if (changed("camera_auto_rotation", "0"))
+                restart_needed.push_back("Camera auto-rotation");
+            if (IsItemHovered())
+                SetTooltip(
+                    "The game turning the camera by itself as you move. Off with keyboard and "
+                    "mouse: it fights\nevery mouse turn.");
+            if (::Core::BbMouseCamera::Installed())
+                TextDisabled("Native mouse camera: on");
+            else
+                TextDisabled(
+                    "Native mouse camera: restart the game to turn it on (Bloodborne 1.09)");
+            if (TreeNode("Key bindings")) {
+                DrawKeyBindings();
+                TreePop();
+            }
+            if (Button("Restore previous controls"))
+                kbm_message = Input::BbKbm::Restore() ? "Previous controls restored."
+                                                      : "Could not restore the input config.";
+        }
+        if (!kbm_message.empty())
+            TextWrapped("%s", kbm_message.c_str());
+
+        SeparatorText("Benchmark route");
+        {
+            namespace Route = ::Input::BbRoute;
+            const auto mode = Route::GetMode();
+            TextWrapped("Record a route once, then play it back to repeat the same movement and "
+                        "measure the frame rate. Start each run from the same spot (rest at a lamp "
+                        "or load the same save). Enemies can act differently each run.");
+            switch (mode) {
+            case Route::Mode::Idle:
+                if (Button("Record route"))
+                    Route::StartRecording();
+                if (IsItemHovered())
+                    SetTooltip(
+                        "Records from when F1 is closed. Open F1 again to stop.\nThe "
+                        "controller, keys and mouse camera are recorded; loading screens are "
+                        "left out.");
+                SameLine();
+                BeginDisabled(!Route::HasRoute());
+                if (Button("Play route"))
+                    Route::Play();
+                EndDisabled();
+                if (Route::HasRoute()) {
+                    SameLine();
+                    TextDisabled("(%.0f s recorded)", Route::RouteSeconds());
+                }
+                break;
+            case Route::Mode::Recording:
+                TextColored(RestartColor, "Recording: %.0f s", Route::ElapsedSeconds());
+                SameLine();
+                if (Button("Stop recording"))
+                    Route::StopRecording();
+                break;
+            case Route::Mode::Armed:
+                TextColored(RestartColor, "Close F1 to start the replay");
+                SameLine();
+                if (Button("Cancel"))
+                    Route::Stop();
+                break;
+            case Route::Mode::Playing:
+                TextColored(RestartColor, "Playing: %.0f of %.0f s", Route::ElapsedSeconds(),
+                            Route::RouteSeconds());
+                SameLine();
+                if (Button("Stop"))
+                    Route::Stop();
+                break;
+            }
+            if (const auto r = Route::LastResult(); r.valid) {
+                Text("Last replay: %.1f FPS average, %.1f FPS 1%% low, worst frame %.1f ms, %u "
+                     "stutters",
+                     r.average_fps, r.low_fps, r.worst_ms, r.stutters);
+                TextDisabled("(each replay is added to routes/results.csv in the user folder)");
+            }
+        }
+    }
+    if (graphics_tab) {
+        settings.Load(); // F3 may have changed them
+        SeparatorText("Textures");
+        {
+            static constexpr std::array AnisotropyNames{"Game default", "2x", "4x", "8x", "16x"};
+            int index = BbAnisotropyIndex(EmulatorSettings.GetBbAnisotropy());
+            SetNextItemWidth(Px(200.0f));
+            if (Combo("Anisotropic filtering", &index, AnisotropyNames.data(),
+                      int(AnisotropyNames.size()))) {
+                EmulatorSettings.SetBbAnisotropy(BbAnisotropySamples(index));
                 EmulatorSettings.Save();
             }
             if (IsItemHovered())
-                SetTooltip("Better reflections at the full render size instead of the game's half "
-                           "size: a little sharper,\nat more GPU time.");
-            if constexpr (ShowReflectionTuning) {
-                bool rough_rays = EmulatorSettings.IsBbSsrRoughRays();
-                if (Checkbox("Sharp reflections (test)", &rough_rays)) {
-                    EmulatorSettings.SetBbSsrRoughRays(rough_rays);
-                    EmulatorSettings.Save();
-                }
-                if (IsItemHovered())
-                    SetTooltip("No fade towards the screen's edges, no blur between neighbouring "
-                               "pixels, and a short history\n(less smearing). Changes at once.");
-                BeginDisabled(!rough_rays || !full_res);
-                float min_gloss = float(EmulatorSettings.GetBbSsrMinGloss()) * 0.01f;
-                SetNextItemWidth(200.0f);
-                if (SliderFloat("Minimum gloss", &min_gloss, 0.0f, 1.0f, "%.2f"))
-                    EmulatorSettings.SetBbSsrMinGloss(int(std::lround(min_gloss * 100.0f)));
+                SetTooltip("Sharper ground and stairs at an angle.");
+            if (EmulatorSettings.GetBbAnisotropy() != launch.anisotropy) {
+                SameLine();
+                RestartHint(true, "(restart to apply)");
+                restart_needed.push_back("Anisotropic filtering");
+            }
+            static constexpr std::array QualityNames{"Full", "High", "Medium"};
+            int quality = std::clamp(EmulatorSettings.GetBbTextureQuality(), 0, 2);
+            SetNextItemWidth(Px(200.0f));
+            if (Combo("Texture quality", &quality, QualityNames.data(), int(QualityNames.size()))) {
+                EmulatorSettings.SetBbTextureQuality(quality);
+                EmulatorSettings.Save();
+            }
+            if (IsItemHovered())
+                SetTooltip("Less VRAM for big textures (the BB Remaster mod's) by leaving out "
+                           "their sharpest level:\nHigh: textures over 2048, Medium: over 1024 "
+                           "(about 500 MB less in busy areas).\nApplies to textures loaded after "
+                           "a change: from the next loading screen.");
+        }
+
+        SeparatorText("Ambient occlusion");
+        {
+            bool vbao = EmulatorSettings.IsBbVbao();
+            if (Checkbox("Better ambient occlusion (GT-VBAO)", &vbao)) {
+                EmulatorSettings.SetBbVbao(vbao);
+                EmulatorSettings.Save();
+            }
+            if (IsItemHovered())
+                SetTooltip("The game's ambient occlusion replaced with GT-VBAO: deeper, cleaner "
+                           "contact shadows in corners,\nunder objects and in carvings, without "
+                           "the game's dark halos around thin things.");
+            BeginDisabled(!vbao);
+            // Stored as hundredths; saved when the slider is let go.
+            const auto slider = [](const char* name, int value, auto set) {
+                float shown = float(value) * 0.01f;
+                SetNextItemWidth(Px(200.0f));
+                if (SliderFloat(name, &shown, 0.25f, 4.0f, "%.2f"))
+                    set(int(std::lround(shown * 100.0f)));
                 if (IsItemDeactivatedAfterEdit())
                     EmulatorSettings.Save();
-                if (IsItemHovered())
-                    SetTooltip("Only surfaces at least this glossy reflect (the Gloss debug view: "
-                               "puddles about 0.8, metal about 0.5,\ndry stone near 0). Higher: "
-                               "fewer, steadier reflections and less GPU time. Sharp at full "
-                               "resolution only.");
-                EndDisabled();
-                BeginDisabled(!rough_rays);
-                int frames = std::clamp(EmulatorSettings.GetBbSsrSharpFrames(), 2, 16);
-                SetNextItemWidth(200.0f);
-                if (SliderInt("Steadiness (frames)", &frames, 2, 16))
-                    EmulatorSettings.SetBbSsrSharpFrames(frames);
-                if (IsItemDeactivatedAfterEdit())
-                    EmulatorSettings.Save();
-                if (IsItemHovered())
-                    SetTooltip("How many frames the reflections are averaged over (8 by default). "
-                               "More: less flicker, but more\nsmearing when the camera moves. "
-                               "Sharp reflections only.");
-                EndDisabled();
-                constexpr std::array DebugNames{"Off", "All magenta", "Hits magenta", "Gloss",
-                                                "Raw (no denoiser)"};
-                int debug = std::clamp(EmulatorSettings.GetBbSsrDebug(), 0, 4);
-                if (Combo("Reflections debug", &debug, DebugNames.data(), int(DebugNames.size()))) {
-                    EmulatorSettings.SetBbSsrDebug(debug); // not saved
-                }
-                if (IsItemHovered())
-                    SetTooltip(
-                        "All magenta: every pixel's reflection is bright magenta, so the "
-                        "picture shows where the game's lighting\nuses reflections and how "
-                        "strongly. Hits magenta: only where a ray hit something. Gloss: shiny "
-                        "green, rough red.\nRaw: the reflections as traced, without "
-                        "the denoiser. Off when the game restarts.");
+            };
+            slider("Strength", EmulatorSettings.GetBbVbaoStrength(),
+                   [](int v) { EmulatorSettings.SetBbVbaoStrength(v); });
+            if (IsItemHovered())
+                SetTooltip("How dark occluded places get (1.50 by default).");
+            slider("Reach (metres)", EmulatorSettings.GetBbVbaoRadius(),
+                   [](int v) { EmulatorSettings.SetBbVbaoRadius(v); });
+            if (IsItemHovered())
+                SetTooltip("How far away something can be and still shade a surface (1.50 by "
+                           "default).");
+            bool half_res = EmulatorSettings.IsBbVbaoHalfRes();
+            if (Checkbox("Half resolution (faster)", &half_res)) {
+                EmulatorSettings.SetBbVbaoHalfRes(half_res);
+                EmulatorSettings.Save();
+            }
+            if (IsItemHovered())
+                SetTooltip(
+                    "Computed at half the scene's size and upscaled along the edges: about a "
+                    "quarter of the cost,\nslightly softer fine detail.");
+            if (Button("Defaults")) {
+                EmulatorSettings.SetBbVbaoHalfRes(true);
+                EmulatorSettings.SetBbVbaoStrength(150);
+                EmulatorSettings.SetBbVbaoRadius(150);
+                EmulatorSettings.Save();
             }
             EndDisabled();
         }
-    }
 
-    // Down here on purpose: hardly anyone wants it back.
-    SeparatorText("Game effects");
-    bool motion_blur = settings.Get("motion_blur", "0") != "0";
-    if (Checkbox("Game motion blur", &motion_blur))
-        settings.Set("motion_blur", motion_blur ? "1" : "0");
-    SameLine();
-    TextDisabled("(off = sharper in motion)");
-    // Debugging tools, with F3's advanced settings shown.
-    if (EmulatorSettings.IsBbShowThreadedSettings()) {
-        // The whole picture but the character blurred (after a respawn): every input of the game's
-        // motion blur passes goes to the log, to compare with a frame that looks right.
-        if (Button("Log motion blur inputs"))
-            Common::GuestStats::blur_dump_requested.store(true, std::memory_order_relaxed);
+        if (ShowReflections) {
+            SeparatorText("Reflections");
+            {
+                static constexpr std::array<const char*, 3> modes = {"Game's", "Better", "Off"};
+                const int mode = std::clamp(EmulatorSettings.GetBbSsrMode(), 0, 2);
+                SetNextItemWidth(Px(200.0f));
+                if (BeginCombo("Screen space reflections", modes[mode])) {
+                    for (int i = 0; i < int(modes.size()); ++i) {
+                        if (Selectable(modes[i], i == mode)) {
+                            EmulatorSettings.SetBbSsrMode(i);
+                            EmulatorSettings.Save();
+                        }
+                    }
+                    EndCombo();
+                }
+                if (IsItemHovered())
+                    SetTooltip(
+                        "With the game's \"Enable Screen Space Reflections\" patch. Game's: as "
+                        "the game draws them.\nBetter: traced more precisely, sharper, to the "
+                        "screen's edges. Off: no screen-space reflections at all.");
+                BeginDisabled(mode != 1);
+                bool full_res = EmulatorSettings.IsBbSsrFullRes();
+                if (Checkbox("Full resolution", &full_res)) {
+                    EmulatorSettings.SetBbSsrFullRes(full_res);
+                    EmulatorSettings.Save();
+                }
+                if (IsItemHovered())
+                    SetTooltip(
+                        "Better reflections at the full render size instead of the game's half "
+                        "size: a little sharper,\nat more GPU time.");
+                if constexpr (ShowReflectionTuning) {
+                    bool rough_rays = EmulatorSettings.IsBbSsrRoughRays();
+                    if (Checkbox("Sharp reflections (test)", &rough_rays)) {
+                        EmulatorSettings.SetBbSsrRoughRays(rough_rays);
+                        EmulatorSettings.Save();
+                    }
+                    if (IsItemHovered())
+                        SetTooltip(
+                            "No fade towards the screen's edges, no blur between neighbouring "
+                            "pixels, and a short history\n(less smearing). Changes at once.");
+                    BeginDisabled(!rough_rays || !full_res);
+                    float min_gloss = float(EmulatorSettings.GetBbSsrMinGloss()) * 0.01f;
+                    SetNextItemWidth(Px(200.0f));
+                    if (SliderFloat("Minimum gloss", &min_gloss, 0.0f, 1.0f, "%.2f"))
+                        EmulatorSettings.SetBbSsrMinGloss(int(std::lround(min_gloss * 100.0f)));
+                    if (IsItemDeactivatedAfterEdit())
+                        EmulatorSettings.Save();
+                    if (IsItemHovered())
+                        SetTooltip(
+                            "Only surfaces at least this glossy reflect (the Gloss debug view: "
+                            "puddles about 0.8, metal about 0.5,\ndry stone near 0). Higher: "
+                            "fewer, steadier reflections and less GPU time. Sharp at full "
+                            "resolution only.");
+                    EndDisabled();
+                    BeginDisabled(!rough_rays);
+                    int frames = std::clamp(EmulatorSettings.GetBbSsrSharpFrames(), 2, 16);
+                    SetNextItemWidth(Px(200.0f));
+                    if (SliderInt("Steadiness (frames)", &frames, 2, 16))
+                        EmulatorSettings.SetBbSsrSharpFrames(frames);
+                    if (IsItemDeactivatedAfterEdit())
+                        EmulatorSettings.Save();
+                    if (IsItemHovered())
+                        SetTooltip(
+                            "How many frames the reflections are averaged over (8 by default). "
+                            "More: less flicker, but more\nsmearing when the camera moves. "
+                            "Sharp reflections only.");
+                    EndDisabled();
+                    constexpr std::array DebugNames{"Off", "All magenta", "Hits magenta", "Gloss",
+                                                    "Raw (no denoiser)"};
+                    int debug = std::clamp(EmulatorSettings.GetBbSsrDebug(), 0, 4);
+                    if (Combo("Reflections debug", &debug, DebugNames.data(),
+                              int(DebugNames.size()))) {
+                        EmulatorSettings.SetBbSsrDebug(debug); // not saved
+                    }
+                    if (IsItemHovered())
+                        SetTooltip(
+                            "All magenta: every pixel's reflection is bright magenta, so the "
+                            "picture shows where the game's lighting\nuses reflections and how "
+                            "strongly. Hits magenta: only where a ray hit something. Gloss: shiny "
+                            "green, rough red.\nRaw: the reflections as traced, without "
+                            "the denoiser. Off when the game restarts.");
+                }
+                EndDisabled();
+            }
+        }
+
+        // Down here on purpose: hardly anyone wants it back.
+        SeparatorText("Game effects");
+        bool motion_blur = settings.Get("motion_blur", "0") != "0";
+        if (Checkbox("Game motion blur", &motion_blur))
+            settings.Set("motion_blur", motion_blur ? "1" : "0");
         SameLine();
-        TextDisabled("(press while the picture is blurred, and once when it looks right)");
-        // A texture that looks wrong: uploaded again from game memory. If it then looks right, the
-        // emulator's copy was out of date (the log lists textures still waiting for their largest
-        // level).
-        if (Button("Reload textures from game memory"))
-            Common::GuestStats::texture_reload_requested.store(true, std::memory_order_relaxed);
-        SameLine();
-        TextDisabled("(press while a texture looks wrong)");
+        TextDisabled("(off = sharper in motion)");
+        // Debugging tools, with F3's advanced settings shown.
+        if (EmulatorSettings.IsBbShowThreadedSettings()) {
+            // The whole picture but the character blurred (after a respawn): every input of the
+            // game's motion blur passes goes to the log, to compare with a frame that looks right.
+            if (Button("Log motion blur inputs"))
+                Common::GuestStats::blur_dump_requested.store(true, std::memory_order_relaxed);
+            SameLine();
+            TextDisabled("(press while the picture is blurred, and once when it looks right)");
+            // A texture that looks wrong: uploaded again from game memory. If it then looks right,
+            // the emulator's copy was out of date (the log lists textures still waiting for their
+            // largest level).
+            if (Button("Reload textures from game memory"))
+                Common::GuestStats::texture_reload_requested.store(true, std::memory_order_relaxed);
+            SameLine();
+            TextDisabled("(press while a texture looks wrong)");
+        }
     }
     EndChild();
     restart_footer = !restart_needed.empty();

@@ -1345,6 +1345,7 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/friends_layer.h
           src/imgui/dlss_layer.cpp
           src/imgui/dlss_layer.h
+          src/imgui/bb_settings_file.h
           src/imgui/invitation_prompt_layer.cpp
           src/imgui/invitation_prompt_layer.h
           src/imgui/shadnet_notifications_layer.cpp

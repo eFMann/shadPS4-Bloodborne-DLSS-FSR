@@ -16,6 +16,7 @@
 #include "common/path_util.h"
 #include "core/cpu_patches.h"
 #include "core/devtools/layer.h"
+#include "imgui/bb_settings_file.h"
 #include "imgui/imgui_std.h"
 #include "input/input_handler.h"
 #include "settings_dialog_imgui.h"
@@ -121,17 +122,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbCopySkipSameSetting = EmulatorSettings.IsBbCopySkipSame();
     bbClearOneLayerSetting = EmulatorSettings.IsBbClearOneLayer();
     bbSpreadLoadsSetting = EmulatorSettings.IsBbSpreadLoads();
-    {
-        // 0 (the game's own), 2, 4, 8, 16 -> 0..4
-        const int samples = EmulatorSettings.GetBbAnisotropy();
-        bbAnisotropySetting = samples >= 16  ? 4
-                              : samples >= 8 ? 3
-                              : samples >= 4 ? 2
-                              : samples >= 2 ? 1
-                                             : 0;
-    }
     bbDrawDataMemorySetting = std::clamp(EmulatorSettings.GetBbDrawDataMemory(), 0, 2);
-    bbTextureQualitySetting = std::clamp(EmulatorSettings.GetBbTextureQuality(), 0, 2);
     bbIgnoreDisplayScaleSetting = EmulatorSettings.IsBbIgnoreDisplayScale();
     bbStutterDetailSetting = EmulatorSettings.IsBbStutterDetail();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
@@ -243,10 +234,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbCopySkipSame(bbCopySkipSameSetting, isSpecific);
     EmulatorSettings.SetBbClearOneLayer(bbClearOneLayerSetting, isSpecific);
     EmulatorSettings.SetBbSpreadLoads(bbSpreadLoadsSetting, isSpecific);
-    EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
-                                     isSpecific);
     EmulatorSettings.SetBbDrawDataMemory(bbDrawDataMemorySetting, isSpecific);
-    EmulatorSettings.SetBbTextureQuality(bbTextureQualitySetting, isSpecific);
     EmulatorSettings.SetBbIgnoreDisplayScale(bbIgnoreDisplayScaleSetting, isSpecific);
     EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
@@ -1090,17 +1078,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             }
 
             AddSettingSection("Graphics", "Picture quality.", false);
-            AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);
-            if (ImGui::IsItemHovered()) {
-                ShowTooltip("Sharper ground and stairs at an angle (needs a restart)");
-            }
-            AddSettingCombo("Texture quality", bbTextureQualitySetting, textureQualityOptions);
-            if (ImGui::IsItemHovered()) {
-                ShowTooltip("Less VRAM for big textures (the BB Remaster mod's) by leaving "
-                            "out their sharpest level:\nHigh: textures over 2048, Medium: "
-                            "over 1024 (about 500 MB less in busy areas).\nApplies to "
-                            "textures loaded after a change: from the next loading screen.");
-            }
+            DrawBbImageSettings();
 
             AddSettingSection("Performance", "How the game's data reaches the graphics card.",
                               false);
@@ -1241,6 +1219,114 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
 
     ImGui::PopStyleVar();
     ImGui::EndChild();
+}
+
+// The same settings as F1's Graphics tab (ambient occlusion, reflections, the game's effects), read
+// and written directly, so that F1 and F3 always show the same (not loaded into F3's copies and
+// saved with them).
+void SettingsWindow::DrawBbImageSettings() {
+    const auto saved = [] { EmulatorSettings.Save(); };
+    // A row with a check box: the setting's value, changed and saved at once.
+    const auto checkbox = [&](const char* name, bool value, auto set, const char* tooltip) {
+        bool shown = value;
+        AddSettingCheckbox(name, shown);
+        if (ImGui::IsItemHovered()) {
+            ShowTooltip(tooltip);
+        }
+        if (shown != value) {
+            set(shown);
+            saved();
+        }
+    };
+    // A row with a slider for a value stored in hundredths, saved when it is let go.
+    const auto slider = [&](const char* name, int value, auto set, const char* tooltip) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextWrapped("%s", name);
+        ImGui::TableNextColumn();
+        float shown = float(value) * 0.01f;
+        if (ImGui::SliderFloat((std::string("##") + name).c_str(), &shown, 0.25f, 4.0f, "%.2f")) {
+            set(int(std::lround(shown * 100.0f)));
+        }
+        NoteRowFocus();
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            saved();
+        }
+        if (ImGui::IsItemHovered()) {
+            ShowTooltip(tooltip);
+        }
+    };
+
+    // Texture filtering and quality: the same settings as F1's (Graphics), saved at once.
+    int anisotropy = ImGui::BbAnisotropyIndex(EmulatorSettings.GetBbAnisotropy());
+    const int anisotropy_before = anisotropy;
+    AddSettingCombo("Anisotropic filtering", anisotropy, anisotropyOptions);
+    if (ImGui::IsItemHovered()) {
+        ShowTooltip("Sharper ground and stairs at an angle (needs a restart)");
+    }
+    if (anisotropy != anisotropy_before) {
+        EmulatorSettings.SetBbAnisotropy(ImGui::BbAnisotropySamples(anisotropy));
+        saved();
+    }
+    int texture_quality = std::clamp(EmulatorSettings.GetBbTextureQuality(), 0, 2);
+    const int texture_quality_before = texture_quality;
+    AddSettingCombo("Texture quality", texture_quality, textureQualityOptions);
+    if (ImGui::IsItemHovered()) {
+        ShowTooltip("Less VRAM for big textures (the BB Remaster mod's) by leaving "
+                    "out their sharpest level:\nHigh: textures over 2048, Medium: "
+                    "over 1024 (about 500 MB less in busy areas).\nApplies to "
+                    "textures loaded after a change: from the next loading screen.");
+    }
+    if (texture_quality != texture_quality_before) {
+        EmulatorSettings.SetBbTextureQuality(texture_quality);
+        saved();
+    }
+
+    const bool vbao = EmulatorSettings.IsBbVbao();
+    checkbox(
+        "Better ambient occlusion (GT-VBAO)", vbao, [](bool v) { EmulatorSettings.SetBbVbao(v); },
+        "Deeper, cleaner contact shadows in corners, under objects and in carvings");
+    if (vbao) {
+        slider(
+            "    Strength", EmulatorSettings.GetBbVbaoStrength(),
+            [](int v) { EmulatorSettings.SetBbVbaoStrength(v); },
+            "How dark occluded places get (1.50 by default)");
+        slider(
+            "    Reach (metres)", EmulatorSettings.GetBbVbaoRadius(),
+            [](int v) { EmulatorSettings.SetBbVbaoRadius(v); },
+            "How far away something can be and still shade a surface (1.50 by default)");
+        checkbox(
+            "    Half resolution (faster)", EmulatorSettings.IsBbVbaoHalfRes(),
+            [](bool v) { EmulatorSettings.SetBbVbaoHalfRes(v); },
+            "About a quarter of the cost, slightly softer fine detail");
+    }
+
+    static const std::vector<std::string> ssr_modes = {"Game's", "Better", "Off"};
+    int ssr_mode = std::clamp(EmulatorSettings.GetBbSsrMode(), 0, 2);
+    const int ssr_before = ssr_mode;
+    AddSettingCombo("Screen space reflections", ssr_mode, ssr_modes);
+    if (ImGui::IsItemHovered()) {
+        ShowTooltip("With the game's \"Enable Screen Space Reflections\" patch. Better: traced "
+                    "more precisely, sharper, to the screen's edges");
+    }
+    if (ssr_mode != ssr_before) {
+        EmulatorSettings.SetBbSsrMode(ssr_mode);
+        saved();
+    }
+    if (ssr_mode == 1) {
+        checkbox(
+            "    Full resolution", EmulatorSettings.IsBbSsrFullRes(),
+            [](bool v) { EmulatorSettings.SetBbSsrFullRes(v); },
+            "A little sharper, at more GPU time");
+    }
+
+    // The game's motion blur: the upscaling settings file's (F1's).
+    ImGui::BbSettingsFile file;
+    file.Load();
+    const bool motion_blur = file.Get("motion_blur", "0") != "0";
+    checkbox(
+        "Game motion blur", motion_blur,
+        [&file](bool v) { file.Set("motion_blur", v ? "1" : "0"); }, "Off: sharper in motion");
 }
 
 void SettingsWindow::AddSettingCheckbox(std::string name, bool& value) {

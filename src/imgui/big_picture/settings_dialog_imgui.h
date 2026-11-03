@@ -62,6 +62,7 @@ private:
     void ShowTooltip(std::string_view text);
     /// A section heading row: a coloured title, and a short note beside it.
     void AddSettingSection(const char* title, const char* note, bool experimental);
+    void DrawBbImageSettings();
     void AddSettingSliderInt(std::string name, int& value, int min, int max);
     void AddSettingSliderFloat(std::string name, float& value, int min, int max, int precision);
     void AddSettingCombo(std::string name, int& value, std::vector<std::string> options);
@@ -174,9 +175,7 @@ private:
     bool bbGeometryInPlaceSetting;
     bool bbSkipEmptyDrawsSetting;
     bool bbBackgroundPipelinesSetting;
-    int bbAnisotropySetting;     ///< index into anisotropyOptions
     int bbDrawDataMemorySetting; ///< index into drawDataMemoryOptions
-    int bbTextureQualitySetting; ///< index into textureQualityOptions
     bool bbIgnoreDisplayScaleSetting;
     bool bbExactProtectionSetting;
     bool bbBatchedUploadsSetting;
