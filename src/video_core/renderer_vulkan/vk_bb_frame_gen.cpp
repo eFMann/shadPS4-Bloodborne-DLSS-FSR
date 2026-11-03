@@ -78,8 +78,21 @@ std::atomic<bool> generating{};
 // Frames per rendered frame the user asked for, and the most this card and runtime allow.
 std::atomic<u32> multiplier{2}, max_multiplier{2};
 
+// The latest frame times, a ring written on each present.
+std::mutex frame_times_mutex;
+std::array<float, FrameTimeCount> frame_times{};
+size_t frame_time_next{};
+std::chrono::steady_clock::time_point last_present{};
+
 void CountPresent(u32 shown) {
     const auto now = std::chrono::steady_clock::now();
+    if (last_present != std::chrono::steady_clock::time_point{}) {
+        std::scoped_lock lock{frame_times_mutex};
+        frame_times[frame_time_next] =
+            std::chrono::duration<float, std::milli>(now - last_present).count();
+        frame_time_next = (frame_time_next + 1) % FrameTimeCount;
+    }
+    last_present = now;
     ++window_presents;
     window_shown += shown;
     const float seconds = std::chrono::duration<float>(now - window_start).count();
@@ -105,6 +118,14 @@ bool CounterVisible() {
 
 Stats GetStats() {
     return {generating, base_fps, output_fps};
+}
+
+std::array<float, FrameTimeCount> GetFrameTimes() {
+    std::scoped_lock lock{frame_times_mutex};
+    std::array<float, FrameTimeCount> ordered;
+    for (size_t i = 0; i < FrameTimeCount; ++i)
+        ordered[i] = frame_times[(frame_time_next + i) % FrameTimeCount];
+    return ordered;
 }
 
 void SetMultiplier(u32 value) {

@@ -1466,7 +1466,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
                 const ImVec2 screen = ImGui::GetCursorScreenPos();
-                ImGui::Dlss::SetGameArea(screen.x, screen.y);
+                ImGui::Dlss::SetGameArea(screen.x, screen.y, size.x, size.y);
                 // ImGui coordinates to window pixels.
                 const ImVec2 scale = ImGui::GetIO().DisplayFramebufferScale;
                 game_area = vk::Rect2D{{s32(screen.x * scale.x), s32(screen.y * scale.y)},

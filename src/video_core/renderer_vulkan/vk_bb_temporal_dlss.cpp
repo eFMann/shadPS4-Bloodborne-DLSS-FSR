@@ -1795,6 +1795,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         status.output_width = out.width;
         status.output_height = out.height;
         status.backend = BackendName(backend);
+        status.preset = backend == Backend::Dlss ? tune.preset : 0;
         status.decoupled = upscale_to.has_value();
         status.reason.clear();
     }

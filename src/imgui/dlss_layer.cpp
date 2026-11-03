@@ -233,7 +233,25 @@ private:
 };
 
 DlssLayer layer;
-std::atomic<float> game_x{}, game_y{};
+std::atomic<float> game_x{}, game_y{}, game_w{}, game_h{};
+
+// The upscaler's mode from the render size's share of the output (DLSS and FSR use the same
+// ratios), or the share in percent for a size in between.
+std::string UpscalerMode(u32 render_height, u32 output_height) {
+    if (output_height == 0)
+        return {};
+    const float share = float(render_height) / float(output_height);
+    static constexpr std::array<std::pair<float, const char*>, 4> Modes{{
+        {2.0f / 3.0f, "Quality"},
+        {1.0f / 1.7f, "Balanced"},
+        {0.5f, "Performance"},
+        {1.0f / 3.0f, "Ultra Performance"},
+    }};
+    for (const auto& [ratio, name] : Modes)
+        if (std::abs(share - ratio) < 0.015f)
+            return name;
+    return fmt::format("{}%", int(std::lround(share * 100.0f)));
+}
 
 // The game's frame rate in a corner, and the displayed one while frame generation runs. Drawn
 // into the game image, so it does not stop the game reaching the screen directly the way
@@ -256,26 +274,163 @@ public:
         }
         if (!Vulkan::FrameGen::CounterVisible())
             return;
+        const bool show_fps = EmulatorSettings.IsBbCounterFps();
+        const bool show_ms = EmulatorSettings.IsBbCounterMs();
+        const bool show_upscaler = EmulatorSettings.IsBbCounterUpscaler();
+        const bool show_graph = EmulatorSettings.IsBbCounterGraph();
+        const auto status = Vulkan::BbTemporalDlssStatus();
+        // Nothing to show (only the upscaler, which isn't running): no box.
+        const bool show_line = show_fps || show_ms || (show_upscaler && status.active);
+        if (!show_line && !show_graph)
+            return;
         const auto stats = Vulkan::FrameGen::GetStats();
-        // Inside the game image: frame generation leaves the bars around it alone.
-        SetNextWindowPos({game_x + 12.0f, game_y + 12.0f});
+        // Inside the game image, in the chosen corner: frame generation leaves the bars around it
+        // alone.
+        const int corner = std::clamp(EmulatorSettings.GetBbCounterCorner(), 0, 3);
+        const bool right = corner == 1 || corner == 3, bottom = corner >= 2;
+        constexpr float Margin = 12.0f;
+        SetNextWindowPos({right ? game_x + game_w - Margin : game_x + Margin,
+                          bottom ? game_y + game_h - Margin : game_y + Margin},
+                         ImGuiCond_Always, {right ? 1.0f : 0.0f, bottom ? 1.0f : 0.0f});
+        // Where the graph goes: under the box (above it in a bottom corner), or at the corner.
+        ImVec2 box_min{right ? game_x + game_w - Margin : game_x + Margin,
+                       bottom ? game_y + game_h - Margin : game_y + Margin};
+        ImVec2 box_max = box_min;
+        float font_size = GetFontSize();
         // Opaque: frame generation keeps the whole box still, so no scene may show through it.
         SetNextWindowBgAlpha(1.0f);
-        if (Begin("##bb_fps_counter", nullptr,
-                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
-                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav |
-                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings |
-                      ImGuiWindowFlags_NoDocking)) {
+        if (show_line && Begin("##bb_fps_counter", nullptr,
+                               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoFocusOnAppearing |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking)) {
             // The same size whether "Menus sized by screen pixels" is on or not.
             if (EmulatorSettings.IsBbIgnoreDisplayScale())
                 SetWindowFontScale(ImGui::Core::DisplayScale());
-            Text("%.0f fps", stats.base_fps);
-            if (stats.generating) {
-                SameLine();
-                TextColored({0.4f, 1.0f, 0.4f, 1.0f}, "-> %.0f fps", stats.output_fps);
+            // "60FPS  16.7ms  DLSS K Quality 2560x1440", with frame generation "60FPS -> 120FPS
+            // ...": the game's frame rate and frame time, then the upscaler (DLAA or Native AA at
+            // the output resolution), DLSS in green and FSR in red; two spaces apart.
+            const float gap = CalcTextSize("  ").x;
+            const ImVec4 green{0.4f, 1.0f, 0.4f, 1.0f}, red{1.0f, 0.35f, 0.3f, 1.0f};
+            const float fps = stats.base_fps;
+            bool first = true;
+            const auto next = [&] {
+                if (!first)
+                    SameLine(0.0f, gap);
+                first = false;
+            };
+            if (show_fps) {
+                next();
+                Text("%.0fFPS", fps);
+                if (stats.generating) {
+                    SameLine();
+                    TextColored(green, "-> %.0fFPS", stats.output_fps);
+                }
+            }
+            if (show_ms) {
+                next();
+                if (fps > 0.0f)
+                    Text("%.1fms", 1000.0f / fps);
+                else
+                    Text("-ms");
+            }
+            if (show_upscaler && status.active) {
+                const bool native = status.render_width >= status.output_width &&
+                                    status.render_height >= status.output_height;
+                const bool dlss = status.backend == "DLSS";
+                std::string upscaler;
+                if (dlss)
+                    upscaler = native ? "DLAA" : "DLSS";
+                else
+                    upscaler = native ? status.backend + " Native AA" : status.backend;
+                if (EmulatorSettings.IsBbCounterPreset() && status.preset >= 1 &&
+                    status.preset <= 26)
+                    upscaler += fmt::format(" {}", char('A' + status.preset - 1));
+                next();
+                TextColored(dlss ? green : red, "%s", upscaler.c_str());
+                // The mode and the output resolution in white, one space after.
+                if (EmulatorSettings.IsBbCounterMode() && !native) {
+                    SameLine();
+                    TextUnformatted(
+                        UpscalerMode(status.render_height, status.output_height).c_str());
+                }
+                if (EmulatorSettings.IsBbCounterResolution()) {
+                    SameLine();
+                    Text("%ux%u", status.output_width, status.output_height);
+                }
+            }
+            box_min = GetWindowPos();
+            box_max = {box_min.x + GetWindowSize().x, box_min.y + GetWindowSize().y};
+            font_size = GetFontSize();
+        }
+        if (show_line)
+            End();
+        if (show_graph)
+            DrawGraph(box_min, box_max, font_size, right, bottom);
+    }
+    // The frame times of the last 120 frames as a bare line, as wide as the box. In a top corner
+    // it runs halfway between the box and the game's health bar (its top at about 5.7% of the
+    // picture's height, at any resolution); in a bottom corner just above the box. No background:
+    // the game's UI stays visible around it. Each frame is drawn against the usual one (the
+    // median): a usual frame always sits on the same height, whatever the frame rate, and a slower
+    // one rises above it, reaching the box at 2.5 times the usual time; the line never moves down
+    // to make room for a spike.
+    static void DrawGraph(ImVec2 box_min, ImVec2 box_max, float font_size, bool right,
+                          bool bottom) {
+        const float width = std::max(box_max.x - box_min.x, font_size * 12.0f);
+        float ceiling, baseline, floor;
+        const float health_bar = game_y + game_h * 0.057f;
+        if (!bottom && health_bar - box_max.y >= 6.0f) {
+            ceiling = box_max.y + 1.0f;
+            baseline = (box_max.y + health_bar) * 0.5f;
+            floor = baseline + (baseline - ceiling) * 0.33f;
+        } else if (!bottom) {
+            ceiling = box_max.y + 2.0f;
+            baseline = ceiling + font_size * 0.75f;
+            floor = ceiling + font_size;
+        } else {
+            floor = box_min.y - 2.0f;
+            baseline = floor - font_size * 0.25f;
+            ceiling = floor - font_size;
+        }
+        const ImVec2 pos{right ? box_max.x - width : box_min.x, ceiling};
+        SetNextWindowPos(pos);
+        SetNextWindowSize({width, floor - ceiling + 1.0f});
+        PushStyleVar(ImGuiStyleVar_WindowPadding, {0.0f, 0.0f});
+        PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        PushStyleVar(ImGuiStyleVar_WindowMinSize, {1.0f, 1.0f});
+        if (Begin("##bb_frame_time_graph", nullptr,
+                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoNav |
+                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings |
+                      ImGuiWindowFlags_NoDocking)) {
+            const auto times = Vulkan::FrameGen::GetFrameTimes();
+            std::vector<float> sorted;
+            for (const float t : times)
+                if (t > 0.0f)
+                    sorted.push_back(t);
+            if (!sorted.empty()) {
+                std::ranges::nth_element(sorted, sorted.begin() + sorted.size() / 2);
+                const float usual = sorted[sorted.size() / 2];
+                std::array<ImVec2, Vulkan::FrameGen::FrameTimeCount> points;
+                for (size_t i = 0; i < times.size(); ++i) {
+                    const float t = times[i] > 0.0f ? times[i] : usual;
+                    const float over = std::clamp(t / usual - 1.0f, -0.5f, 1.5f);
+                    const float y = over >= 0.0f ? baseline - over / 1.5f * (baseline - ceiling)
+                                                 : baseline - over / 0.5f * (floor - baseline);
+                    // On whole pixels (plus a half), so a flat line covers one row, not two.
+                    points[i] = {pos.x + width * float(i) / float(times.size() - 1),
+                                 std::floor(y) + 0.5f};
+                }
+                // One screen pixel thick, without a shadow.
+                const float pixel = 1.0f / std::max(GetIO().DisplayFramebufferScale.y, 1.0f);
+                GetWindowDrawList()->AddPolyline(points.data(), int(points.size()),
+                                                 IM_COL32(255, 255, 255, 230), ImDrawFlags_None,
+                                                 pixel);
             }
         }
         End();
+        PopStyleVar(3);
     }
     // It changes with the game's frames, so it never asks for repeated presents: those would
     // switch frame generation off at 30 fps.
@@ -456,7 +611,7 @@ void DlssLayer::DrawWindow() {
 
     // Tabs. Display: frame rate and resolution. Graphics: textures and the image features, the same
     // settings as F3's (Bloodborne, Graphics), both always showing the same. Other: this menu's UI
-    // scale, keyboard and mouse, the benchmark route.
+    // scale, the FPS counter, keyboard and mouse, the benchmark route.
     bool main_tab = true, display_tab = false, graphics_tab = false, other_tab = false;
     if (BeginTabBar("##f1_tabs")) {
         main_tab = BeginTabItem("Main");
@@ -834,12 +989,6 @@ void DlssLayer::DrawWindow() {
         SameLine();
         TextDisabled("(less input delay, may lower fps)");
 
-        bool fps_counter = settings.Get("fps_counter", "0") != "0";
-        if (Checkbox("Frame gen FPS counter", &fps_counter))
-            settings.Set("fps_counter", fps_counter ? "1" : "0");
-        SameLine();
-        TextDisabled("(top-left corner)");
-
         bool menu_fix = settings.Get("menu_fix", "1") != "0";
         if (Checkbox("Menu fix", &menu_fix))
             settings.Set("menu_fix", menu_fix ? "1" : "0");
@@ -1013,6 +1162,62 @@ void DlssLayer::DrawWindow() {
                 EmulatorSettings.SetBbF1Scale(100);
                 EmulatorSettings.Save();
             }
+        }
+
+        SeparatorText("FPS counter");
+        {
+            bool fps_counter = settings.Get("fps_counter", "0") != "0";
+            if (Checkbox("Show FPS counter", &fps_counter))
+                settings.Set("fps_counter", fps_counter ? "1" : "0");
+            BeginDisabled(!fps_counter);
+            const auto part = [](const char* name, bool value, auto set) {
+                if (Checkbox(name, &value)) {
+                    set(value);
+                    EmulatorSettings.Save();
+                }
+            };
+            part("FPS", EmulatorSettings.IsBbCounterFps(),
+                 [](bool v) { EmulatorSettings.SetBbCounterFps(v); });
+            SameLine();
+            part("Frame time (ms)", EmulatorSettings.IsBbCounterMs(),
+                 [](bool v) { EmulatorSettings.SetBbCounterMs(v); });
+            const bool upscaler = EmulatorSettings.IsBbCounterUpscaler();
+            part("DLSS / FSR", upscaler, [](bool v) { EmulatorSettings.SetBbCounterUpscaler(v); });
+            if (IsItemHovered())
+                SetTooltip("The upscaler: DLSS, DLAA, FSR 4, FSR 3.1 Native AA...");
+            BeginDisabled(!upscaler);
+            Indent();
+            part("Preset", EmulatorSettings.IsBbCounterPreset(),
+                 [](bool v) { EmulatorSettings.SetBbCounterPreset(v); });
+            if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                SetTooltip("DLSS's preset: K, M, L, J...");
+            SameLine();
+            part("Mode", EmulatorSettings.IsBbCounterMode(),
+                 [](bool v) { EmulatorSettings.SetBbCounterMode(v); });
+            if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                SetTooltip("Quality, Balanced, Performance or Ultra Performance, from the render "
+                           "resolution (a percentage for sizes in between).");
+            SameLine();
+            part("Resolution", EmulatorSettings.IsBbCounterResolution(),
+                 [](bool v) { EmulatorSettings.SetBbCounterResolution(v); });
+            if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                SetTooltip("The output resolution the upscaler brings the image up to.");
+            Unindent();
+            EndDisabled();
+            part("Frame time graph", EmulatorSettings.IsBbCounterGraph(),
+                 [](bool v) { EmulatorSettings.SetBbCounterGraph(v); });
+            if (IsItemHovered())
+                SetTooltip("A line under the counter with the time each of the last 120 frames "
+                           "took: flat is smooth, spikes are stutters.");
+            static constexpr std::array Corners{"Top left", "Top right", "Bottom left",
+                                                "Bottom right"};
+            int corner = std::clamp(EmulatorSettings.GetBbCounterCorner(), 0, 3);
+            SetNextItemWidth(Px(200.0f));
+            if (Combo("Corner", &corner, Corners.data(), int(Corners.size()))) {
+                EmulatorSettings.SetBbCounterCorner(corner);
+                EmulatorSettings.Save();
+            }
+            EndDisabled();
         }
 
         SeparatorText("Keyboard & mouse");
@@ -1518,9 +1723,11 @@ void Toggle() {
     layer.toggle_requested = true;
 }
 
-void SetGameArea(float x, float y) {
+void SetGameArea(float x, float y, float width, float height) {
     game_x = x;
     game_y = y;
+    game_w = width;
+    game_h = height;
 }
 
 } // namespace ImGui::Dlss

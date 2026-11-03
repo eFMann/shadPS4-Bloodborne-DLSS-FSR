@@ -128,6 +128,10 @@ struct Stats {
 };
 // Over the last second, for the F1 panel and the corner counter.
 Stats GetStats();
+// The time between the emulator's last presents in milliseconds, oldest first, for the corner
+// counter's graph.
+constexpr size_t FrameTimeCount = 120;
+std::array<float, FrameTimeCount> GetFrameTimes();
 
 // The corner fps counter (dlss.ini fps_counter).
 void SetCounterVisible(bool visible);

@@ -789,6 +789,17 @@ struct VulkanSettings {
     // centred), so it stays on screen at any resolution. Global only.
     Setting<int> bb_f1_pos_x{500};
     Setting<int> bb_f1_pos_y{500};
+    // The FPS counter's parts (F1, Other): the frame rate, the frame time, the upscaler, DLSS's
+    // preset, the mode (Quality, Balanced...), the output resolution, and its corner (0 top left, 1
+    // top right, 2 bottom left, 3 bottom right). Global only.
+    Setting<bool> bb_counter_fps{true};
+    Setting<bool> bb_counter_ms{true};
+    Setting<bool> bb_counter_upscaler{true};
+    Setting<bool> bb_counter_preset{true};
+    Setting<bool> bb_counter_mode{false};
+    Setting<bool> bb_counter_resolution{false};
+    Setting<bool> bb_counter_graph{false}; // a frame time graph under the counter
+    Setting<int> bb_counter_corner{0};
     // With an FPS cap ("Show frames when ready"): frames are shown one cap period apart, an early
     // one held until its turn, instead of each as soon as it is ready. Global only.
     Setting<bool> bb_even_capped_flips{true};
@@ -852,7 +863,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius, bb_vbao_half_res,
     bb_ssr_mode, bb_ssr_full_res, bb_ssr_rough_rays, bb_ssr_min_gloss, bb_ssr_sharp_frames,
     bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_f1_scale, bb_f1_pos_x, bb_f1_pos_y,
-    bb_even_capped_flips, bb_merged_no_stream_sources, bb_merged_large_batches)
+    bb_counter_fps, bb_counter_ms, bb_counter_upscaler, bb_counter_preset, bb_counter_mode,
+    bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_even_capped_flips,
+    bb_merged_no_stream_sources, bb_merged_large_batches)
 
 // -------------------------------
 // Main manager
@@ -1178,6 +1191,14 @@ public:
     SETTING_FORWARD(m_vulkan, BbF1Scale, bb_f1_scale)
     SETTING_FORWARD(m_vulkan, BbF1PosX, bb_f1_pos_x)
     SETTING_FORWARD(m_vulkan, BbF1PosY, bb_f1_pos_y)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterFps, bb_counter_fps)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterMs, bb_counter_ms)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterUpscaler, bb_counter_upscaler)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterPreset, bb_counter_preset)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterMode, bb_counter_mode)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterResolution, bb_counter_resolution)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterGraph, bb_counter_graph)
+    SETTING_FORWARD(m_vulkan, BbCounterCorner, bb_counter_corner)
     SETTING_FORWARD_BOOL(m_vulkan, BbEvenCappedFlips, bb_even_capped_flips)
     SETTING_FORWARD_BOOL(m_vulkan, BbMergedNoStreamSources, bb_merged_no_stream_sources)
     SETTING_FORWARD_BOOL(m_vulkan, BbMergedLargeBatches, bb_merged_large_batches)
