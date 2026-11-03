@@ -759,6 +759,17 @@ struct VulkanSettings {
     // Better reflections at the scene's full size (not the game's half size), from a full-size
     // copy of the last frame, read by the lighting directly: a little sharper, at more GPU time.
     Setting<bool> bb_ssr_full_res{false};
+    // Better reflections, test ("Sharp reflections"): no fade by screen position or camera
+    // angle, no spatial filtering, a short history. Off: as before.
+    Setting<bool> bb_ssr_rough_rays{true};
+    // Sharp reflections at full resolution: only surfaces at least this glossy (hundredths of the
+    // G-buffer's gloss) reflect; rougher ones aren't traced at all.
+    Setting<int> bb_ssr_min_gloss{50};
+    // Sharp reflections: frames of history (more: steadier, but more smearing in motion).
+    Setting<int> bb_ssr_sharp_frames{8};
+    // Better reflections, debug view (not saved): 1 paints every pixel's reflection magenta, 2
+    // only where a ray hit something; the lighting then shows where and how strongly it uses them.
+    Setting<int> bb_ssr_debug{0};
     // Settings window: the threaded renderer's individual settings are listed (remembered).
     Setting<bool> bb_show_threaded_settings{false};
     // Bloodborne's frame rate set free by hooks in the game's code instead of the
@@ -833,8 +844,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_ce_skip_huge_writes, bb_evict_keep_protection, bb_evict_keep_returning,
     bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same, bb_clear_one_layer,
     bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius, bb_vbao_half_res,
-    bb_ssr_mode, bb_ssr_full_res, bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit,
-    bb_even_capped_flips, bb_merged_no_stream_sources, bb_merged_large_batches)
+    bb_ssr_mode, bb_ssr_full_res, bb_ssr_rough_rays, bb_ssr_min_gloss, bb_ssr_sharp_frames,
+    bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_even_capped_flips,
+    bb_merged_no_stream_sources, bb_merged_large_batches)
 
 // -------------------------------
 // Main manager
@@ -1150,6 +1162,10 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, BbVbaoHalfRes, bb_vbao_half_res)
     SETTING_FORWARD(m_vulkan, BbSsrMode, bb_ssr_mode)
     SETTING_FORWARD_BOOL(m_vulkan, BbSsrFullRes, bb_ssr_full_res)
+    SETTING_FORWARD_BOOL(m_vulkan, BbSsrRoughRays, bb_ssr_rough_rays)
+    SETTING_FORWARD(m_vulkan, BbSsrMinGloss, bb_ssr_min_gloss)
+    SETTING_FORWARD(m_vulkan, BbSsrSharpFrames, bb_ssr_sharp_frames)
+    SETTING_FORWARD(m_vulkan, BbSsrDebug, bb_ssr_debug)
     SETTING_FORWARD_BOOL(m_vulkan, BbShowThreadedSettings, bb_show_threaded_settings)
     SETTING_FORWARD_BOOL(m_vulkan, BbFrameHooks, bb_frame_hooks)
     SETTING_FORWARD(m_vulkan, BbFpsLimit, bb_fps_limit)

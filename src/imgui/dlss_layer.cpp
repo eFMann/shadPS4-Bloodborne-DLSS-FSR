@@ -184,7 +184,10 @@ void RestartButton() {
 
 // Screen-space reflections: hidden until "Better" is better (the setting is reset to the game's
 // own, BbDefaultsVersion 4).
-constexpr bool ShowReflections = false;
+constexpr bool ShowReflections = true;
+// Better reflections' tuning and debug views: hidden, at their defaults (sharp, minimum gloss 0.5,
+// 8 frames), until they are settled.
+constexpr bool ShowReflectionTuning = false;
 
 constexpr std::array UpscalerValues{"auto", "dlss", "fsr", "fsr4"};
 constexpr std::array UpscalerNames{"Automatic", "DLSS", "FSR 3.1", "FSR 4 (add-on)"};
@@ -1087,8 +1090,8 @@ void DlssLayer::Draw() {
             }
             if (IsItemHovered())
                 SetTooltip("With the game's \"Enable Screen Space Reflections\" patch. Game's: as "
-                           "the game draws them.\nBetter: traced more precisely and denoised, "
-                           "steadier and cheaper. Off: no screen-space reflections at all.");
+                           "the game draws them.\nBetter: traced more precisely, sharper, to the "
+                           "screen's edges. Off: no screen-space reflections at all.");
             BeginDisabled(mode != 1);
             bool full_res = EmulatorSettings.IsBbSsrFullRes();
             if (Checkbox("Full resolution", &full_res)) {
@@ -1098,6 +1101,54 @@ void DlssLayer::Draw() {
             if (IsItemHovered())
                 SetTooltip("Better reflections at the full render size instead of the game's half "
                            "size: a little sharper,\nat more GPU time.");
+            if constexpr (ShowReflectionTuning) {
+                bool rough_rays = EmulatorSettings.IsBbSsrRoughRays();
+                if (Checkbox("Sharp reflections (test)", &rough_rays)) {
+                    EmulatorSettings.SetBbSsrRoughRays(rough_rays);
+                    EmulatorSettings.Save();
+                }
+                if (IsItemHovered())
+                    SetTooltip("No fade towards the screen's edges, no blur between neighbouring "
+                               "pixels, and a short history\n(less smearing). Changes at once.");
+                BeginDisabled(!rough_rays || !full_res);
+                float min_gloss = float(EmulatorSettings.GetBbSsrMinGloss()) * 0.01f;
+                SetNextItemWidth(200.0f);
+                if (SliderFloat("Minimum gloss", &min_gloss, 0.0f, 1.0f, "%.2f"))
+                    EmulatorSettings.SetBbSsrMinGloss(int(std::lround(min_gloss * 100.0f)));
+                if (IsItemDeactivatedAfterEdit())
+                    EmulatorSettings.Save();
+                if (IsItemHovered())
+                    SetTooltip("Only surfaces at least this glossy reflect (the Gloss debug view: "
+                               "puddles about 0.8, metal about 0.5,\ndry stone near 0). Higher: "
+                               "fewer, steadier reflections and less GPU time. Sharp at full "
+                               "resolution only.");
+                EndDisabled();
+                BeginDisabled(!rough_rays);
+                int frames = std::clamp(EmulatorSettings.GetBbSsrSharpFrames(), 2, 16);
+                SetNextItemWidth(200.0f);
+                if (SliderInt("Steadiness (frames)", &frames, 2, 16))
+                    EmulatorSettings.SetBbSsrSharpFrames(frames);
+                if (IsItemDeactivatedAfterEdit())
+                    EmulatorSettings.Save();
+                if (IsItemHovered())
+                    SetTooltip("How many frames the reflections are averaged over (8 by default). "
+                               "More: less flicker, but more\nsmearing when the camera moves. "
+                               "Sharp reflections only.");
+                EndDisabled();
+                constexpr std::array DebugNames{"Off", "All magenta", "Hits magenta", "Gloss",
+                                                "Raw (no denoiser)"};
+                int debug = std::clamp(EmulatorSettings.GetBbSsrDebug(), 0, 4);
+                if (Combo("Reflections debug", &debug, DebugNames.data(), int(DebugNames.size()))) {
+                    EmulatorSettings.SetBbSsrDebug(debug); // not saved
+                }
+                if (IsItemHovered())
+                    SetTooltip(
+                        "All magenta: every pixel's reflection is bright magenta, so the "
+                        "picture shows where the game's lighting\nuses reflections and how "
+                        "strongly. Hits magenta: only where a ray hit something. Gloss: shiny "
+                        "green, rough red.\nRaw: the reflections as traced, without "
+                        "the denoiser. Off when the game restarts.");
+            }
             EndDisabled();
         }
     }

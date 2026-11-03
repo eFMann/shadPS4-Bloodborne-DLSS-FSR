@@ -53,6 +53,9 @@ struct TraceConstants {
     float edge_fade;
     float cone;
     float max_lod;
+    u32 sharp;       ///< no fade by screen position or angle
+    float min_gloss; ///< sharp: surfaces less glossy aren't traced
+    u32 debug; ///< 1: every pixel's reflection magenta, 2: where a ray hit, 3: the gloss, 4: raw
 };
 
 struct DenoiseConstants {
@@ -62,6 +65,9 @@ struct DenoiseConstants {
     u32 has_gloss;
     u32 history;
     float roughness;
+    u32 sharp;          ///< a short history, no spatial filtering
+    u32 debug;          ///< 4: the rays as traced
+    float sharp_frames; ///< sharp: frames of history
 };
 
 struct DownConstants {
@@ -788,6 +794,9 @@ struct BbSsr::Impl {
             .edge_fade = EdgeFade,
             .cone = Cone,
             .max_lod = float(ColorLevels - 1),
+            .sharp = EmulatorSettings.IsBbSsrRoughRays() ? 1u : 0u,
+            .min_gloss = float(std::clamp(EmulatorSettings.GetBbSsrMinGloss(), 0, 100)) * 0.01f,
+            .debug = u32(std::clamp(EmulatorSettings.GetBbSsrDebug(), 0, 4)),
         };
         job.denoise_push = DenoiseConstants{
             .size = job.trace_push.size,
@@ -796,6 +805,9 @@ struct BbSsr::Impl {
             .has_gloss = full_res ? 1u : 0u,
             .history = history_valid ? 1u : 0u,
             .roughness = HalfResRoughness,
+            .sharp = job.trace_push.sharp,
+            .debug = job.trace_push.debug,
+            .sharp_frames = float(std::clamp(EmulatorSettings.GetBbSsrSharpFrames(), 2, 16)),
         };
         job.pyramid_pipeline = *pyramid_pipeline;
         job.layout = *pipeline_layout;

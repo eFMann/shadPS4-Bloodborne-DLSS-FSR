@@ -11,6 +11,8 @@
 // from a full-size copy of the last frame with its mips, blurred by the surface's gloss as the
 // game's lighting would (its mip level from gloss) but less where the ray was short, so
 // reflections sharpen towards where they touch what they reflect.
+// sharp (the test setting): no fade by the pixel's place on the screen or by the ray's angle
+// (only rays behind the camera are dropped); the denoiser keeps only a short history.
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
 
@@ -37,6 +39,9 @@ layout(push_constant) uniform Constants {
     float edge_fade; // part of the screen at each edge over which hits fade out
     float cone;      // FULL_RES: blur, in pixels per pixel of ray length
     float max_lod;   // FULL_RES: the colour's last mip level
+    uint sharp;      // no fade by place or angle
+    float min_gloss; // sharp, FULL_RES: surfaces less glossy aren't traced
+    uint debug;      // 1: every pixel's reflection magenta, 2: where a ray hit, 3: the gloss
 };
 
 // The game's constants (its reflection pixel shader, 6c2323c2):
@@ -72,7 +77,9 @@ vec3 ReflectedColor(vec2 prev_uv, float ray_px, float gloss) {
     // image: about that many full-size pixels of blur, capped by the ray's cone.
     const float game_lod = clamp(6.5 - 6.5 * gloss, 0.0, 6.0);
     const float footprint = max(1.0, min(exp2(game_lod + 1.0) - 1.0, ray_px * cone));
-    const float lod = clamp(log2(max(footprint, 1.0)), 0.0, max_lod);
+    // Sharp: at least 2 pixels (four taps of the full size): the last frame's colour is the
+    // jittered, unsmoothed scene, whose single pixels flicker from frame to frame.
+    const float lod = clamp(log2(max(footprint, sharp != 0u ? 2.0 : 1.0)), 0.0, max_lod);
     if (lod < 1.0) {
         return textureLod(color_tex, prev_uv, lod).rgb;
     }
@@ -93,6 +100,12 @@ vec3 ReflectedColor(vec2 prev_uv, float ray_px, float gloss) {
 // `hit_distance`: from the surface to what the ray hit (view units; 0 where it hit nothing).
 vec4 Trace(vec2 uv, float depth, float gloss, out float hit_distance) {
     hit_distance = 0.0;
+    // Sharp: only glossy surfaces (puddles, polished metal) reflect, fading in over 0.15 of gloss
+    // above the minimum (without gloss, at half size, it is 1).
+    const float gloss_fade = sharp != 0u ? smoothstep(min_gloss, min_gloss + 0.15, gloss) : 1.0;
+    if (gloss_fade <= 0.0) {
+        return vec4(0.0);
+    }
     // The view position and the reflected direction, as the game makes them.
     const vec3 pos = ViewPos(uv, depth);
     const vec3 view_dir = normalize(pos);
@@ -107,7 +120,7 @@ vec4 Trace(vec2 uv, float depth, float gloss, out float hit_distance) {
                              dot(vec3(C(40u), C(41u), C(42u)), n));
     const vec3 r = normalize(view_dir - 2.0 * dot(normal, view_dir) * normal);
     const vec3 end = pos + r;
-    if (r.z < C(64u) || end.z <= 1e-4) {
+    if ((sharp == 0u && r.z < C(64u)) || end.z <= 1e-4) {
         return vec4(0.0);
     }
 
@@ -136,6 +149,7 @@ vec4 Trace(vec2 uv, float depth, float gloss, out float hit_distance) {
     vec3 p = origin + t * dir;
     int level = 0;
     bool hit = false;
+    float behind = 0.0; // how far behind the depth the hit was (of the thickness)
     for (int i = 0; i < max_steps; ++i) {
         if (any(lessThan(p.xy, vec2(0.0))) || any(greaterThanEqual(p.xy, size)) || p.z >= 1.0) {
             break;
@@ -165,6 +179,7 @@ vec4 Trace(vec2 uv, float depth, float gloss, out float hit_distance) {
         } else if (level > 0) {
             --level;
         } else if (p.z - surface < thickness) {
+            behind = (p.z - surface) / max(thickness, 1e-8);
             hit = true;
             break;
         } else {
@@ -194,13 +209,18 @@ vec4 Trace(vec2 uv, float depth, float gloss, out float hit_distance) {
     // The game's fade: rays close to its lowest direction, and pixels far from the centre.
     const float angle = clamp(r.z - C(64u), 0.0, 1.0);
     const float edge = clamp(length(uv - 0.5) * 2.0, 0.0, 1.0);
-    float fade = min(1.0, min(angle * angle, 1.0 - edge * edge));
+    float fade = sharp != 0u ? 1.0 : min(1.0, min(angle * angle, 1.0 - edge * edge));
     // Hits near the screen's edges (and where the last frame did not see them).
     const vec2 border = smoothstep(vec2(0.0), vec2(edge_fade), hit_uv) *
                         (1.0 - smoothstep(vec2(1.0 - edge_fade), vec2(1.0), hit_uv)) *
                         smoothstep(vec2(0.0), vec2(edge_fade), prev_uv) *
                         (1.0 - smoothstep(vec2(1.0 - edge_fade), vec2(1.0), prev_uv));
-    fade *= border.x * border.y;
+    fade *= border.x * border.y * gloss_fade;
+    if (sharp != 0u) {
+        // Hits deep in the thickness fade out: with the camera's jitter they come and go
+        // between frames, which flickered on and off.
+        fade *= clamp(2.0 - 2.0 * behind, 0.0, 1.0);
+    }
     hit_distance = length(ViewPos(hit_uv, hit_depth) - pos);
     return vec4(color * fade, fade);
 }
@@ -222,6 +242,13 @@ void main() {
         return;
     }
     float hit_distance;
-    imageStore(out_img, pixel, Trace((vec2(pixel) + 0.5) / size, depth, gloss, hit_distance));
+    vec4 result = Trace((vec2(pixel) + 0.5) / size, depth, gloss, hit_distance);
+    if (debug == 1u || (debug == 2u && result.a > 0.0)) {
+        result = vec4(4.0, 0.0, 4.0, 1.0);
+    } else if (debug == 3u) {
+        // Shiny green, rough red (1 without the gloss, at half size).
+        result = vec4(4.0 * (1.0 - gloss), 4.0 * gloss, 0.0, 1.0);
+    }
+    imageStore(out_img, pixel, result);
     imageStore(distance_img, pixel, vec4(hit_distance));
 }

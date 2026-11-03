@@ -50,6 +50,9 @@ layout(push_constant) uniform Constants {
     uint has_gloss;
     uint history;      // 0: no last frame (the first, after a pause, or the setting off)
     float roughness;   // without the gloss
+    uint sharp;        // the trace's sharp setting: a short history, no spatial filtering
+    uint debug;        // 4: the rays as traced (no filtering, no history)
+    float sharp_frames; // sharp: frames of history
 };
 
 float C(uint k) {
@@ -108,6 +111,13 @@ float Roughness(ivec2 pixel) {
     }
     const ivec2 texel = ivec2((vec2(Clamped(pixel)) + 0.5) * normal_scale);
     return clamp(1.0 - texelFetch(gloss_tex, texel, 0).r, 0.0, 1.0);
+}
+
+// How much the filters may spread a pixel over its neighbours: sharp, none (one mirror ray
+// per pixel, blurred by gloss in the trace, has no noise to filter; the filters only blurred
+// it, the 8x8 tile average going into every frame).
+float SpatialAmount(float r) {
+    return sharp != 0u ? 0.0 : 1.0;
 }
 
 float Luminance(vec3 color) {
@@ -248,7 +258,15 @@ void main() {
         vec3 history_normal = vec3(0.0);
         float history_depth = 0.0;
         bool found = true;
-        if (hit_similarity > REPROJECTION_NORMAL_SIMILARITY_THRESHOLD &&
+        if (sharp != 0u) {
+            // Sharp: always where the surface was (the choice between that and the reflection's
+            // mirror image, by how alike the normals and neighbours look, could change from
+            // frame to frame with the camera's jitter and flicker where nothing moved).
+            history_normal = surface_old.xyz;
+            history_depth = textureLod(sampled9, surface_uv, 0.0).z;
+            reprojection_uv = surface_uv;
+            reprojected = textureLod(sampled8, surface_uv, 0.0);
+        } else if (hit_similarity > REPROJECTION_NORMAL_SIMILARITY_THRESHOLD &&
             hit_similarity + 1.0e-3 > surface_similarity &&
             abs(hit_old.w - r) < abs(surface_old.w - r) + 1.0e-3) {
             history_normal = hit_old.xyz;
@@ -293,7 +311,10 @@ void main() {
         if (Inside(reprojection_uv) && disocclusion > 0.0) {
             const vec4 old = textureLod(sampled9, reprojection_uv, 0.0);
             num_samples = old.y * disocclusion;
-            const float max_samples = max(8.0, MAX_SAMPLES * SamplesForRoughness(r));
+            // Sharp: the setting's frames (more is steadier, but smears more in motion); else
+            // the denoiser's own 8 to 32.
+            const float max_samples =
+                sharp != 0u ? sharp_frames : max(8.0, MAX_SAMPLES * SamplesForRoughness(r));
             num_samples = min(max_samples, num_samples + 1.0);
             const float new_variance = TemporalVariance(radiance.rgb, reprojected.rgb);
             variance = mix(new_variance, old.x, 1.0 / num_samples);
@@ -359,7 +380,8 @@ void main() {
     const vec4 surface = tile_surface[center.y][center.x];
     vec4 resolved = radiance;
     float resolved_variance = variance;
-    if (variance > 0.0 && Roughness(pixel) >= 0.0001) {
+    const float spatial = SpatialAmount(Roughness(pixel));
+    if (debug != 4u && variance > 0.0 && Roughness(pixel) >= 0.0001 && spatial > 0.0) {
         const vec2 uv8 = (vec2(pixel) + 0.5) / vec2((ivec2(size) + 7) / 8 * 8);
         const vec4 avg = textureLod(sampled8, uv8, 0.0);
         float total = RadianceWeight(avg, radiance, variance);
@@ -380,7 +402,7 @@ void main() {
                 pow(max(dot(surface.xyz, neighbor_surface.xyz), 0.0), PREFILTER_NORMAL_SIGMA);
             weight *= exp(-abs(surface.w - neighbor_surface.w) * surface.w * PREFILTER_DEPTH_SIGMA);
             weight *= RadianceWeight(avg, neighbor, variance);
-            weight *= variance_weight;
+            weight *= variance_weight * spatial;
             total += weight;
             sum += weight * neighbor;
             variance_sum += weight * weight * tile_variance[at.y][at.x];
@@ -411,10 +433,29 @@ void main() {
     float variance = texelFetch(tex1, pixel, 0).x;
     const float r = Roughness(pixel);
     const float num_samples = texelFetch(tex5, pixel, 0).y;
-    if (history != 0u) {
+    if (history != 0u && debug != 4u && sharp != 0u) {
+        // Sharp: the history kept within this frame's 3x3 neighbours (a reflection that moved
+        // or appeared takes over at once), then blended in.
+        vec4 lo = signal;
+        vec4 hi = signal;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                const vec4 neighbor = tile[center.y + y][center.x + x];
+                lo = min(lo, neighbor);
+                hi = max(hi, neighbor);
+            }
+        }
+        const vec4 old = clamp(texelFetch(tex6, pixel, 0), lo, hi);
+        signal = mix(signal, old, 1.0 - 1.0 / max(num_samples, 1.0));
+        variance = 0.0;
+        if (any(isinf(signal)) || any(isnan(signal))) {
+            signal = vec4(0.0);
+        }
+    } else if (history != 0u && debug != 4u) {
         const vec2 uv8 = (vec2(pixel) + 0.5) / vec2((ivec2(size) + 7) / 8 * 8);
         const vec4 avg = textureLod(sampled8, uv8, 0.0);
         const vec4 old = texelFetch(tex6, pixel, 0);
+        const float spatial = SpatialAmount(r);
         Moments neighborhood = LocalNeighborhood(center);
         // The history clipped to this frame's spread around the pixel.
         const vec4 spread = (sqrt(neighborhood.variance) + length(neighborhood.mean - avg)) *
@@ -423,8 +464,8 @@ void main() {
         const vec4 clipped = ClipAABB(neighborhood.mean - spread, neighborhood.mean + spread, old);
         const float weight = 1.0 - 1.0 / max(num_samples, 1.0);
         // Towards the tile's average while there are few frames, and without outliers.
-        signal = mix(signal, avg, 1.0 / max(num_samples + 1.0, 1.0));
-        signal = ClipAABB(avg - spread, avg + spread, signal);
+        signal = mix(signal, avg, spatial / max(num_samples + 1.0, 1.0));
+        signal = mix(signal, ClipAABB(avg - spread, avg + spread, signal), spatial);
         signal = mix(signal, clipped, weight);
         variance = mix(TemporalVariance(signal.rgb, clipped.rgb), variance, weight);
         if (any(isinf(signal)) || any(isnan(signal)) || isinf(variance) || isnan(variance)) {
