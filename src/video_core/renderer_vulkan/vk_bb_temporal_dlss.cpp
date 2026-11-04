@@ -2550,11 +2550,17 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
 
 std::optional<BbTemporalDlss::DrawReplacement> BbTemporalDlss::TakeDrawReplacement() {
     BB_STAGE_CENSUS("BbTemporalDlss::TakeDrawReplacement", Features);
+    if (!impl->replacement) [[likely]] { // every draw asks
+        return std::nullopt;
+    }
     return std::exchange(impl->replacement, std::nullopt);
 }
 
 std::optional<BbTemporalDlss::DisplayCopyReplay> BbTemporalDlss::TakeDisplayCopyReplay() {
     BB_STAGE_CENSUS("BbTemporalDlss::TakeDisplayCopyReplay", Features);
+    if (!impl->display_copy_replay) [[likely]] { // every draw asks
+        return std::nullopt;
+    }
     return std::exchange(impl->display_copy_replay, std::nullopt);
 }
 

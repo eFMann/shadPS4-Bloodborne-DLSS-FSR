@@ -62,6 +62,14 @@ inline std::atomic<bool> enabled{false};
 inline thread_local Phase phase = Phase::None;
 inline thread_local Label label = Label::Targets;
 
+/// The recorder's current step, for the census only: a thread-local write each, about a dozen a
+/// draw, so only while the census is on.
+inline void SetLabel(Label next) {
+    if (enabled.load(std::memory_order_relaxed)) [[unlikely]] {
+        label = next;
+    }
+}
+
 struct Site {
     const char* name;
     Owner owner;
@@ -74,17 +82,23 @@ void Count(Site& site);
 /// The recorder, around a draw's two phases.
 class PhaseScope {
 public:
-    explicit PhaseScope(Phase next) : previous{phase} {
-        phase = next;
+    explicit PhaseScope(Phase next) : active{enabled.load(std::memory_order_relaxed)} {
+        if (active) [[unlikely]] {
+            previous = phase;
+            phase = next;
+        }
     }
     ~PhaseScope() {
-        phase = previous;
+        if (active) [[unlikely]] {
+            phase = previous;
+        }
     }
     PhaseScope(const PhaseScope&) = delete;
     PhaseScope& operator=(const PhaseScope&) = delete;
 
 private:
-    Phase previous;
+    bool active;
+    Phase previous{};
 };
 
 /// The recorder, once a draw is recorded: counts it and logs every 20 s.

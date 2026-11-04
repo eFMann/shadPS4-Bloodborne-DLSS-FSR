@@ -624,6 +624,7 @@ private:
         }
     }
     bool finisher_running{};                  ///< the resolve thread's
+    u32 pending_ops_counter{};                ///< the resolve thread's (PopPendingOperations)
     u64 fin_write{};                          ///< entries handed over (the resolve thread's)
     alignas(64) std::atomic<u64> fin_published{0};
     alignas(64) std::atomic<u64> fin_done{0};

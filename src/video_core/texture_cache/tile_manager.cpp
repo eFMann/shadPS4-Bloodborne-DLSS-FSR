@@ -197,6 +197,46 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     return handle;
 }
 
+namespace {
+/// A tiling pass (buffer to buffer), recorded in order through the scheduler.
+void RecordTiling(Vulkan::Scheduler& scheduler, vk::Pipeline pipeline, vk::PipelineLayout layout,
+                  const vk::DescriptorBufferInfo& tiled, const vk::DescriptorBufferInfo& linear,
+                  const vk::DescriptorBufferInfo& params, u32 dim_x) {
+    scheduler.RecordUncaptured(
+        [pipeline, layout, tiled, linear, params, dim_x](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+            const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+                {
+                    .dstSet = VK_NULL_HANDLE,
+                    .dstBinding = 0,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageBuffer,
+                    .pBufferInfo = &tiled,
+                },
+                {
+                    .dstSet = VK_NULL_HANDLE,
+                    .dstBinding = 1,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageBuffer,
+                    .pBufferInfo = &linear,
+                },
+                {
+                    .dstSet = VK_NULL_HANDLE,
+                    .dstBinding = 2,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eUniformBuffer,
+                    .pBufferInfo = &params,
+                },
+            }};
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, set_writes);
+            cmdbuf.dispatch(dim_x, 1, 1);
+        });
+}
+} // namespace
+
 std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
                                                        u64 in_offset, const ImageInfo& info,
                                                        bool flush_barriers, u32 trim) {
@@ -241,8 +281,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         runtime.FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
+    const vk::Pipeline pipeline = GetTilingPipeline(info, false);
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer->Handle(),
@@ -256,36 +295,11 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         .range = detile_size,
     };
 
-    const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
-        {
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 0,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &tiled_buffer_info,
-        },
-        {
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 1,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &linear_buffer_info,
-        },
-        {
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 2,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eUniformBuffer,
-            .pBufferInfo = &params_buffer_info,
-        },
-    }};
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
-
     const auto dim_x = (detile_size / bytes_per_texel) / 64;
-    cmdbuf.dispatch(dim_x, 1, 1);
+    // Through the recording thread (a few a frame): a direct command buffer made the draw
+    // recorder wait for it.
+    RecordTiling(scheduler, pipeline, *pl_layout, tiled_buffer_info, linear_buffer_info,
+                 params_buffer_info, dim_x);
 
     runtime.AccessBuffer(staging.buffer, staging.offset, detile_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
@@ -333,8 +347,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
     runtime.FlushBarriers();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
+    const vk::Pipeline pipeline = GetTilingPipeline(info, true);
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer->Handle(),
@@ -348,36 +361,11 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = info.guest_size,
     };
 
-    const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
-        {
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 0,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &tiled_buffer_info,
-        },
-        {
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 1,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &linear_buffer_info,
-        },
-        {
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 2,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eUniformBuffer,
-            .pBufferInfo = &params_buffer_info,
-        },
-    }};
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
-
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
-    cmdbuf.dispatch(dim_x, 1, 1);
+    // Through the recording thread (a few a frame): a direct command buffer made the draw
+    // recorder wait for it.
+    RecordTiling(scheduler, pipeline, *pl_layout, tiled_buffer_info, linear_buffer_info,
+                 params_buffer_info, dim_x);
 
     // The staging copy is read by the tiling shader: a later write to that staging memory (it is
     // handed out again) waits for it.

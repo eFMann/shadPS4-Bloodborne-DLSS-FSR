@@ -1074,7 +1074,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     const bool threaded = finisher_running && DrawPipe::OnStageB();
     occlusion_b.draws_seen += occlusion_b.open ? 1 : 0;
     if (DrawPipe::OnStageB()) {
-        scheduler.PopPendingOperations();
+        // Every 64th draw: each call reads the GPU's progress from the driver (and the
+        // submissions run them too); per draw it was about 0.4% of all CPU time.
+        if ((++pending_ops_counter & 63) == 0) {
+            scheduler.PopPendingOperations();
+        }
         if (target_memo_enabled.load(std::memory_order_relaxed) && !threaded) {
             scheduler.KickRecording(); // nobody holds the command buffer here
         }
@@ -1119,14 +1123,14 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     // One step a draw on each half (a step reads the clock: several a draw cost ~1% of the recorder).
     Common::Crumbs::Add("draw: resolve (vs, ps)", stage_hash(Shader::SwStage::Vertex),
                         stage_hash(Shader::SwStage::Fragment));
-    StageCensus::label = StageCensus::Label::Targets;
+    StageCensus::SetLabel(StageCensus::Label::Targets);
     PrepareRenderState(pipeline);
     ProfileLap(Section::Targets);
-    StageCensus::label = StageCensus::Label::Resources;
+    StageCensus::SetLabel(StageCensus::Label::Resources);
     if (!BindResources(pipeline)) {
         return;
     }
-    StageCensus::label = StageCensus::Label::Upscaler;
+    StageCensus::SetLabel(StageCensus::Label::Upscaler);
     TemporalDlssDraw(pipeline, false);
     if (const auto source = temporal_dlss.TakeDrawReplacement()) {
         // Records here, on this thread: the scheduler catches the finish thread up first.
@@ -1138,21 +1142,21 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         return;
     }
     ProfileLap(Section::Dlss);
-    StageCensus::label = StageCensus::Label::RenderState;
+    StageCensus::SetLabel(StageCensus::Label::RenderState);
     entry.state = BeginRendering(pipeline);
     ProfileLap(Section::BeginRendering);
 
-    StageCensus::label = StageCensus::Label::Vertex;
+    StageCensus::SetLabel(StageCensus::Label::Vertex);
     BindVertexBuffers(pipeline);
     ProfileLap(Section::VertexBuffers);
-    StageCensus::label = StageCensus::Label::Index;
+    StageCensus::SetLabel(StageCensus::Label::Index);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
     ProfileLap(Section::Vertex);
 
     // The rest of what the draw's registers give: the finish half reads none of them.
-    StageCensus::label = StageCensus::Label::Dynamic;
+    StageCensus::SetLabel(StageCensus::Label::Dynamic);
     {
         const auto dynamic_start = RecMark();
         // The same as the last draw's when its registers and other inputs are (threaded
@@ -1208,7 +1212,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     }
     rh->num_indices = regs.num_indices;
     rh->num_instances = regs.num_instances.NumInstances();
-    StageCensus::label = StageCensus::Label::Motion;
+    StageCensus::SetLabel(StageCensus::Label::Motion);
     if (pipeline->GetGraphicsKey().motion_vectors && object_motion && object_motion->Active()) {
         const MotionPrep prep =
             packet_motion ? *packet_motion : ComputeMotionPrep(pipeline, is_indexed, index_offset);
@@ -1218,15 +1222,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     }
     // Our features' decisions, and the display copy this draw replays (set by the upscaler's
     // draw hook above).
-    StageCensus::label = StageCensus::Label::Hooks;
+    StageCensus::SetLabel(StageCensus::Label::Hooks);
     rh->features = DrawFeatures(pipeline);
-    StageCensus::label = StageCensus::Label::DisplayCopy;
+    StageCensus::SetLabel(StageCensus::Label::DisplayCopy);
     rh->display_copy = temporal_dlss.TakeDisplayCopyReplay();
     ProfileLap(Section::Dynamic);
 
     // The line between the halves: what the finish half needs is in the entry; the images'
     // binding marks and the buffer tracking were the resolve half's.
-    StageCensus::label = StageCensus::Label::Reset;
+    StageCensus::SetLabel(StageCensus::Label::Reset);
     const auto handoff_start = RecMark();
     defer_binds = false;
     rh->flush_barriers = needs_barrier;
@@ -1310,34 +1314,34 @@ void Rasterizer::FinishDraw(FinishEntry& e) {
     const u64 mirror_flushes = velocity_mirror.Flushes();
     mirror_rebind = false;
 
-    StageCensus::label = StageCensus::Label::Vertex;
+    StageCensus::SetLabel(StageCensus::Label::Vertex);
     if (h.bind_vertex) {
         RecordVertexBindings(h.vertex);
     }
-    StageCensus::label = StageCensus::Label::Index;
+    StageCensus::SetLabel(StageCensus::Label::Index);
     if (h.bind_index) {
         RecordIndexBinding(h.index);
     }
-    StageCensus::label = StageCensus::Label::Barriers;
+    StageCensus::SetLabel(StageCensus::Label::Barriers);
     if (h.flush_barriers) {
         runtime.RecordBarriers(h.barriers);
     }
     FinLap(Section::Barriers);
 
-    StageCensus::label = StageCensus::Label::Descriptors;
+    StageCensus::SetLabel(StageCensus::Label::Descriptors);
     pipeline->BindResources(fin->set_writes, fin->push_data);
     FinLap(Section::Descriptors);
-    StageCensus::label = StageCensus::Label::Dynamic;
+    StageCensus::SetLabel(StageCensus::Label::Dynamic);
     if (!h.dynamic_same) {
         fin_dynamic = h.dynamic;
     }
     ApplyDynamicState(fin_dynamic);
-    StageCensus::label = StageCensus::Label::Pass;
+    StageCensus::SetLabel(StageCensus::Label::Pass);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
     FinLap(Section::Dynamic);
 
-    StageCensus::label = StageCensus::Label::Draw;
+    StageCensus::SetLabel(StageCensus::Label::Draw);
     const auto pipeline_handle = pipeline->Handle();
     scheduler.Record([pipeline_handle](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline_handle);
@@ -1358,10 +1362,10 @@ void Rasterizer::FinishDraw(FinishEntry& e) {
     // The display copy replay records directly (CommandBuffer() waits for the recording
     // thread first); the velocity mirror goes through Record().
     const auto draw = [&] { record_draw(scheduler.CommandBuffer()); };
-    StageCensus::label = StageCensus::Label::Mirror;
+    StageCensus::SetLabel(StageCensus::Label::Mirror);
     ReplayVelocityMirror(pipeline, state, is_indexed, [&] { scheduler.Record(record_draw); });
     RebindAfterMirror(pipeline, state, is_indexed, mirror_flushes);
-    StageCensus::label = StageCensus::Label::Draw;
+    StageCensus::SetLabel(StageCensus::Label::Draw);
     if (occlusion_b.open) {
         occlusion_b.depth_view = reinterpret_cast<u64>(
             static_cast<VkImageView>(state.depth_stencil_attachment.image_view));
@@ -1381,10 +1385,10 @@ void Rasterizer::FinishDraw(FinishEntry& e) {
         OcclusionQueryEnd(query);
     }
     if (h.display_copy) {
-        StageCensus::label = StageCensus::Label::DisplayCopy;
+        StageCensus::SetLabel(StageCensus::Label::DisplayCopy);
         ReplayDisplayCopy(pipeline, state, draw, std::exchange(h.display_copy, std::nullopt));
     }
-    StageCensus::label = StageCensus::Label::Hooks;
+    StageCensus::SetLabel(StageCensus::Label::Hooks);
     if (features & VbaoAfter) {
         BetterAoAfterDraw(pipeline);
     }
