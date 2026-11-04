@@ -1254,6 +1254,13 @@ private:
     };
     static constexpr u64 CopyJobCount = 1ull << 16;
     void RingCopy(VAddr guest, u8* dest, u64 offset, u64 size);
+    /// Hands the copy jobs made so far to the copy thread (before a packet that needs them).
+    void PublishCopies();
+    u64 copy_published_head{}; ///< stage A: copy_head as last published
+    /// Prefetch: per shader buffer binding, whether it held the scene constants (SceneProbeSeen)
+    /// and how often it was copied (stage A).
+    static constexpr u32 SceneProbeSeen = 1u << 31;
+    tsl::robin_map<const void*, u32> scene_probes;
     void RunCopyThread(std::stop_token stop);
     void WaitForCopies(u64 end);
     std::unique_ptr<CopyJob[]> copy_jobs;

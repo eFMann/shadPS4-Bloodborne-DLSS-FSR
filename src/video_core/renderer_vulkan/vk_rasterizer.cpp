@@ -5797,6 +5797,7 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
                      num_prefetch * static_cast<u32>(sizeof(PrefetchedBuffer)) +
                      (vertex_prepared ? VertexSectionSize(num_vertex, num_vertex_ranges) : 0) +
                      (motion_prepared ? AlignPacket(sizeof(MotionPrep)) : 0);
+    PublishCopies(); // the jobs up to copy_end, before the packet can run
     u8* const out = draw_pipe->Begin(size);
     u8* at = out;
 
@@ -5888,12 +5889,15 @@ void Rasterizer::ABeginDraw() {
         a_last = {};
         return;
     }
-    const auto now = std::chrono::steady_clock::now();
     a_profile = (a_profile_counter++ & 31) == 0;
     a_hitch = diagnostics.load(std::memory_order_relaxed) && HitchProfile();
     if (a_hitch) {
         a_hitch_draws.fetch_add(1, std::memory_order_relaxed);
     }
+    if (!a_profile && !a_hitch) {
+        return; // no clock reads for the draws not timed (two a draw cost ~2% of this thread)
+    }
+    const auto now = std::chrono::steady_clock::now();
     if (a_profile && a_last != std::chrono::steady_clock::time_point{}) {
         const auto decode = (now - a_last) - (draw_pipe->drain_time - a_drain_mark);
         if (decode < std::chrono::milliseconds(1)) {
@@ -5911,8 +5915,13 @@ void Rasterizer::AEndDraw() {
     }
     a_profile = false;
     a_hitch = false;
-    a_last = std::chrono::steady_clock::now();
-    a_drain_mark = draw_pipe->drain_time;
+    // The decode time of the next draw, only if it is timed.
+    if ((a_profile_counter & 31) == 0 || diagnostics.load(std::memory_order_relaxed)) {
+        a_last = std::chrono::steady_clock::now();
+        a_drain_mark = draw_pipe->drain_time;
+    } else {
+        a_last = {};
+    }
 }
 
 u64 Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, VAddr write_addr,
@@ -5927,6 +5936,7 @@ u64 Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, VAddr w
             {draw_pipe->packets + 1, write_addr, write_addr + write_size, writer, 0});
     }
     const u32 total = sizeof(TaskPacket) + AlignPacket(size);
+    PublishCopies(); // the jobs up to copy_end, before the packet can run
     u8* out = draw_pipe->Begin(total);
     *reinterpret_cast<TaskPacket*>(out) = {
         static_cast<u8>(PacketKind::Task), {}, size, task, copy_head};
@@ -6004,10 +6014,20 @@ void Rasterizer::RingCopy(VAddr guest, u8* dest, u64 offset, u64 size) {
     }
     // Copy thread: made later, before the packet runs on the draw recorder.
     while (copy_head - copy_done.load(std::memory_order_acquire) >= CopyJobCount) {
+        PublishCopies();
         std::this_thread::yield();
     }
     copy_jobs[copy_head % CopyJobCount] = {guest, dest, offset, size};
     ++copy_head;
+    // Handed over with the packet (PublishCopies): once per draw instead of once per buffer,
+    // each a write to the line the copy thread polls.
+}
+
+void Rasterizer::PublishCopies() {
+    if (copy_published_head == copy_head) {
+        return;
+    }
+    copy_published_head = copy_head;
     copy_published.store(copy_head, std::memory_order_seq_cst);
     if (copy_sleeping.load(std::memory_order_seq_cst)) {
         copy_wake.fetch_add(1, std::memory_order_seq_cst);
@@ -6133,13 +6153,25 @@ void Rasterizer::PrefetchBuffers(const Pipeline* pipeline) {
                 const_ring->Flush(offset, size);
             } else {
                 RingCopy(guest, dest, offset, size);
-                // Read here, where the data was just copied, not on the recorder (cold there),
-                // with the same test the scene constants' readers start with.
+                // The same test the scene constants' readers start with. With the copy thread the
+                // data is not read here otherwise: each test was a read of memory the game just
+                // wrote on another core (about 6% of this thread's time). So only for the
+                // buffers that held the scene constants before, the others' first 64 times and
+                // then every 256th (a binding changing what it holds is still found).
                 if (size >= 64 * sizeof(float)) {
-                    const auto* f = reinterpret_cast<const float*>(guest);
-                    if (f[0] == 3000.0f && std::abs(f[1] * f[0] - 1.0f) <= 1e-3f && f[4] >= 64.0f &&
-                        f[5] >= 64.0f) {
-                        flags |= PrefetchScene;
+                    u32& probe = scene_probes[&desc];
+                    const bool seen = (probe & SceneProbeSeen) != 0;
+                    const u32 count = probe & ~SceneProbeSeen;
+                    if (seen || count < 64 || (count & 255) == 0) {
+                        const auto* f = reinterpret_cast<const float*>(guest);
+                        if (f[0] == 3000.0f && std::abs(f[1] * f[0] - 1.0f) <= 1e-3f &&
+                            f[4] >= 64.0f && f[5] >= 64.0f) {
+                            flags |= PrefetchScene;
+                            probe |= SceneProbeSeen;
+                        }
+                    }
+                    if (!seen) {
+                        probe = (probe & SceneProbeSeen) | ((count + 1) & ~SceneProbeSeen);
                     }
                 }
             }
