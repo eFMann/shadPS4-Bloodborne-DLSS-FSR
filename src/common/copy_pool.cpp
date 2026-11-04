@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -12,9 +13,31 @@
 #include "common/copy_pool.h"
 #include "common/thread.h"
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 namespace Common::CopyPool {
 
 namespace {
+
+void CpuPause() {
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_pause();
+#elif defined(_M_ARM64) && defined(_MSC_VER)
+    __yield();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+/// How long a copy thread stays awake after a task, watching for the next one. Streaming a new
+/// area hands over a piece every ~25 us for tens of milliseconds (one per new texture, 1 MiB
+/// pieces of geometry): asleep between them, each hand-over woke a thread through the OS, 2-3 ms
+/// of the draw recorder's time in a traversal stutter. Awake, a hand-over is a queue push.
+constexpr auto SpinTime = std::chrono::microseconds{200};
 
 std::atomic<u32> requested_workers{0};
 
@@ -60,6 +83,7 @@ public:
             next.store(0, std::memory_order_relaxed);
             done.store(0, std::memory_order_relaxed);
             ++generation;
+            generation_seen.store(generation, std::memory_order_release);
         }
         cv.notify_all();
         Work(task, count);
@@ -78,11 +102,18 @@ public:
             return;
         }
         async_pending.fetch_add(1, std::memory_order_relaxed);
+        bool wake;
         {
             std::scoped_lock lock{mutex};
             async_queue.push_back(std::move(task));
+            queued.store(async_queue.size(), std::memory_order_release);
+            // Only a sleeping thread needs waking (an OS call); awake ones are watching the queue.
+            // Read under the lock: a thread going to sleep counts itself under it first.
+            wake = sleeping != 0;
         }
-        cv.notify_one();
+        if (wake) {
+            cv.notify_one();
+        }
     }
 
     bool WaitAsync() {
@@ -97,6 +128,7 @@ public:
                 if (!async_queue.empty()) {
                     task = std::move(async_queue.front());
                     async_queue.pop_front();
+                    queued.store(async_queue.size(), std::memory_order_relaxed);
                 }
             }
             if (task) {
@@ -128,14 +160,35 @@ private:
     void WorkerLoop(std::stop_token stop) {
         Common::SetCurrentThreadName("shadPS4:CopyPool");
         u64 seen = 0;
+        bool worked = false;
         while (true) {
             const std::function<void(std::size_t)>* task = nullptr;
             std::size_t count = 0;
             std::function<void()> async_task;
+            if (worked) {
+                // Just finished a task: more usually follow within microseconds.
+                const auto until = std::chrono::steady_clock::now() + SpinTime;
+                while (queued.load(std::memory_order_acquire) == 0 &&
+                       generation_seen.load(std::memory_order_acquire) == seen &&
+                       !stop.stop_requested()) {
+                    for (int i = 0; i < 32; ++i) {
+                        CpuPause();
+                    }
+                    if (std::chrono::steady_clock::now() >= until) {
+                        break;
+                    }
+                }
+            }
             {
                 std::unique_lock lock{mutex};
-                cv.wait(lock,
-                        [&] { return stopping || generation != seen || !async_queue.empty(); });
+                const auto ready = [&] {
+                    return stopping || generation != seen || !async_queue.empty();
+                };
+                while (!ready()) {
+                    ++sleeping;
+                    cv.wait(lock);
+                    --sleeping;
+                }
                 if (stopping || stop.stop_requested()) {
                     return;
                 }
@@ -150,8 +203,10 @@ private:
                 } else {
                     async_task = std::move(async_queue.front());
                     async_queue.pop_front();
+                    queued.store(async_queue.size(), std::memory_order_relaxed);
                 }
             }
+            worked = task != nullptr || static_cast<bool>(async_task);
             if (task) {
                 Work(*task, count);
                 {
@@ -180,11 +235,14 @@ private:
     const std::function<void(std::size_t)>* job_task = nullptr;
     std::size_t job_count = 0;
     u64 generation = 0;
+    std::atomic<u64> generation_seen{0}; ///< `generation`, readable without the lock
     u32 active = 0;
+    u32 sleeping = 0; ///< threads waiting on `cv` (under `mutex`)
     bool stopping = false;
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> done{0};
     std::deque<std::function<void()>> async_queue;
+    std::atomic<std::size_t> queued{0}; ///< async_queue.size(), readable without the lock
     std::atomic<u64> async_pending{0};
 };
 

@@ -27,6 +27,7 @@
 #include "common/guest_stats.h"
 #include "common/polyfill_thread.h"
 #include "common/rdtsc.h"
+#include "common/render_affinity.h"
 #include "common/thread.h"
 #include "common/types.h"
 
@@ -185,6 +186,7 @@ private:
         Common::GuestStats::on_recorder = true;
         u64 at = 0;
         while (true) {
+            Common::RenderAffinity::Apply();
             // Packets follow each other within microseconds while a frame is decoded: spin,
             // and sleep only after a longer pause (between frames).
             u64 available = published.load(std::memory_order_acquire);

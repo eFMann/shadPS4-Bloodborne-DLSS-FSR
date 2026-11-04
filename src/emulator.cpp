@@ -115,17 +115,30 @@ static bool closing_normally = false;
 // Closing the window: each step is logged, and if one hangs (closing with frame generation on once
 // left the game running without input), the process is ended after a while anyway.
 static std::atomic<const char*> exit_step{"starting"};
+// When the exit (or a restart) began: each step is logged with the time since.
+static std::chrono::steady_clock::time_point exit_start{};
 static void ExitStep(const char* step) {
     exit_step = step;
     if (closing_normally || Core::BbResolution::restarting) {
-        LOG_INFO(Loader, "Exit: {}", step);
+        if (exit_start == std::chrono::steady_clock::time_point{}) {
+            exit_start = std::chrono::steady_clock::now();
+        }
+        LOG_INFO(Loader, "Exit: {} ({} ms in)", step,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - exit_start)
+                     .count());
     }
 }
-static void StartExitWatchdog() {
+static void StartExitWatchdog(std::chrono::seconds limit = std::chrono::seconds{30}) {
 #ifdef _WIN32
-    std::thread([] {
-        std::this_thread::sleep_for(std::chrono::seconds{30});
-        LOG_CRITICAL(Loader, "Exit stuck for 30 s at: {}; ending the process", exit_step.load());
+    static std::atomic_flag started = ATOMIC_FLAG_INIT;
+    if (started.test_and_set()) {
+        return;
+    }
+    std::thread([limit] {
+        std::this_thread::sleep_for(limit);
+        LOG_CRITICAL(Loader, "Exit stuck for {} s at: {}; ending the process", limit.count(),
+                     exit_step.load());
         Common::Log::Flush();
         TerminateProcess(GetCurrentProcess(), 0);
     }).detach();
@@ -164,6 +177,12 @@ Emulator::Emulator() {
         __llvm_profile_write_file();
 #endif
         const bool restarting = Core::BbResolution::restarting;
+        if (restarting) {
+            // A restart: the new process waits for this one to end, so a step that hangs here
+            // (the game's threads still run) kept the game from coming back at all.
+            StartExitWatchdog(std::chrono::seconds{15});
+            ExitStep("saving before the restart");
+        }
         // A restart ends the process below without the DLLs' own shutdown, so NGX needs no
         // release first (it waits for the GPU thread, which once took 12 s and stuttered sound).
         if (!restarting) {
@@ -1023,7 +1042,14 @@ void Emulator::Restart(std::filesystem::path eboot_path, const std::vector<std::
 
     LOG_INFO(Common, "Relaunching the emulator with args: {}", fmt::join(args, " "));
     Libraries::Np::NpHandler::GetInstance().Shutdown();
-    Common::Log::Shutdown();
+    if (Core::BbResolution::restarting) {
+        // F1 / F3 restart: the new process waits for this one to end before it opens the log
+        // (--wait-for-pid), so the exit steps after this still reach it.
+        ExitStep("starting the new process");
+        Common::Log::Flush();
+    } else {
+        Common::Log::Shutdown();
+    }
 
     auto& ipc = IPC::Instance();
 

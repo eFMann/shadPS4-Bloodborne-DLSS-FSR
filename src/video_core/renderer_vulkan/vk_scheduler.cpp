@@ -10,6 +10,7 @@
 #include "common/debug.h"
 #include "common/guest_stats.h"
 #include "common/logging/log.h"
+#include "common/render_affinity.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
@@ -364,6 +365,7 @@ void CommandRecorder::Run(std::stop_token stop) {
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     u64 at = 0;
     while (true) {
+        Common::RenderAffinity::Apply();
         u64 available = head.load(std::memory_order_acquire);
         if (available == at) {
             // Spin briefly (commands follow each other while a frame is recorded), then sleep.

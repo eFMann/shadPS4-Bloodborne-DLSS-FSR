@@ -14,6 +14,8 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/render_affinity.h"
+#include "core/bb_resolution.h"
 #include "core/cpu_patches.h"
 #include "core/devtools/layer.h"
 #include "imgui/bb_settings_file.h"
@@ -35,6 +37,13 @@ int SettingsWindow::GetComboIndex(std::string selection, std::vector<std::string
     }
 
     return 0;
+}
+
+// The restart prompt's starting values, by profile, kept for the whole run (F3 can be opened
+// and closed many times while the game runs).
+static std::map<std::string, std::vector<std::pair<const char*, int>>>& RestartSnapshots() {
+    static std::map<std::string, std::vector<std::pair<const char*, int>>> snapshots;
+    return snapshots;
 }
 
 void SettingsWindow::LoadSettings(std::string profile) {
@@ -161,6 +170,34 @@ void SettingsWindow::LoadSettings(std::string profile) {
         extraDmemSetting = EmulatorSettings.GetExtraDmemInMBytes();
         vblankFrequencySetting = EmulatorSettings.GetVblankFrequency();
     }
+    // What the running game started with, for the restart prompt: this profile's values the
+    // first time F3 loads it in this run (later loads may hold changes saved since).
+    auto& started = RestartSnapshots()[profile];
+    if (started.empty()) {
+        started = RestartValues();
+    }
+}
+
+// Settings that only apply when the game starts: their values now, named as in the menu.
+std::vector<std::pair<const char*, int>> SettingsWindow::RestartValues() const {
+    return {
+        // The main part switches at once, but the GPU readback queue, the kept upload memory and
+        // overlapped frames are set up at a start: a restart gives all of it.
+        {"Threaded Renderer", threadedRendererSetting},
+        {"Resizable BAR / Smart Access Memory", bbDrawDataMemorySetting},
+        {"Faster Windows locks and sleeps", bbFastLocksSetting},
+        {"Overlap game and GPU frames", bbOverlapFramesSetting},
+        {"Draw data copy thread", bbCopyThreadSetting},
+        {"Fast pixel shader math", bbFastPixelMathSetting},
+        {"GPU interpolation where safe", bbHardwareInterpolationSetting},
+        {"GPU readbacks on the copy queue", bbReadbackQueueSetting},
+        {"Copy threads", bbCopyThreadsSetting},
+        {"VRAM cleanup", bbVramReclaimSetting},
+        {"Also free idle buffers", bbBufferEvictionSetting},
+        {"Go past the budget", bbVramPastBudgetSetting},
+        {"Faster pipeline lookup (1.09)", EmulatorSettings.IsBbGxPipelines()},
+        {"Windows Guest Red Zone Protection", windowsGuestRedZoneProtectionModeSetting},
+    };
 }
 
 void SettingsWindow::SaveSettings(std::string profile) {
@@ -645,11 +682,27 @@ void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& ap
     }
     ImGui::SameLine();
 
-    // Align buttons right
+    // Align buttons right. The Bloodborne tab's Show/Hide advanced settings goes before Save.
+    const bool bb_tab = currentCategory == SettingsCategory::Bloodborne;
+    const bool advanced_shown = EmulatorSettings.IsBbShowThreadedSettings();
+    const char* advanced_label =
+        advanced_shown ? "Hide advanced settings" : "Show advanced settings";
     float buttonsWidth = ImGui::CalcTextSize("Save").x + ImGui::CalcTextSize("Cancel").x +
                          ImGui::CalcTextSize("Apply").x + ImGui::GetStyle().FramePadding.x * 6.0f +
                          ImGui::GetStyle().ItemSpacing.x * 2;
+    if (bb_tab) {
+        buttonsWidth += ImGui::CalcTextSize(advanced_label).x +
+                        ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+    }
     ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - buttonsWidth);
+    if (bb_tab) {
+        if (ImGui::Button(advanced_shown ? "Hide advanced settings##bb_advanced"
+                                         : "Show advanced settings##bb_advanced")) {
+            EmulatorSettings.SetBbShowThreadedSettings(!advanced_shown);
+            EmulatorSettings.Save();
+        }
+        ImGui::SameLine();
+    }
 
     // Controller shortcuts: d-pad right on a setting jumps to Save (right again: Apply,
     // Cancel); Options saves and closes (with the usual confirmation).
@@ -682,19 +735,71 @@ void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& ap
             }
 
             SaveSettings(profile);
-            if (closeOnSave) {
+            // In game, saving the profile the game runs with: settings that only apply at a
+            // start and changed since the game started ask about a restart first.
+            restartChanged.clear();
+            const std::string running_profile =
+                runningGameSerial.empty() || !RestartSnapshots().contains(runningGameSerial)
+                    ? std::string{"Global"}
+                    : runningGameSerial;
+            if (isGameRunning && profile == running_profile) {
+                const auto now = RestartValues();
+                const auto& started = RestartSnapshots()[profile];
+                for (size_t i = 0; i < now.size() && i < started.size(); ++i) {
+                    if (now[i].second != started[i].second) {
+                        restartChanged.emplace_back(now[i].first);
+                    }
+                }
+            }
+            if (!restartChanged.empty()) {
+                restartPromptRequest = true;
+            } else if (closeOnSave) {
                 DeInit();
                 *open = false;
                 closeOnSave = false;
-                ImGui::CloseCurrentPopup();
-            } else {
-                ImGui::CloseCurrentPopup();
             }
+            ImGui::CloseCurrentPopup();
             if (applySettings) {
                 applySettings();
             }
         }
 
+        ImGui::EndPopup();
+    }
+
+    // Restart needed: the relaunch F1 uses for the resolution (on its own thread, back to the
+    // last autosave), or later.
+    if (restartPromptRequest) {
+        restartPromptRequest = false;
+        ImGui::OpenPopup("Restart needed##bb_restart");
+    }
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Restart needed##bb_restart", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("These changes apply after a restart:");
+        for (const auto& name : restartChanged) {
+            ImGui::BulletText("%s", name.c_str());
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("The game closes and starts again; you continue from your last "
+                            "autosave.\nDon't restart while the save icon is showing.");
+        ImGui::Spacing();
+        if (ImGui::Button("Restart now")) {
+            ImGui::CloseCurrentPopup();
+            DeInit();
+            *open = false;
+            closeOnSave = false;
+            ::Core::BbResolution::RestartGame();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Later")) {
+            ImGui::CloseCurrentPopup();
+            if (closeOnSave) {
+                DeInit();
+                *open = false;
+                closeOnSave = false;
+            }
+        }
         ImGui::EndPopup();
     }
 
@@ -977,156 +1082,63 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 500.0f * uiScale);
             ImGui::TableSetupColumn("Value");
 
-            // Bloodborne-only, experimental: everything the threaded renderer work added. Off
-            // (the switch, or one toggle under it) is the standard shadPS4 behaviour.
+            // Bloodborne-only: everything the threaded renderer work added. Off (the switch, or one
+            // toggle) is the standard shadPS4 behaviour. Each section shows its main settings;
+            // "Show advanced settings" adds the rest in every section.
             AddSettingSection("Threaded Renderer",
                               "Used by Bloodborne only. If something goes wrong, turn off "
                               "Threaded Renderer to get standard shadPS4 behaviour.",
                               true);
             {
-                // Advanced settings (the threaded renderer's parts, developer tools): listed only
-                // when shown (remembered).
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::TextWrapped("Threaded Renderer");
                 ImGui::TableNextColumn();
                 ImGui::Checkbox("##Threaded Renderer", &threadedRendererSetting);
-                // With the Show/Hide button beside it, d-pad right goes to the button first
-                // (ImGui's own navigation); from the button it jumps to Save as usual.
-                const bool shown = EmulatorSettings.IsBbShowThreadedSettings();
-                ImGui::SameLine();
-                if (ImGui::SmallButton(shown ? "Hide advanced settings##threaded_parts"
-                                             : "Show advanced settings##threaded_parts")) {
-                    EmulatorSettings.SetBbShowThreadedSettings(!shown);
-                    EmulatorSettings.Save();
-                }
                 NoteRowFocus();
                 ImGui::SameLine();
-                AddHint("Faster rendering and smoother frame pacing. Switches all below");
+                AddHint("Faster rendering and smoother frame pacing. Most settings below need it "
+                        "(needs a restart)");
             }
             const bool advanced = EmulatorSettings.IsBbShowThreadedSettings();
-            if (threadedRendererSetting) {
-                AddSettingCheckbox("    Real occlusion tests", bbRealOcclusionSetting,
-                                   "More fps in busy areas; can make textures flicker white");
-                AddSettingCheckbox("    Merged copy shaders", bbMergedCopiesSetting,
-                                   "Less GPU copy work; can cause white dots to flicker");
-                if (advanced && bbMergedCopiesSetting) {
-                    AddSettingCheckbox("        Sources from buffer memory",
-                                       bbMergedNoStreamSourcesSetting,
-                                       "White dots test: small copy sources not snapshotted "
-                                       "from game memory");
-                    AddSettingCheckbox("        Large batches", bbMergedLargeBatchesSetting,
-                                       "White dots test: the old 64 MB batches instead of 64 KB");
+            const bool tr = threadedRendererSetting;
+            // Global settings saved at once (a game's profile would not keep them).
+            const auto live = [&](const char* name, bool value, auto set, const char* hint) {
+                bool shown = value;
+                AddSettingCheckbox(name, shown, hint);
+                if (shown != value) {
+                    set(shown);
+                    EmulatorSettings.Save();
                 }
-                AddSettingCheckbox("    Background shader compiles", bbBackgroundPipelinesSetting,
-                                   "New objects appear a frame late instead of a stutter");
-                AddSettingCheckbox("    Show frames when ready", bbFlipWhenReadySetting,
-                                   "Smoother above 60 fps. Off: frames on vblank ticks");
-            }
-            if (threadedRendererSetting && advanced) {
-                // Each off: the emulator's original behaviour for that part (troubleshooting).
-                AddSettingCheckbox("    Streaming optimisations", bbStreamingSetting,
-                                   "Smaller hitches entering new areas");
-                AddSettingCheckbox("    GPU readbacks on the copy queue", bbReadbackQueueSetting,
-                                   "Fewer small stutters (needs a restart)");
-                // Its copies back to game memory run on that queue (nothing without it).
-                if (bbReadbackQueueSetting) {
-                    AddSettingCheckbox("        Early GPU data write-back", bbEarlyWritebackSetting,
-                                       "GPU data the game writes over is copied back before it "
-                                       "waits");
-                }
-                AddSettingCheckbox("    Faster Windows locks and sleeps", bbFastLocksSetting,
-                                   "Less CPU overhead (needs a restart)");
-                AddSettingCheckbox("    Geometry in place", bbGeometryInPlaceSetting,
-                                   "Static vertex/index data not copied for every draw");
-                AddSettingCheckbox("    Background copies", bbBackgroundTextureCopiesSetting,
-                                   "Copies textures and new geometry for the GPU on other threads");
-                // The pool those copies run on (also used by Streaming optimisations' large
-                // uploads, so listed with Background copies off too).
-                AddSettingCombo(
-                    "        Copy threads", bbCopyThreadsSetting,
-                    {fmt::format("Auto ({})", Common::CopyPool::AutoWorkers()), "4", "6", "8"});
+                return shown;
+            };
+            // Settings that can cause visual artefacts: marked, and turning one on asks first
+            // (a pop-up says what to look out for).
+            const auto risky = [&](const char* name, bool& value, const char* hint,
+                                   const char* risk) {
+                const bool before = value;
+                AddSettingCheckbox(name, value, hint);
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.2f, 1.0f), "(!)");
                 if (ImGui::IsItemHovered()) {
-                    ShowTooltip("Threads for background copies and large uploads when an area "
-                                "streams in: more copy faster but compete with the game's "
-                                "threads. Auto: half the CPU's threads, at most 8 (needs a "
-                                "restart)");
+                    ShowTooltip(risk);
                 }
-                if (bbBackgroundTextureCopiesSetting) {
-                    AddSettingCheckbox("        Protect on a helper thread",
-                                       bbProtectHelperThreadSetting,
-                                       "New textures' memory protected by a helper thread "
-                                       "instead of the draw recorder (shorter stutter)");
+                if (!before && value) {
+                    value = false;
+                    bbRiskTarget = &value;
+                    bbRiskName = name;
+                    bbRiskText = risk;
+                    bbRiskOpenRequest = true;
                 }
-                AddSettingCheckbox("    Skip draws with no output", bbSkipEmptyDrawsSetting,
-                                   "Occlusion test geometry the emulator does not use");
-                AddSettingCheckbox("    Reuse texture lookups", bbTextureSetMemoSetting,
-                                   "A draw's textures found once, not every draw");
-                AddSettingCheckbox("    Copy geometry ahead", bbRingGeometrySetting,
-                                   "Small vertex/index data copied by the decoding thread");
-                AddSettingCheckbox("    Overlap GPU submissions", bbSubmitOverlapSetting,
-                                   "Next submission decoded while the last is recorded");
-                AddSettingCheckbox("    Overlap game and GPU frames", bbOverlapFramesSetting,
-                                   "The game starts its next frame while the last one finishes "
-                                   "(needs a restart)");
-                AddSettingCheckbox("    Occlusion results in order", bbOcclusionInOrderSetting,
-                                   "Occlusion results queued behind the draws, no wait");
-                AddSettingCheckbox("    Fast pixel shader math", bbFastPixelMathSetting,
-                                   "Driver fuses multiply-adds; shaders rebuilt (needs a restart)");
-                AddSettingCheckbox("    Constant copies without waiting", bbConstantsNoWaitSetting,
-                                   "Game's constant copies don't wait for queued draws");
-                AddSettingCheckbox("    GPU interpolation where safe",
-                                   bbHardwareInterpolationSetting,
-                                   "NVIDIA: less pixel shader code (needs a restart)");
-                AddSettingCheckbox("    Draw data copy thread", bbCopyThreadSetting,
-                                   "Draw memory copies on their own thread (needs a restart)");
-                AddSettingCheckbox("    Keep rendering while presenting",
-                                   bbRenderDuringPresentSetting,
-                                   "Frame limiters like RTSS don't hold up rendering");
-                AddSettingCheckbox("    Spread area loading", bbSpreadLoadsSetting,
-                                   "Respawns and area loads upload textures over a few frames");
-                AddSettingCheckbox("    Copy only kept texture levels", bbSkipLeftOutLevelsSetting,
-                                   "Texture quality High/Medium: less data copied per upload");
-                AddSettingCheckbox("    Direct texture copies", bbDirectTextureCopiesSetting,
-                                   "Texture data read straight from game memory (faster loads)");
-                AddSettingCheckbox("    Cached texture staging", bbCachedTextureStagingSetting,
-                                   "Texture uploads staged in cached memory (faster copies)");
-                AddSettingCheckbox("    Lower detail first", bbLowerDetailFirstSetting,
-                                   "Streaming bursts: a new texture's largest level arrives a "
-                                   "few frames later (softer meanwhile, shorter stutter)");
-                AddSettingCheckbox("    Clear shader-written images", bbClearShaderWrittenSetting,
-                                   "New images a compute shader fully overwrites are cleared "
-                                   "instead of uploaded (shorter stutter)");
-                AddSettingCheckbox("    Constant dumps past huge writes", bbCeSkipHugeWritesSetting,
-                                   "The GPU thread keeps preparing draws in area loads instead of "
-                                   "waiting for the draw recorder");
-                // Only used when VRAM cleanup frees idle buffers.
-                if (bbVramReclaimSetting && bbBufferEvictionSetting) {
-                    AddSettingCheckbox("    Cheaper buffer refill", bbEvictKeepProtectionSetting,
-                                       "With buffer eviction: evicted buffers come back without "
-                                       "protecting their memory again (shorter stutter)");
-                    AddSettingCheckbox("    Keep returning buffers", bbEvictKeepReturningSetting,
-                                       "With buffer eviction: loading screens free only what VRAM "
-                                       "needs; buffers the game keeps using are freed last");
-                }
-                AddSettingCheckbox("    Copy shader on the CPU", bbCpuCopyShaderSetting,
-                                   "The game's small GPU copies are done in game memory, so the "
-                                   "game doesn't wait for the GPU (stutters while running)");
-                if (bbCpuCopyShaderSetting) {
-                    AddSettingCheckbox("        Skip copies that change nothing",
-                                       bbCopySkipSameSetting, "Fewer buffer uploads");
-                }
-                AddSettingCheckbox("    Clear shadow cube faces", bbClearOneLayerSetting,
-                                   "No wedges of light in lamp shadows");
-            }
+            };
+            const auto subheading = [&](const char* title) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f), "%s", title);
+            };
 
-            AddSettingSection("Graphics", "Picture quality.", false);
-            DrawBbImageSettings();
-
-            AddSettingSection("Performance", "How the game's data reaches the graphics card.",
-                              false);
-            // The per-draw data the CPU writes every frame: in graphics card memory with Resizable
-            // BAR / Smart Access Memory, else system memory. The log says which was used.
+            // ---------------------------------------------------------------------------------
+            AddSettingSection("Performance", "Frame rate and smoothness.", false);
             AddSettingCombo("Resizable BAR / Smart Access Memory", bbDrawDataMemorySetting,
                             drawDataMemoryOptions);
             if (ImGui::IsItemHovered()) {
@@ -1135,54 +1147,161 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                             "Smart Access Memory (AMD) enabled in the BIOS.\nAuto detects "
                             "it. Try Off if you get stutter or crashes. (needs a restart)");
             }
-            AddSettingCheckbox("Protect only changed pages", bbExactProtectionSetting,
-                               "Less CPU time protecting game memory the GPU reads");
-            AddSettingCheckbox("Batched texture uploads", bbBatchedUploadsSetting,
-                               "New textures of a draw uploaded together");
-            {
-                // Global, saved at once (a game's profile would not keep it).
-                bool gx = EmulatorSettings.IsBbGxPipelines();
-                const bool before = gx;
-                AddSettingCheckbox(
-                    "Pipelines from the engine's objects", gx,
-                    "Experimental, Bloodborne 1.09: a draw whose engine objects were seen before "
-                    "takes the pipeline they gave\nthen, instead of working it out from the GPU's "
-                    "registers (less command thread time a draw).\nEvery 256th is checked; on "
-                    "any difference it stops by itself. Needs a restart");
-                if (gx != before) {
-                    EmulatorSettings.SetBbGxPipelines(gx);
-                    EmulatorSettings.Save();
+            if (tr) {
+                AddSettingCheckbox("Show frames when ready", bbFlipWhenReadySetting,
+                                   "Smoother above 60 fps. Off: frames on vblank ticks");
+                risky("Real occlusion tests", bbRealOcclusionSetting,
+                      "More fps in busy areas",
+                      "Can make textures flicker white for a moment,\nfor example when coming "
+                      "round a corner.");
+                risky("Merged copy shaders", bbMergedCopiesSetting, "Less GPU copy work",
+                      "Can make particles flicker (seen with Intel 12th gen CPUs and newer;\n"
+                      "possibly fixed, not confirmed yet).");
+                if (advanced && bbMergedCopiesSetting) {
+                    AddSettingCheckbox("    Sources from buffer memory",
+                                       bbMergedNoStreamSourcesSetting,
+                                       "Flicker test: small copy sources not snapshotted from "
+                                       "game memory");
+                    AddSettingCheckbox("    Large batches", bbMergedLargeBatchesSetting,
+                                       "Flicker test: the old 64 MB batches instead of 64 KB");
                 }
             }
-            {
-                // Global, saved at once (a game's profile would not keep it).
-                bool finisher = EmulatorSettings.IsBbDrawFinisher();
-                const bool before = finisher;
-                AddSettingCheckbox(
-                    "Draw recorder on two threads", finisher,
-                    "Experimental, with the threaded renderer: the draw recorder's command "
-                    "recording runs on a thread of its own,\nnext to the part that finds "
-                    "textures, buffers and render targets. Applies at once");
-                if (finisher != before) {
-                    EmulatorSettings.SetBbDrawFinisher(finisher);
-                    EmulatorSettings.Save();
-                }
+            if (tr && advanced) {
+                AddSettingCheckbox("Faster Windows locks and sleeps", bbFastLocksSetting,
+                                   "Less CPU overhead (needs a restart)");
+                AddSettingCheckbox("Overlap GPU submissions", bbSubmitOverlapSetting,
+                                   "The next submission is decoded while the last is recorded");
+                AddSettingCheckbox("Overlap game and GPU frames", bbOverlapFramesSetting,
+                                   "The game starts its next frame while the last one finishes "
+                                   "(needs a restart)");
+                AddSettingCheckbox("Skip draws with no output", bbSkipEmptyDrawsSetting,
+                                   "Occlusion test geometry the emulator does not use");
+                AddSettingCheckbox("Reuse texture lookups", bbTextureSetMemoSetting,
+                                   "A draw's textures are found once, not every draw");
+                AddSettingCheckbox("Reuse static geometry", bbGeometryInPlaceSetting,
+                                   "Vertex and index data that never changes isn't copied for "
+                                   "every draw");
+                AddSettingCheckbox("Copy small geometry early", bbRingGeometrySetting,
+                                   "Small vertex and index data copied by the decoding thread");
+                AddSettingCheckbox("Constant copies without waiting", bbConstantsNoWaitSetting,
+                                   "The game's constant copies don't wait for queued draws");
+                AddSettingCheckbox("Occlusion results without waiting", bbOcclusionInOrderSetting,
+                                   "Occlusion results queued behind the draws instead of "
+                                   "waited for");
+                AddSettingCheckbox("Draw data copy thread", bbCopyThreadSetting,
+                                   "Draw memory copies on their own thread (needs a restart)");
+                AddSettingCheckbox("Keep rendering while presenting",
+                                   bbRenderDuringPresentSetting,
+                                   "Frame limiters like RTSS don't hold up rendering");
+                AddSettingCheckbox("Protect only changed pages", bbExactProtectionSetting,
+                                   "Less CPU time protecting game memory the GPU reads");
+                AddSettingCheckbox("Batched texture uploads", bbBatchedUploadsSetting,
+                                   "A draw's new textures are uploaded together");
+                AddSettingCheckbox("Fast pixel shader math", bbFastPixelMathSetting,
+                                   "The driver fuses multiply-adds; shaders rebuilt (needs a "
+                                   "restart)");
+                AddSettingCheckbox("GPU interpolation where safe",
+                                   bbHardwareInterpolationSetting,
+                                   "NVIDIA: less pixel shader code (needs a restart)");
             }
-            {
-                // Global, saved at once (a game's profile would not keep it).
-                bool async_submit = EmulatorSettings.IsBbAsyncSubmit();
-                const bool before = async_submit;
-                AddSettingCheckbox(
-                    "Submit on the recording thread", async_submit,
-                    "Experimental, with the threaded renderer: the frame's GPU work is handed to "
-                    "the recording thread to submit,\nso the draw recorder and the command thread "
-                    "don't wait for it to finish recording first. Applies at once");
-                if (async_submit != before) {
-                    EmulatorSettings.SetBbAsyncSubmit(async_submit);
-                    EmulatorSettings.Save();
-                }
+            if (tr && advanced) {
+                subheading("Experimental");
+                live(
+                    "Draw recorder on two threads", EmulatorSettings.IsBbDrawFinisher(),
+                    [](bool v) { EmulatorSettings.SetBbDrawFinisher(v); },
+                    "The draw recorder's command recording on a thread of its own");
+                live(
+                    "Submit on the recording thread", EmulatorSettings.IsBbAsyncSubmit(),
+                    [](bool v) { EmulatorSettings.SetBbAsyncSubmit(v); },
+                    "The GPU threads don't wait for recording to finish before submitting");
+                live(
+                    "Faster pipeline lookup (1.09)", EmulatorSettings.IsBbGxPipelines(),
+                    [](bool v) { EmulatorSettings.SetBbGxPipelines(v); },
+                    "Pipelines taken from the engine's objects; stops by itself on any "
+                    "difference (needs a restart)");
+                const bool off_core0 = live(
+                    "Keep render threads off core 0", EmulatorSettings.IsBbRenderThreadsOffCore0(),
+                    [](bool v) { EmulatorSettings.SetBbRenderThreadsOffCore0(v); },
+                    "Windows: the render threads avoid the core that handles most interrupts");
+                Common::RenderAffinity::Set(off_core0);
             }
 
+            // ---------------------------------------------------------------------------------
+            AddSettingSection("Stutters",
+                              "Hitches when new areas, objects and textures load.", false);
+            if (tr) {
+                risky("Background shader compiles", bbBackgroundPipelinesSetting,
+                      "No stutter when a new object needs a shader",
+                      "New objects can appear a frame late (a brief pop-in).");
+                AddSettingCheckbox("Background copies", bbBackgroundTextureCopiesSetting,
+                                   "New textures and geometry are copied on other threads");
+                AddSettingCombo(
+                    "    Copy threads", bbCopyThreadsSetting,
+                    {fmt::format("Auto ({})", Common::CopyPool::AutoWorkers()), "4", "6", "8"});
+                if (ImGui::IsItemHovered()) {
+                    ShowTooltip("Threads for background copies and large uploads when an area "
+                                "streams in: more copy faster but compete with the game's "
+                                "threads. Auto: half the CPU's threads, at most 8 (needs a "
+                                "restart)");
+                }
+                if (bbBackgroundTextureCopiesSetting) {
+                    AddSettingCheckbox("    Protect on a helper thread",
+                                       bbProtectHelperThreadSetting,
+                                       "New textures' and geometry's memory protected off the "
+                                       "draw recorder");
+                }
+                risky("Spread area loading", bbSpreadLoadsSetting,
+                      "Area loads upload textures over a few frames",
+                      "New textures can show black for a few frames while an area loads.");
+                risky("Lower detail first", bbLowerDetailFirstSetting,
+                      "A new texture's sharpest level arrives a few frames later",
+                      "New textures can look soft (blurry) for a few frames.");
+            }
+            if (tr && advanced) {
+                AddSettingCheckbox("Streaming optimisations", bbStreamingSetting,
+                                   "Smaller hitches entering new areas");
+                AddSettingCheckbox("GPU readbacks on the copy queue", bbReadbackQueueSetting,
+                                   "Fewer small stutters (needs a restart)");
+                if (bbReadbackQueueSetting) {
+                    AddSettingCheckbox("    Early GPU data write-back", bbEarlyWritebackSetting,
+                                       "GPU data the game writes over is copied back before it "
+                                       "waits");
+                }
+                AddSettingCheckbox("Direct texture copies", bbDirectTextureCopiesSetting,
+                                   "Texture data read straight from game memory");
+                AddSettingCheckbox("Cached texture staging", bbCachedTextureStagingSetting,
+                                   "Texture uploads staged in cached memory (faster copies)");
+                AddSettingCheckbox("Copy only kept texture levels", bbSkipLeftOutLevelsSetting,
+                                   "Texture quality High/Medium: less data copied per upload");
+                AddSettingCheckbox("Clear shader-written images", bbClearShaderWrittenSetting,
+                                   "New images a compute shader fully overwrites are cleared, "
+                                   "not uploaded");
+                AddSettingCheckbox("Keep preparing draws during area loads",
+                                   bbCeSkipHugeWritesSetting,
+                                   "The GPU thread doesn't wait for the draw recorder in area "
+                                   "loads");
+                AddSettingCheckbox("Small GPU copies on the CPU", bbCpuCopyShaderSetting,
+                                   "The game doesn't wait for the GPU for its small copies");
+                if (bbCpuCopyShaderSetting) {
+                    AddSettingCheckbox("    Skip copies that change nothing",
+                                       bbCopySkipSameSetting, "Fewer buffer uploads");
+                }
+                subheading("Experimental");
+                live(
+                    "Stage uploads in VRAM", EmulatorSettings.IsBbVramUploadStaging(),
+                    [](bool v) { EmulatorSettings.SetBbVramUploadStaging(v); },
+                    "Resizable BAR: new data copied straight into a fixed 128 MB of VRAM");
+            }
+
+            // ---------------------------------------------------------------------------------
+            AddSettingSection("Graphics", "Picture quality.", false);
+            DrawBbImageSettings();
+            if (tr && advanced) {
+                AddSettingCheckbox("Fix light wedges in lamp shadows", bbClearOneLayerSetting,
+                                   "Clears each shadow cube face before it's drawn");
+            }
+
+            // ---------------------------------------------------------------------------------
             AddSettingSection(
                 "VRAM", "Graphics card memory in long sessions and with texture mods.", false);
             AddSettingCheckbox("VRAM cleanup", bbVramReclaimSetting,
@@ -1191,6 +1310,15 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox(
                     "    Also free idle buffers", bbBufferEvictionSetting,
                     "Buffer memory unused for 30 s near the limit (needs a restart)");
+                if (tr && advanced && bbBufferEvictionSetting) {
+                    AddSettingCheckbox("        Cheaper buffer refill",
+                                       bbEvictKeepProtectionSetting,
+                                       "Freed buffers come back without protecting their "
+                                       "memory again");
+                    AddSettingCheckbox("        Keep returning buffers",
+                                       bbEvictKeepReturningSetting,
+                                       "Loading screens free buffers the game keeps using last");
+                }
                 AddSettingCheckbox("    Clean up at loading screens", bbLoadScreenCleanupSetting,
                                    "Frees what the last area used; the next one loads its own");
                 AddSettingCheckbox("    Use more VRAM", bbMoreVramSetting,
@@ -1201,11 +1329,19 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                        "(needs a restart)");
                 }
             }
+            if (advanced) {
+                // Testing the VRAM cleanup: act as if the GPU had this much VRAM (0 = real).
+                AddSettingSliderInt("VRAM budget override (MB, 0 = real)", bbVramBudgetTestSetting,
+                                    0, 24000);
+            }
+
+            // ---------------------------------------------------------------------------------
             AddSettingSection("Interface", "The emulator's in-game windows (F1, F3, pop-ups).",
                               false);
             AddSettingCheckbox("Menus sized by screen pixels", bbIgnoreDisplayScaleSetting,
                                "Ignores Windows display scaling (125%, 150%), as games do");
 
+            // ---------------------------------------------------------------------------------
             AddSettingSection("Diagnostics", "For troubleshooting. Slower when on: leave off.",
                               false);
             AddSettingCheckbox("Diagnostics in the log", threadedRendererDiagnosticsSetting,
@@ -1215,51 +1351,56 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             // Times every draw: heavy on the CPU.
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.2f, 1.0f), "(costs fps)");
-            {
-                // Global settings, saved at once (a game's profile would not keep them).
-                const auto live = [&](const char* name, bool value, auto set, const char* tip) {
-                    bool shown = value;
-                    AddSettingCheckbox(name, shown, tip);
-                    if (shown != value) {
-                        set(shown);
-                        EmulatorSettings.Save();
-                    }
-                };
-                live(
-                    "Performance meter", EmulatorSettings.IsBbPerfMeter(),
-                    [](bool v) { EmulatorSettings.SetBbPerfMeter(v); },
-                    "Under the FPS counter: which stage holds the frame rate (the GPU, the "
-                    "command thread that\ndecodes the game's GPU commands, the draw recorder, or "
-                    "the game itself) and each one's time a\nframe; a summary in the log every 20 "
-                    "seconds. With the threaded renderer");
-                live(
-                    "Recorder split census", EmulatorSettings.IsBbRecorderCensus(),
-                    [](bool v) { EmulatorSettings.SetBbRecorderCensus(v); },
-                    "Developer map for splitting the draw recorder: which calls into the caches "
-                    "and which recorded\ncommands each half of a draw would make, in the log "
-                    "every 20 s. Costs a little CPU");
-                live(
-                    "Check GX draw capture", EmulatorSettings.IsBbGxObserve(),
-                    [](bool v) { EmulatorSettings.SetBbGxObserve(v); },
-                    "Developer check for building draws from the engine (Bloodborne 1.09): the "
-                    "game's draw calls\nare hooked and what they bind is compared with what the "
-                    "command thread decodes. Changes\nnothing drawn; results in the log every 10 "
-                    "s. Costs some CPU. Needs a restart");
-            }
+            live(
+                "Performance meter", EmulatorSettings.IsBbPerfMeter(),
+                [](bool v) { EmulatorSettings.SetBbPerfMeter(v); },
+                "Under the FPS counter: which stage holds the frame rate; a log summary every "
+                "20 s");
             if (advanced) {
                 AddSettingCheckbox("GPU time per pass in the log",
                                    threadedRendererGpuProfileSetting,
                                    "Which render passes take the GPU's time");
-                // Testing the VRAM cleanup: act as if the GPU had this much VRAM (0 = real).
-                AddSettingSliderInt("VRAM budget override (MB, 0 = real)", bbVramBudgetTestSetting,
-                                    0, 24000);
-                AddSettingCheckbox("RenderDoc captures (F12)", renderdocSetting,
-                                   "Loads an installed RenderDoc (needs a restart)");
-                AddSettingSliderInt("Frames per RenderDoc capture", bbRdocCaptureFramesSetting, 1,
-                                    120);
+                live(
+                    "Recorder split census", EmulatorSettings.IsBbRecorderCensus(),
+                    [](bool v) { EmulatorSettings.SetBbRecorderCensus(v); },
+                    "Developer: what each half of the draw recorder does, in the log every 20 s");
+                live(
+                    "Check GX draw capture", EmulatorSettings.IsBbGxObserve(),
+                    [](bool v) { EmulatorSettings.SetBbGxObserve(v); },
+                    "Developer (1.09): the engine's draws compared with the decoded ones "
+                    "(needs a restart)");
             }
+            // RenderDoc captures (F12) and frames per capture: hidden for now (the settings stay
+            // in the config).
 
             ImGui::EndTable();
+        }
+        // Turning on a setting that can cause visual artefacts: asked first.
+        if (bbRiskOpenRequest) {
+            bbRiskOpenRequest = false;
+            ImGui::OpenPopup("Possible visual artefacts##bb_risk");
+        }
+        if (ImGui::BeginPopupModal("Possible visual artefacts##bb_risk", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f), "%s", bbRiskName.c_str());
+            ImGui::Spacing();
+            ImGui::TextUnformatted(bbRiskText.c_str());
+            ImGui::Spacing();
+            ImGui::TextDisabled("If you see this, turn the setting off again.");
+            ImGui::Spacing();
+            if (ImGui::Button("Turn on")) {
+                if (bbRiskTarget) {
+                    *bbRiskTarget = true;
+                }
+                bbRiskTarget = nullptr;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                bbRiskTarget = nullptr;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
     } else if (category == SettingsCategory::Input) {
         if (ImGui::BeginTable("SettingsTable", 2)) {
@@ -1446,15 +1587,65 @@ void SettingsWindow::DrawBbImageSettings() {
         [&file](bool v) { file.Set("motion_blur", v ? "1" : "0"); }, "Off: sharper in motion");
 }
 
+// A setting's name. Leading spaces (4 a level) make it a sub-setting of the row above: indented,
+// a little dimmer, with a connector line from its parent so it reads as part of it.
+// A sub-setting's indent (leading spaces, 4 a level): its name and its control both move in.
+static float SubSettingIndent(const std::string& name) {
+    size_t spaces = 0;
+    while (spaces < name.size() && name[spaces] == ' ') {
+        ++spaces;
+    }
+    return ImGui::GetFontSize() * 1.25f * static_cast<float>(spaces / 4);
+}
+
+void SettingsWindow::DrawSettingName(const std::string& name) {
+    size_t spaces = 0;
+    while (spaces < name.size() && name[spaces] == ' ') {
+        ++spaces;
+    }
+    const int level = static_cast<int>(spaces / 4);
+    if (level == 0) {
+        ImGui::TextWrapped("%s", name.c_str());
+        return;
+    }
+    const float step = ImGui::GetFontSize() * 1.25f;
+    const float line_height = ImGui::GetTextLineHeight();
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImU32 colour = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    const float thickness = std::max(1.0f, ImGui::GetFontSize() / 12.0f);
+    const float x = pos.x + step * static_cast<float>(level - 1) + step * 0.4f;
+    const float y_mid = pos.y + line_height * 0.5f;
+    auto* draw_list = ImGui::GetWindowDrawList();
+    // From the row above down to this one's middle, then across to its name.
+    draw_list->AddLine(ImVec2(x, pos.y - line_height * 0.45f), ImVec2(x, y_mid), colour,
+                       thickness);
+    draw_list->AddLine(ImVec2(x, y_mid), ImVec2(x + step * 0.45f, y_mid), colour, thickness);
+    ImVec4 text = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    text.w *= 0.8f;
+    const float indent = step * static_cast<float>(level);
+    ImGui::Indent(indent);
+    ImGui::PushStyleColor(ImGuiCol_Text, text);
+    ImGui::TextWrapped("%s", name.c_str() + spaces);
+    ImGui::PopStyleColor();
+    ImGui::Unindent(indent);
+}
+
 void SettingsWindow::AddSettingCheckbox(std::string name, bool& value) {
     std::string label = "##" + name;
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
 
-    ImGui::TextWrapped("%s", name.c_str());
+    DrawSettingName(name);
     ImGui::TableNextColumn();
+    const float indent = SubSettingIndent(name);
+    if (indent > 0.0f) {
+        ImGui::Indent(indent);
+    }
     ImGui::Checkbox(label.c_str(), &value);
     NoteRowFocus();
+    if (indent > 0.0f) {
+        ImGui::Unindent(indent);
+    }
 }
 
 // "(needs a restart)" in a hint or tooltip stands out in amber, without the brackets.
@@ -1519,7 +1710,7 @@ void SettingsWindow::AddSettingSliderInt(std::string name, int& value, int min, 
     std::string label = "##" + name;
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
-    ImGui::TextWrapped("%s", name.c_str());
+    DrawSettingName(name);
 
     ImGui::TableNextColumn();
     ImGui::SliderInt(label.c_str(), &value, min, max);
@@ -1533,7 +1724,7 @@ void SettingsWindow::AddSettingSliderFloat(std::string name, float& value, int m
 
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
-    ImGui::TextWrapped("%s", name.c_str());
+    DrawSettingName(name);
 
     ImGui::TableNextColumn();
     ImGui::SliderFloat(label.c_str(), &value, min, max, precisionString.c_str());
@@ -1545,11 +1736,18 @@ void SettingsWindow::AddSettingCombo(std::string name, int& value,
     std::string label = "##" + name;
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
-    ImGui::TextWrapped("%s", name.c_str());
+    DrawSettingName(name);
 
     ImGui::TableNextColumn();
+    const float indent = SubSettingIndent(name);
+    if (indent > 0.0f) {
+        ImGui::Indent(indent);
+    }
     const char* combo_value = options[value].c_str();
     const bool combo_open = ImGui::BeginCombo(label.c_str(), combo_value);
+    if (indent > 0.0f) {
+        ImGui::Unindent(indent);
+    }
     if (!combo_open) {
         NoteRowFocus();
     }

@@ -250,9 +250,11 @@ private:
     const Buffer* GetArena(u64 first_block, u64 last_block);
     /// Uploads guest ranges (BufferCopy: srcOffset = offset in the upload, dstOffset = guest
     /// address, size) into the arena; copies on the copy threads when large.
+    /// protect_ticket: protection on a helper thread (PageManager::QueueProtection) the copies
+    /// wait for before they read guest memory; 0 when the pages are protected already.
     void UploadRanges(const Buffer* arena,
                       boost::container::small_vector<vk::BufferCopy, 4>& copies,
-                      size_t total_size_bytes);
+                      size_t total_size_bytes, u64 protect_ticket = 0);
     /// GetArena, timed for stutter reports.
     const Buffer* TimedArena(u64 first_block, u64 last_block);
 

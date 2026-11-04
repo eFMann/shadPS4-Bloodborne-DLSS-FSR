@@ -1151,8 +1151,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     if (trim >= size) {
         trim = 0;
     }
-    const auto staging =
-        staging_pool.Request(size - trim, staging_type, instance.StorageMinAlignment());
+    // Stage uploads in VRAM (setting): streaming-size textures copied straight into graphics card
+    // memory, so the GPU's copy into the image doesn't cross PCIe.
+    const auto staging = [&] {
+        if (size - trim >= BackgroundCopyMin) {
+            if (const auto vram = staging_pool.RequestVram(size - trim,
+                                                           instance.StorageMinAlignment())) {
+                return *vram;
+            }
+        }
+        return staging_pool.Request(size - trim, staging_type, instance.StorageMinAlignment());
+    }();
     const u64 staging_end = trim + staging.size;
     // Left-out levels: the staging memory keeps the image's layout, their bytes are just not
     // filled (nothing copies them into the image).
@@ -2041,10 +2050,34 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     size_t total_size_bytes{};
     std::optional<Common::GuestStats::DetailTimer> timer{std::in_place,
                                                          Common::GuestStats::Detail::BufTrack};
-    memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
-        copies.emplace_back(total_size_bytes, addr, size);
-        total_size_bytes += size;
-    });
+    // Protection on a helper thread (with background copies): the pages of data uploaded now
+    // are watched for writes again by the helper thread instead of here (2.5-5 ms of the draw
+    // recorder's time in a traversal stutter, 14 ms entering an area). The copies wait for it
+    // before reading guest memory, so a write before the protection is in what they copy and a
+    // write after it faults as usual.
+    ProtectRanges deferred;
+    {
+        std::optional<DeferRegionProtection> defer;
+        if (Common::BbTuning::Threaded() && EmulatorSettings.IsBbProtectHelperThread() &&
+            EmulatorSettings.IsBbBackgroundTextureCopies()) {
+            defer.emplace(&deferred);
+        }
+        memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
+            copies.emplace_back(total_size_bytes, addr, size);
+            total_size_bytes += size;
+        });
+    }
+    u64 protect_ticket = 0;
+    if (!deferred.empty()) {
+        if (!copies.empty() && total_size_bytes >= BackgroundBufferCopyMin) {
+            protect_ticket = page_manager.QueueProtection(std::move(deferred));
+        } else {
+            // Small: protected here, as before (a helper round trip costs more).
+            for (const auto& [address, length] : deferred) {
+                page_manager.ApplyProtection(address, length);
+            }
+        }
+    }
     if (copies.empty()) {
         timer.reset();
     } else {
@@ -2054,7 +2087,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         namespace GSU = Common::GuestStats;
         GSU::buffer_syncs.fetch_add(1, std::memory_order_relaxed);
         GSU::buffer_sync_ranges.fetch_add(copies.size(), std::memory_order_relaxed);
-        UploadRanges(arena, copies, total_size_bytes);
+        UploadRanges(arena, copies, total_size_bytes, protect_ticket);
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeMemoryFromImage(arena, device_addr, size);
@@ -2064,17 +2097,30 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 
 void BufferCache::UploadRanges(const Buffer* arena,
                                boost::container::small_vector<vk::BufferCopy, 4>& copies,
-                               size_t total_size_bytes) {
+                               size_t total_size_bytes, u64 protect_ticket) {
     {
         namespace GSU = Common::GuestStats;
         const auto start = std::chrono::steady_clock::now();
-        const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        // Stage uploads in VRAM (setting): streaming-size uploads (new geometry) copied straight
+        // into graphics card memory; small everyday ones stay in system RAM.
+        const auto staging = [&] {
+            if (total_size_bytes >= BackgroundBufferCopyMin) {
+                if (const auto vram = staging_pool.RequestVram(total_size_bytes)) {
+                    return *vram;
+                }
+            }
+            return staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        }();
         bool background = false;
         const bool copy_threads = total_size_bytes >= BackgroundBufferCopyMin &&
                                   Common::BbTuning::Threaded() &&
                                   EmulatorSettings.IsBbBackgroundTextureCopies();
         if (!copy_threads) {
             GSU::buffer_sync_inline_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+            // Copied here: the helper thread's protection first.
+            if (protect_ticket != 0) {
+                page_manager.WaitProtection(protect_ticket);
+            }
         }
         if (copy_threads) {
             // Streaming a new area uploads 100+ MiB of vertex and index data in one frame, in a
@@ -2090,7 +2136,11 @@ void BufferCache::UploadRanges(const Buffer* arena,
                     Common::CopyPool::Async([memory = memory, source = copy.dstOffset + offset,
                                              destination = staging.mapped + staged, length,
                                              buffer = staging.buffer,
-                                             flush = staging.offset + staged] {
+                                             flush = staging.offset + staged, protect_ticket,
+                                             tracker = &page_manager] {
+                        if (protect_ticket != 0) {
+                            tracker->WaitProtection(protect_ticket);
+                        }
                         memory->CopySparseMemory(source, destination, length);
                         buffer->Flush(flush, length);
                     });

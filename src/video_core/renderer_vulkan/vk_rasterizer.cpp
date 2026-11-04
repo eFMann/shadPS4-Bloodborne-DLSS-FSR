@@ -17,6 +17,7 @@
 #include "common/guest_stats.h"
 #include "common/hash.h"
 #include "common/rdtsc.h"
+#include "common/render_affinity.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/bb_frame_rate.h"
@@ -86,6 +87,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         LOG_INFO(Render_Vulkan, "Copy threads: {} (setting {})", workers,
                  copy_threads > 0 ? std::to_string(copy_threads) : std::string{"auto"});
     }
+    // Picked up by each render thread at the top of its loop.
+    Common::RenderAffinity::Set(EmulatorSettings.IsBbRenderThreadsOffCore0());
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -1514,6 +1517,7 @@ void Rasterizer::RunFinisher() {
     const u32 threads = std::thread::hardware_concurrency();
     const auto spin_time = std::chrono::microseconds(threads >= 12 ? 200 : 50);
     while (true) {
+        Common::RenderAffinity::Apply();
         const u64 at = fin_done.load(std::memory_order_relaxed); // this thread's
         u64 available = fin_published.load(std::memory_order_acquire);
         if (available == at) {

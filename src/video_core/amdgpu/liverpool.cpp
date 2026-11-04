@@ -17,6 +17,7 @@
 #include "common/debug.h"
 #include "common/guest_stats.h"
 #include "common/polyfill_thread.h"
+#include "common/render_affinity.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/bb_gx_draws.h"
@@ -363,6 +364,7 @@ void Liverpool::Process(std::stop_token stoken) {
         Common::GuestStats::cmd_state.store(static_cast<u8>(state), std::memory_order_relaxed);
     };
     while (!stoken.stop_requested()) {
+        Common::RenderAffinity::Apply();
         {
             set_state(CmdState::Idle);
             const bool idle_timed = CmdFrameTiming::On();

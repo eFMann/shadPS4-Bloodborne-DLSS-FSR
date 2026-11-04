@@ -904,6 +904,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/frame_pacing.h
            src/common/copy_pool.cpp
            src/common/copy_pool.h
+           src/common/render_affinity.cpp
+           src/common/render_affinity.h
            src/common/types.h
            src/common/uint128.h
            src/common/unique_function.h

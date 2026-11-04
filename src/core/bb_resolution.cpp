@@ -485,7 +485,7 @@ void RestartGame() {
     // Its own thread: the relaunch waits for the GPU thread to release DLSS, which may in turn
     // wait for the thread that draws F1.
     std::thread([] {
-        LOG_INFO(Loader, "Resolution: restarting the game to apply it");
+        LOG_INFO(Loader, "Restarting the game to apply settings");
         auto* mnt = Common::Singleton<FileSys::MntPoints>::Instance();
         std::filesystem::path eboot = mnt->GetHostPath("/app0/eboot.bin");
         if (auto file = mnt->Open("/app0/eboot.bin", false))

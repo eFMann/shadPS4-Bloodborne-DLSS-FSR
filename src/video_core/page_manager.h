@@ -30,6 +30,22 @@ enum class PageOp : s8 {
     Untrack = -1,
 };
 
+/// Protection on a helper thread for buffer uploads: while one is alive on a thread, the write
+/// tracking UpdatePageWatchersForRegion starts there (pages watched for writes again after their
+/// data is uploaded, nothing else changing) only changes the page states; the protection calls'
+/// ranges go to `sink` for the caller to queue (PageManager::QueueProtection) and its copies to
+/// wait for before they read the memory.
+class DeferRegionProtection {
+public:
+    explicit DeferRegionProtection(ProtectRanges* sink);
+    ~DeferRegionProtection();
+    DeferRegionProtection(const DeferRegionProtection&) = delete;
+    DeferRegionProtection& operator=(const DeferRegionProtection&) = delete;
+
+private:
+    ProtectRanges* previous;
+};
+
 class PageManager {
     static constexpr size_t PM_PAGE_BITS = 12;
     static constexpr size_t PM_PAGE_SIZE = 1ULL << PM_PAGE_BITS;

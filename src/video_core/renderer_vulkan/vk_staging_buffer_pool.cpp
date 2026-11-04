@@ -13,6 +13,7 @@
 #include "common/bb_tuning.h"
 #include "common/elf_info.h"
 #include "common/guest_stats.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
 #include "core/emulator_settings.h"
@@ -51,6 +52,14 @@ constexpr u64 BLOCK_SIZE = 16_MB;
 // released in a session): the floor stays.
 constexpr u64 RELEASE_IDLE_FRAMES = 180;
 constexpr size_t RELEASE_FLOOR_BLOCKS = 12;
+// Stage uploads in VRAM: 8 blocks, 128 MiB. A traversal burst stages 50-160 MiB, and blocks free
+// again within a frame or two once the GPU has copied out of them; entering a big area (300+ MiB)
+// overflows to system RAM. After a release under VRAM pressure: ~10 s without.
+constexpr size_t VRAM_RING_BLOCKS = 8;
+constexpr u64 VRAM_PAUSE_FRAMES = 600;
+// Resizable BAR / Smart Access Memory: the CPU-visible part of VRAM covers (nearly) all of it,
+// not the classic 256 MiB window the driver and the draw data may need.
+constexpr u64 REBAR_MIN_VISIBLE = 1024_MB;
 
 void CountDeviceLocalAllocation(MemoryType type, u64 bytes) {
     if (type != MemoryType::DeviceLocal) {
@@ -70,6 +79,24 @@ u64 RoundAllocationSize(u64 size) {
 
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_} {
+    {
+        // Stage uploads in VRAM: only with Resizable BAR on a dedicated card (an integrated
+        // GPU's "VRAM" is system RAM: nothing to save).
+        const auto props = instance.GetPhysicalDevice().getMemoryProperties();
+        constexpr auto bar_flags =
+            vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible;
+        u64 visible = 0;
+        for (u32 i = 0; i < props.memoryTypeCount; ++i) {
+            if ((props.memoryTypes[i].propertyFlags & bar_flags) == bar_flags) {
+                visible = std::max<u64>(visible,
+                                        props.memoryHeaps[props.memoryTypes[i].heapIndex].size);
+            }
+        }
+        vram_capable = !instance.IsIntegrated() && visible > REBAR_MIN_VISIBLE;
+        LOG_INFO(Render_Vulkan, "Stage uploads in VRAM: {} ({} MiB CPU-visible VRAM{})",
+                 vram_capable ? "possible" : "not possible", visible >> 20,
+                 instance.IsIntegrated() ? ", integrated GPU" : "");
+    }
     // Bloodborne threaded renderer with streaming optimisations only.
     if (!Common::BbTuning::IsBloodborne(Common::ElfInfo::Instance().GameSerial()) ||
         !EmulatorSettings.IsThreadedRenderer() || !EmulatorSettings.IsBbStreaming()) {
@@ -216,6 +243,79 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     return ref;
 }
 
+std::optional<StagingBufferRef> StagingBufferPool::RequestVram(u64 size, u64 alignment) {
+    if (!vram_capable || size > BLOCK_SIZE || frame < vram_paused_until_frame ||
+        !EmulatorSettings.IsBbVramUploadStaging()) {
+        return std::nullopt;
+    }
+    Ring& ring = vram_ring;
+    Block* found{};
+    u64 offset{};
+    for (size_t i = 0; i < ring.blocks.size(); ++i) {
+        const size_t index = (ring.current + i) % ring.blocks.size();
+        Block* block = &ring.blocks[index];
+        if (const auto reserved = block->buffer->Reserve(size, alignment, false)) {
+            ring.current = index;
+            found = block;
+            offset = *reserved;
+            break;
+        }
+    }
+    if (!found) {
+        if (ring.blocks.size() >= VRAM_RING_BLOCKS) {
+            // Full of uploads the GPU hasn't copied out yet: system RAM, as before.
+            ++vram_fallbacks;
+            return std::nullopt;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        auto buffer =
+            std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, MemoryType::Stream,
+                                                      BLOCK_SIZE);
+        if (buffer->mapped_data.empty()) {
+            ++vram_fallbacks;
+            return std::nullopt;
+        }
+        found = &ring.blocks.emplace_back(Block{
+            .buffer = std::move(buffer),
+            .last_used_frame = frame,
+        });
+        CountAllocation(BLOCK_SIZE, start);
+        ring.current = ring.blocks.size() - 1;
+        const auto reserved = found->buffer->Reserve(size, alignment, false);
+        if (!reserved) {
+            ++vram_fallbacks;
+            return std::nullopt;
+        }
+        offset = *reserved;
+    }
+    found->last_used_frame = frame;
+    vram_uploads += size;
+    return StagingBufferRef{
+        .buffer = found->buffer.get(),
+        .offset = offset,
+        .size = size,
+        .mapped = found->buffer->mapped_data.data() + offset,
+        .type = MemoryType::Stream,
+    };
+}
+
+void StagingBufferPool::ReleaseVramRing(bool only_idle, ReleasedMemory* released) {
+    auto& blocks = vram_ring.blocks;
+    for (size_t i = blocks.size(); i-- > 0;) {
+        const Block& block = blocks[i];
+        if (!scheduler.IsFree(block.buffer->LastTick()) ||
+            (only_idle && frame - block.last_used_frame < RELEASE_IDLE_FRAMES)) {
+            continue;
+        }
+        if (released) {
+            released->bytes += block.buffer->SizeBytes();
+            ++released->ring_blocks;
+        }
+        blocks.erase(blocks.begin() + i);
+    }
+    vram_ring.current = 0;
+}
+
 void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
     auto& cache = large_caches[u32(ref.type)];
     const auto it = std::ranges::find_if(
@@ -253,6 +353,26 @@ void StagingBufferPool::TickFrame() {
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);
+    }
+    // Stage uploads in VRAM turned off: its blocks go once the GPU is done with them.
+    if (!vram_ring.blocks.empty() && !EmulatorSettings.IsBbVramUploadStaging()) {
+        const size_t before = vram_ring.blocks.size();
+        ReleaseVramRing(false, nullptr);
+        if (vram_ring.blocks.size() != before) {
+            LOG_INFO(Render_Vulkan, "Stage uploads in VRAM: off, released {} MiB",
+                     (before - vram_ring.blocks.size()) * (BLOCK_SIZE >> 20));
+        }
+    }
+    if ((vram_uploads != 0 || vram_fallbacks != 0) &&
+        std::chrono::steady_clock::now() - vram_log_time >= std::chrono::seconds(10)) {
+        vram_log_time = std::chrono::steady_clock::now();
+        LOG_INFO(Render_Vulkan,
+                 "Stage uploads in VRAM (10 s): {:.1f} MiB staged in VRAM, {} uploads to system "
+                 "RAM (area full), {} MiB held",
+                 static_cast<double>(vram_uploads) / 1048576.0, vram_fallbacks,
+                 vram_ring.blocks.size() * (BLOCK_SIZE >> 20));
+        vram_uploads = 0;
+        vram_fallbacks = 0;
     }
     PublishStats();
 }
@@ -293,11 +413,22 @@ StagingBufferPool::ReleasedMemory StagingBufferPool::ReleaseIdleDeviceLocal(bool
         ++released.large_buffers;
         return true;
     });
+    // Stage uploads in VRAM: under pressure its blocks go too, and it stays off for a while
+    // (system RAM meanwhile) so the next burst doesn't take the memory straight back.
+    if (!vram_ring.blocks.empty()) {
+        const u64 before = released.bytes;
+        ReleaseVramRing(!emergency, &released);
+        if (released.bytes != before) {
+            vram_paused_until_frame = frame + VRAM_PAUSE_FRAMES;
+            LOG_INFO(Render_Vulkan, "Stage uploads in VRAM: released {} MiB (VRAM {}), paused",
+                     (released.bytes - before) >> 20, emergency ? "full" : "under pressure");
+        }
+    }
     return released;
 }
 
 u64 StagingBufferPool::DeviceLocalBytes() const {
-    u64 bytes = 0;
+    u64 bytes = vram_ring.blocks.size() * BLOCK_SIZE;
     for (const Block& block : rings[u32(MemoryType::DeviceLocal)].blocks) {
         bytes += block.buffer->SizeBytes();
     }

@@ -55,6 +55,8 @@ private:
     void AddCategory(std::string name, std::variant<SDL_Texture*, ImGui::RefCountedTexture> texture,
                      SettingsCategory category, float center_x, float max_text_width);
 
+    /// A setting's name; leading spaces (4 a level) draw it as a sub-setting of the row above.
+    void DrawSettingName(const std::string& name);
     void AddSettingCheckbox(std::string name, bool& value);
     /// A checkbox with a short grey hint beside it (seen without hovering, also on a pad).
     void AddSettingCheckbox(std::string name, bool& value, const char* hint);
@@ -84,6 +86,16 @@ private:
         rowFocused |= ImGui::IsItemFocused();
     }
     int openedFrame = 0; ///< ImGui frame the window was opened on (Prepare)
+    /// Bloodborne tab: a setting that can cause visual artefacts waiting for "Turn on".
+    bool* bbRiskTarget = nullptr;
+    std::string bbRiskName;
+    std::string bbRiskText;
+    bool bbRiskOpenRequest = false;
+    /// Restart prompt: settings that apply at a start, as the game started (LoadSettings) and
+    /// those changed at the last save.
+    std::vector<std::pair<const char*, int>> RestartValues() const;
+    std::vector<std::string> restartChanged;
+    bool restartPromptRequest = false;
     int deleteProfileIndex = -1;
 
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> profilesTexture;

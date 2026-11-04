@@ -53,7 +53,8 @@ const std::vector<std::string>& SkippedPatches();
 void Install();
 // What this launch applied (enabled is false when F1 doesn't set the resolution).
 const Choice& Applied();
-// Relaunches the game straight away (back to the last autosave), so a new resolution applies.
+// Relaunches the game straight away (back to the last autosave), so settings that apply at a
+// start take effect (F1's resolution, F3's restart prompt).
 void RestartGame();
 // Set by RestartGame: the exit that follows ends the process at once (emulator.cpp).
 inline bool restarting = false;

@@ -727,6 +727,7 @@ struct VulkanSettings {
     // Protection on a helper thread: a new texture's memory protection (noticing the game's
     // writes) is done by one helper thread instead of the draw recorder (~6-9 ms of a traversal
     // burst); the texture's background copies wait for it. Needs background texture copies.
+    // New geometry's (buffer uploads') protection too (2.5-5 ms of a traversal stutter).
     Setting<bool> bb_protect_helper_thread{true};
     // Copy shader on the CPU: the game's GPU copy shader (thousands of small copies a second)
     // is done in game memory when neither side holds data only the GPU has. Its destination
@@ -822,6 +823,16 @@ struct VulkanSettings {
     // once): the frame's and the guest submissions' command buffers are ended and submitted by
     // the recording thread, so the GPU threads don't wait for it to catch up. Global only.
     Setting<bool> bb_async_submit{false};
+    // Stage uploads in VRAM (F3, Performance; Resizable BAR / Smart Access Memory on a
+    // dedicated graphics card, applies at once): streaming uploads are copied by the copy threads
+    // straight into a fixed 128 MiB area of graphics card memory instead of system RAM, so the GPU
+    // doesn't pull them across PCIe afterwards (10-25 ms in the frame after a traversal stutter).
+    // Global only.
+    Setting<bool> bb_vram_upload_staging{false};
+    // Keep render threads off core 0 (F3, Performance; Windows, applies at once): the command
+    // thread, draw recorder and finisher and the recording thread avoid the first physical core,
+    // where Windows serves most interrupts. Global only.
+    Setting<bool> bb_render_threads_off_core0{false};
     Setting<int> bb_counter_corner{0};
     // With an FPS cap ("Show frames when ready"): frames are shown one cap period apart, an early
     // one held until its turn, instead of each as soon as it is ready. Global only.
@@ -888,7 +899,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_f1_scale, bb_f1_pos_x, bb_f1_pos_y,
     bb_counter_fps, bb_counter_ms, bb_counter_upscaler, bb_counter_preset, bb_counter_mode,
     bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_perf_meter, bb_gx_observe,
-    bb_gx_pipelines, bb_recorder_census, bb_draw_finisher, bb_async_submit, bb_even_capped_flips, bb_merged_no_stream_sources,
+    bb_gx_pipelines, bb_recorder_census, bb_draw_finisher, bb_async_submit, bb_vram_upload_staging,
+    bb_render_threads_off_core0, bb_even_capped_flips, bb_merged_no_stream_sources,
     bb_merged_large_batches)
 
 // -------------------------------
@@ -1268,6 +1280,8 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, BbRecorderCensus, bb_recorder_census)
     SETTING_FORWARD_BOOL(m_vulkan, BbDrawFinisher, bb_draw_finisher)
     SETTING_FORWARD_BOOL(m_vulkan, BbAsyncSubmit, bb_async_submit)
+    SETTING_FORWARD_BOOL(m_vulkan, BbVramUploadStaging, bb_vram_upload_staging)
+    SETTING_FORWARD_BOOL(m_vulkan, BbRenderThreadsOffCore0, bb_render_threads_off_core0)
     SETTING_FORWARD(m_vulkan, BbCounterCorner, bb_counter_corner)
     SETTING_FORWARD_BOOL(m_vulkan, BbEvenCappedFlips, bb_even_capped_flips)
     SETTING_FORWARD_BOOL(m_vulkan, BbMergedNoStreamSources, bb_merged_no_stream_sources)

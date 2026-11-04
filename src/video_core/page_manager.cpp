@@ -44,6 +44,18 @@
 
 namespace VideoCore {
 
+namespace {
+/// DeferRegionProtection's sink on this thread (none: protect at once).
+thread_local ProtectRanges* t_deferred_region_protection = nullptr;
+} // namespace
+
+DeferRegionProtection::DeferRegionProtection(ProtectRanges* sink)
+    : previous{std::exchange(t_deferred_region_protection, sink)} {}
+
+DeferRegionProtection::~DeferRegionProtection() {
+    t_deferred_region_protection = previous;
+}
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
@@ -284,6 +296,10 @@ struct PageManager::Impl {
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) {
+        // Protection on a helper thread (buffer uploads): write tracking only, deferred.
+        ProtectRanges* const deferred = write_op == PageOp::Track && read_op == PageOp::None
+                                            ? t_deferred_region_protection
+                                            : nullptr;
         const u64 base_page = base_addr >> PM_PAGE_BITS;
         const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
         const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
@@ -297,7 +313,18 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
-                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                const VAddr range_addr = range_begin << PM_PAGE_BITS;
+                const u64 range_size = range_pages << PM_PAGE_BITS;
+                if (deferred) {
+                    if (!deferred->empty() &&
+                        deferred->back().first + deferred->back().second == range_addr) {
+                        deferred->back().second += range_size;
+                    } else {
+                        deferred->emplace_back(range_addr, range_size);
+                    }
+                } else {
+                    Protect(range_addr, range_size, perms);
+                }
                 range_pages = 0;
                 potential_pages = 0;
             }
