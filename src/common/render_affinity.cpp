@@ -30,7 +30,7 @@ constexpr int MinCpusLeft = 6;
 
 struct Masks {
     bool valid = false;
-    DWORD_PTR process = 0; ///< every CPU the process may use (group 0)
+    DWORD_PTR process = 0;   ///< every CPU the process may use (group 0)
     DWORD_PTR off_core0 = 0; ///< the same without the logical CPUs of the core CPU 0 is on
 };
 
@@ -53,8 +53,8 @@ Masks ComputeMasks() {
         if (GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
             for (DWORD offset = 0; offset < length;) {
                 const auto* entry =
-                    reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
-                        buffer.data() + offset);
+                    reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() +
+                                                                                     offset);
                 for (WORD g = 0; g < entry->Processor.GroupCount; ++g) {
                     const GROUP_AFFINITY& group = entry->Processor.GroupMask[g];
                     if (group.Group == 0 && (group.Mask & 1) != 0) {

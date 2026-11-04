@@ -333,15 +333,14 @@ bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Schedul
         const auto pass_layout = guest_state.depth_stencil_attachment.image_layout;
         auto range = DepthRange(depth_ci.format);
         range.baseArrayLayer = depth_layer;
-        const vk::ImageMemoryBarrier2 barrier{
-            .srcStageMask = to_read ? tests : read_stage,
-            .srcAccessMask = to_read ? attachment : read_access,
-            .dstStageMask = to_read ? read_stage : tests,
-            .dstAccessMask = to_read ? read_access : attachment,
-            .oldLayout = to_read ? pass_layout : read,
-            .newLayout = to_read ? read : pass_layout,
-            .image = depth_ci.image,
-            .subresourceRange = range};
+        const vk::ImageMemoryBarrier2 barrier{.srcStageMask = to_read ? tests : read_stage,
+                                              .srcAccessMask = to_read ? attachment : read_access,
+                                              .dstStageMask = to_read ? read_stage : tests,
+                                              .dstAccessMask = to_read ? read_access : attachment,
+                                              .oldLayout = to_read ? pass_layout : read,
+                                              .newLayout = to_read ? read : pass_layout,
+                                              .image = depth_ci.image,
+                                              .subresourceRange = range};
         command.pipelineBarrier2(
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
     };
@@ -639,8 +638,8 @@ void BbVelocityMirror::FlushBatch(Scheduler& scheduler) {
         for (auto& replay : commands) {
             replay(vk::CommandBuffer{command});
         }
-        RecordingCosts::mirror_ns.fetch_add(
-            (std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+        RecordingCosts::mirror_ns.fetch_add((std::chrono::steady_clock::now() - start).count(),
+                                            std::memory_order_relaxed);
         RecordingCosts::mirror_commands.fetch_add(commands.size(), std::memory_order_relaxed);
         RecordingCosts::mirror_batches.fetch_add(1, std::memory_order_relaxed);
     });

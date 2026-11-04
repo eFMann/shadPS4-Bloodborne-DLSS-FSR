@@ -9,8 +9,8 @@
 #include <string>
 
 #include "common/crash_crumbs.h"
-#include "common/rdtsc.h"
 #include "common/logging/log.h"
+#include "common/rdtsc.h"
 #include "common/thread.h"
 
 namespace Common::Crumbs {

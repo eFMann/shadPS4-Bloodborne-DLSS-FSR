@@ -109,10 +109,10 @@ private:
     /// Stage uploads in VRAM: up to VRAM_RING_BLOCKS blocks, made as uploads first need them and
     /// kept while the setting is on (released when it goes off and under VRAM pressure).
     Ring vram_ring;
-    bool vram_capable = false;      ///< Resizable BAR on a dedicated graphics card
+    bool vram_capable = false;       ///< Resizable BAR on a dedicated graphics card
     u64 vram_paused_until_frame = 0; ///< after a release under VRAM pressure
-    u64 vram_uploads = 0;           ///< bytes staged there since the last log line
-    u64 vram_fallbacks = 0;         ///< requests it couldn't take since the last log line
+    u64 vram_uploads = 0;            ///< bytes staged there since the last log line
+    u64 vram_fallbacks = 0;          ///< requests it couldn't take since the last log line
     std::chrono::steady_clock::time_point vram_log_time{};
     void ReleaseVramRing(bool only_idle, ReleasedMemory* released);
 

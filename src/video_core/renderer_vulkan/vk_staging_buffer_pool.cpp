@@ -88,8 +88,8 @@ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& sched
         u64 visible = 0;
         for (u32 i = 0; i < props.memoryTypeCount; ++i) {
             if ((props.memoryTypes[i].propertyFlags & bar_flags) == bar_flags) {
-                visible = std::max<u64>(visible,
-                                        props.memoryHeaps[props.memoryTypes[i].heapIndex].size);
+                visible =
+                    std::max<u64>(visible, props.memoryHeaps[props.memoryTypes[i].heapIndex].size);
             }
         }
         vram_capable = !instance.IsIntegrated() && visible > REBAR_MIN_VISIBLE;
@@ -268,9 +268,8 @@ std::optional<StagingBufferRef> StagingBufferPool::RequestVram(u64 size, u64 ali
             return std::nullopt;
         }
         const auto start = std::chrono::steady_clock::now();
-        auto buffer =
-            std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, MemoryType::Stream,
-                                                      BLOCK_SIZE);
+        auto buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler,
+                                                                MemoryType::Stream, BLOCK_SIZE);
         if (buffer->mapped_data.empty()) {
             ++vram_fallbacks;
             return std::nullopt;

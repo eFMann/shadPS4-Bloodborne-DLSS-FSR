@@ -708,11 +708,11 @@ void Rasterizer::CopyInsteadOfDraw(const BbTemporalDlss::DrawReplacement& replac
         .extent = {target.info.size.width, target.info.size.height, 1}};
     // Through the recording thread: right after the upscaler's queued work, a direct command
     // buffer here would wait for all of it.
-    scheduler.RecordUncaptured([source_image, target_image = target.GetImage(),
-                                region](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImage(source_image, vk::ImageLayout::eTransferSrcOptimal, target_image,
-                         vk::ImageLayout::eTransferDstOptimal, region);
-    });
+    scheduler.RecordUncaptured(
+        [source_image, target_image = target.GetImage(), region](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImage(source_image, vk::ImageLayout::eTransferSrcOptimal, target_image,
+                             vk::ImageLayout::eTransferDstOptimal, region);
+        });
 }
 
 // Draws the display copy again at the output size, reading the upscaled frame (see
@@ -842,8 +842,7 @@ u8 Rasterizer::DrawFeatures(const GraphicsPipeline* pipeline) const {
     if (hash == BbSsr::TraceShader && (ssr_mode == 1 || ssr_mode == 2)) {
         features |= SsrReplaces;
     }
-    if (ssr && ssr_mode == 1 &&
-        (hash == BbSsr::ColorCopyShader || hash == BbSsr::LightingShader)) {
+    if (ssr && ssr_mode == 1 && (hash == BbSsr::ColorCopyShader || hash == BbSsr::LightingShader)) {
         features |= SsrAfter;
     }
     if (vbao && EmulatorSettings.IsBbVbao()) {
@@ -921,11 +920,11 @@ void Rasterizer::RecordVertexBindings(const LastVertexBind& v) {
     header.num_attributes = v.dynamic ? u32(v.attributes.size()) : 0;
     header.num_buffers = v.num_buffers;
     header.flags = (v.dynamic ? 1u : 0u) | (!v.dynamic && v.num_buffers ? 2u : 0u);
-    alignas(16) std::array<u8, sizeof(VertexCommandHeader) +
-                                   MaxVertexBufferCount * (sizeof(Binding) + sizeof(Attribute) +
-                                                           sizeof(vk::Buffer) +
-                                                           3 * sizeof(vk::DeviceSize))>
-        data;
+    alignas(16)
+        std::array<u8, sizeof(VertexCommandHeader) +
+                           MaxVertexBufferCount * (sizeof(Binding) + sizeof(Attribute) +
+                                                   sizeof(vk::Buffer) + 3 * sizeof(vk::DeviceSize))>
+            data;
     u32 size = 0;
     const auto put = [&](const void* src, size_t bytes) {
         std::memcpy(data.data() + size, src, bytes);
@@ -1123,7 +1122,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         const auto* info = pipeline->GetStages()[static_cast<u32>(stage)];
         return info ? info->pgm_hash : 0;
     };
-    // One step a draw on each half (a step reads the clock: several a draw cost ~1% of the recorder).
+    // One step a draw on each half (a step reads the clock: several a draw cost ~1% of the
+    // recorder).
     Common::Crumbs::Add("draw: resolve (vs, ps)", stage_hash(Shader::SwStage::Vertex),
                         stage_hash(Shader::SwStage::Fragment));
     StageCensus::SetLabel(StageCensus::Label::Targets);
@@ -1166,8 +1166,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         // renderer only: packets mark the register blocks they change).
         const auto& masks = pipeline->GetGraphicsKey().write_masks;
         rh->dynamic_same = DrawPipe::OnStageB() && !dynamic_memo_off && dynamic_memo_valid &&
-                           DynamicRegsSame(regs, false) &&
-                           draw_jitter == dynamic_memo_jitter && masks == dynamic_memo_masks &&
+                           DynamicRegsSame(regs, false) && draw_jitter == dynamic_memo_jitter &&
+                           masks == dynamic_memo_masks &&
                            attachment_feedback_loop == dynamic_memo_feedback &&
                            is_indexed == dynamic_memo_indexed;
         if (rh->dynamic_same) {
@@ -1445,14 +1445,14 @@ void Rasterizer::SchedulerCatchUp(void* context) {
 
 bool Rasterizer::RecorderIdle() const {
     // The recorder idle first: then the entries it handed over are all published.
-    return draw_pipe->Idle() &&
-           fin_done.load(std::memory_order_acquire) == fin_published.load(std::memory_order_acquire);
+    return draw_pipe->Idle() && fin_done.load(std::memory_order_acquire) ==
+                                    fin_published.load(std::memory_order_acquire);
 }
 
 void Rasterizer::WaitFinisherIdle() {
     // After the recorder ran dry (Drain): every entry it handed over is published.
-    for (u32 spins = 0; fin_done.load(std::memory_order_acquire) !=
-                        fin_published.load(std::memory_order_acquire);
+    for (u32 spins = 0;
+         fin_done.load(std::memory_order_acquire) != fin_published.load(std::memory_order_acquire);
          ++spins) {
         if (spins < 4096) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -4686,9 +4686,9 @@ bool Rasterizer::TargetMemoUsable(const TargetSignature& signature) {
     const auto& regs = Regs();
     // With the finish thread running, the open pass is the one the draws handed to it leave
     // (asking the scheduler would wait for that thread).
-    const bool open = finisher_running ? memo_pass_open : scheduler.IsRenderingWith(target_memo.state);
-    if (!target_memo.valid || !open ||
-        regs.depth_render_control.depth_clear_enable ||
+    const bool open =
+        finisher_running ? memo_pass_open : scheduler.IsRenderingWith(target_memo.state);
+    if (!target_memo.valid || !open || regs.depth_render_control.depth_clear_enable ||
         regs.depth_render_control.stencil_clear_enable || !(signature == target_memo.signature)) {
         return false;
     }
@@ -5119,20 +5119,19 @@ bool Rasterizer::SameDynamic(const DrawDynamic& a, const DrawDynamic& b) {
         (a.depth_bounds_min != b.depth_bounds_min || a.depth_bounds_max != b.depth_bounds_max)) {
         return false;
     }
-    if (a.depth_bias && (a.depth_bias_constant != b.depth_bias_constant ||
-                         a.depth_bias_clamp != b.depth_bias_clamp ||
-                         a.depth_bias_slope != b.depth_bias_slope)) {
+    if (a.depth_bias &&
+        (a.depth_bias_constant != b.depth_bias_constant ||
+         a.depth_bias_clamp != b.depth_bias_clamp || a.depth_bias_slope != b.depth_bias_slope)) {
         return false;
     }
-    if (a.stencil_test &&
-        (!(a.stencil_front_ops == b.stencil_front_ops) ||
-         !(a.stencil_back_ops == b.stencil_back_ops) ||
-         a.stencil_front_reference != b.stencil_front_reference ||
-         a.stencil_back_reference != b.stencil_back_reference ||
-         a.stencil_front_write_mask != b.stencil_front_write_mask ||
-         a.stencil_back_write_mask != b.stencil_back_write_mask ||
-         a.stencil_front_compare_mask != b.stencil_front_compare_mask ||
-         a.stencil_back_compare_mask != b.stencil_back_compare_mask)) {
+    if (a.stencil_test && (!(a.stencil_front_ops == b.stencil_front_ops) ||
+                           !(a.stencil_back_ops == b.stencil_back_ops) ||
+                           a.stencil_front_reference != b.stencil_front_reference ||
+                           a.stencil_back_reference != b.stencil_back_reference ||
+                           a.stencil_front_write_mask != b.stencil_front_write_mask ||
+                           a.stencil_back_write_mask != b.stencil_back_write_mask ||
+                           a.stencil_front_compare_mask != b.stencil_front_compare_mask ||
+                           a.stencil_back_compare_mask != b.stencil_back_compare_mask)) {
         return false;
     }
     return true;
@@ -5300,8 +5299,8 @@ void Rasterizer::UpdateDepthStencilState(DrawDynamic& out) const {
         regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
     out.depth_test = depth_test_enabled;
     if (depth_test_enabled) {
-        out.depth_write = regs.depth_control.depth_write_enable &&
-                          !regs.depth_render_control.depth_clear_enable;
+        out.depth_write =
+            regs.depth_control.depth_write_enable && !regs.depth_render_control.depth_clear_enable;
         out.depth_compare = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
     }
 
@@ -5559,34 +5558,34 @@ const std::vector<std::pair<u32, u32>>& Rasterizer::DynamicStateRanges() {
 #define BB_DYNAMIC_REG(field)                                                                      \
     fields.emplace_back(u32(offsetof(AmdGpu::Regs, field) / sizeof(u32)),                          \
                         u32((sizeof(AmdGpu::Regs::field) + sizeof(u32) - 1) / sizeof(u32)))
-    // Viewports and scissors (GetCombinedScissor, IsClipDisabled).
-    BB_DYNAMIC_REG(viewport_control);
-    BB_DYNAMIC_REG(viewports);
-    BB_DYNAMIC_REG(viewport_depths);
-    BB_DYNAMIC_REG(viewport_scissors);
-    BB_DYNAMIC_REG(screen_scissor);
-    BB_DYNAMIC_REG(window_scissor);
-    BB_DYNAMIC_REG(generic_scissor);
-    BB_DYNAMIC_REG(window_offset);
-    BB_DYNAMIC_REG(polygon_control);
-    BB_DYNAMIC_REG(clipper_control);
-    BB_DYNAMIC_REG(mode_control);
-    BB_DYNAMIC_REG(primitive_type);
-    // Depth and stencil.
-    BB_DYNAMIC_REG(depth_control);
-    BB_DYNAMIC_REG(depth_buffer);
-    BB_DYNAMIC_REG(depth_render_control);
-    BB_DYNAMIC_REG(depth_bounds_min);
-    BB_DYNAMIC_REG(depth_bounds_max);
-    BB_DYNAMIC_REG(poly_offset);
-    BB_DYNAMIC_REG(stencil_control);
-    BB_DYNAMIC_REG(stencil_ref_front);
-    BB_DYNAMIC_REG(stencil_ref_back);
-    // Primitive, rasterization and blending.
-    BB_DYNAMIC_REG(enable_primitive_restart);
-    BB_DYNAMIC_REG(primitive_restart_index);
-    BB_DYNAMIC_REG(line_control);
-    BB_DYNAMIC_REG(blend_constants);
+        // Viewports and scissors (GetCombinedScissor, IsClipDisabled).
+        BB_DYNAMIC_REG(viewport_control);
+        BB_DYNAMIC_REG(viewports);
+        BB_DYNAMIC_REG(viewport_depths);
+        BB_DYNAMIC_REG(viewport_scissors);
+        BB_DYNAMIC_REG(screen_scissor);
+        BB_DYNAMIC_REG(window_scissor);
+        BB_DYNAMIC_REG(generic_scissor);
+        BB_DYNAMIC_REG(window_offset);
+        BB_DYNAMIC_REG(polygon_control);
+        BB_DYNAMIC_REG(clipper_control);
+        BB_DYNAMIC_REG(mode_control);
+        BB_DYNAMIC_REG(primitive_type);
+        // Depth and stencil.
+        BB_DYNAMIC_REG(depth_control);
+        BB_DYNAMIC_REG(depth_buffer);
+        BB_DYNAMIC_REG(depth_render_control);
+        BB_DYNAMIC_REG(depth_bounds_min);
+        BB_DYNAMIC_REG(depth_bounds_max);
+        BB_DYNAMIC_REG(poly_offset);
+        BB_DYNAMIC_REG(stencil_control);
+        BB_DYNAMIC_REG(stencil_ref_front);
+        BB_DYNAMIC_REG(stencil_ref_back);
+        // Primitive, rasterization and blending.
+        BB_DYNAMIC_REG(enable_primitive_restart);
+        BB_DYNAMIC_REG(primitive_restart_index);
+        BB_DYNAMIC_REG(line_control);
+        BB_DYNAMIC_REG(blend_constants);
 #undef BB_DYNAMIC_REG
         std::ranges::sort(fields);
         for (const auto& [word, count] : fields) {
@@ -6896,8 +6895,8 @@ void Rasterizer::MeterSecond(std::chrono::steady_clock::time_point& start) {
             m.rec_detail[i] = rec_detail_ns[i].load(std::memory_order_relaxed);
         }
         m.rec_draws = profile_draws.load(std::memory_order_relaxed);
-        m.fin_busy = s64(double(fin_busy_ticks.load(std::memory_order_relaxed)) *
-                         Common::TscNsPerTick());
+        m.fin_busy =
+            s64(double(fin_busy_ticks.load(std::memory_order_relaxed)) * Common::TscNsPerTick());
         for (size_t i = 0; i < m.fin_waits.size(); ++i) {
             m.fin_waits[i] = fin_waits[i].load(std::memory_order_relaxed);
             m.fin_wait_ns[i] = fin_wait_ns[i].load(std::memory_order_relaxed);

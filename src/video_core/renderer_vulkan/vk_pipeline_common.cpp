@@ -3,12 +3,12 @@
 
 #include <boost/container/static_vector.hpp>
 
+#include <cstring>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
-#include <cstring>
-#include <vector>
 
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -95,9 +95,9 @@ bool EncodeWrites(const Pipeline::DescriptorWrites& source, std::vector<u8>& out
         if (write.pNext || kinds != 1) {
             return false;
         }
-        (write.pImageInfo ? header.num_images
-                          : write.pBufferInfo ? header.num_buffers : header.num_texels) +=
-            write.descriptorCount;
+        (write.pImageInfo    ? header.num_images
+         : write.pBufferInfo ? header.num_buffers
+                             : header.num_texels) += write.descriptorCount;
     }
     out.resize(sizeof(header) + header.num_writes * sizeof(CompactWrite) +
                header.num_images * sizeof(vk::DescriptorImageInfo) +
@@ -110,9 +110,14 @@ bool EncodeWrites(const Pipeline::DescriptorWrites& source, std::vector<u8>& out
     u8* buffers = images + header.num_images * sizeof(vk::DescriptorImageInfo);
     u8* texels = buffers + header.num_buffers * sizeof(vk::DescriptorBufferInfo);
     for (const auto& write : source) {
-        const CompactWrite compact{write.dstBinding, write.dstArrayElement, write.descriptorCount,
+        const CompactWrite compact{write.dstBinding,
+                                   write.dstArrayElement,
+                                   write.descriptorCount,
                                    write.descriptorType,
-                                   write.pImageInfo ? 0u : write.pBufferInfo ? 1u : 2u, 0};
+                                   write.pImageInfo    ? 0u
+                                   : write.pBufferInfo ? 1u
+                                                       : 2u,
+                                   0};
         std::memcpy(at, &compact, sizeof(compact));
         at += sizeof(compact);
         if (write.pImageInfo) {

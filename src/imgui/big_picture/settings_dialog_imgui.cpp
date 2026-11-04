@@ -330,8 +330,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
                                      old_layer[section].is_object() &&
                                      old_layer[section].contains(key);
                     if (!had || old_layer[section][key] != value) {
-                        LOG_INFO(Config, "Settings save changes {} {}.{}: {} -> {}", layer,
-                                 section, key, had ? old_layer[section][key].dump() : "(none)",
+                        LOG_INFO(Config, "Settings save changes {} {}.{}: {} -> {}", layer, section,
+                                 key, had ? old_layer[section][key].dump() : "(none)",
                                  value.dump());
                         ++changes;
                     }
@@ -1150,8 +1150,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             if (tr) {
                 AddSettingCheckbox("Show frames when ready", bbFlipWhenReadySetting,
                                    "Smoother above 60 fps. Off: frames on vblank ticks");
-                risky("Real occlusion tests", bbRealOcclusionSetting,
-                      "More fps in busy areas",
+                risky("Real occlusion tests", bbRealOcclusionSetting, "More fps in busy areas",
                       "Can make textures flicker white for a moment,\nfor example when coming "
                       "round a corner.");
                 risky("Merged copy shaders", bbMergedCopiesSetting, "Less GPU copy work",
@@ -1190,8 +1189,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "waited for");
                 AddSettingCheckbox("Draw data copy thread", bbCopyThreadSetting,
                                    "Draw memory copies on their own thread (needs a restart)");
-                AddSettingCheckbox("Keep rendering while presenting",
-                                   bbRenderDuringPresentSetting,
+                AddSettingCheckbox("Keep rendering while presenting", bbRenderDuringPresentSetting,
                                    "Frame limiters like RTSS don't hold up rendering");
                 AddSettingCheckbox("Protect only changed pages", bbExactProtectionSetting,
                                    "Less CPU time protecting game memory the GPU reads");
@@ -1200,8 +1198,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("Fast pixel shader math", bbFastPixelMathSetting,
                                    "The driver fuses multiply-adds; shaders rebuilt (needs a "
                                    "restart)");
-                AddSettingCheckbox("GPU interpolation where safe",
-                                   bbHardwareInterpolationSetting,
+                AddSettingCheckbox("GPU interpolation where safe", bbHardwareInterpolationSetting,
                                    "NVIDIA: less pixel shader code (needs a restart)");
             }
             if (tr && advanced) {
@@ -1227,8 +1224,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             }
 
             // ---------------------------------------------------------------------------------
-            AddSettingSection("Stutters",
-                              "Hitches when new areas, objects and textures load.", false);
+            AddSettingSection("Stutters", "Hitches when new areas, objects and textures load.",
+                              false);
             if (tr) {
                 risky("Background shader compiles", bbBackgroundPipelinesSetting,
                       "No stutter when a new object needs a shader",
@@ -1283,8 +1280,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("Small GPU copies on the CPU", bbCpuCopyShaderSetting,
                                    "The game doesn't wait for the GPU for its small copies");
                 if (bbCpuCopyShaderSetting) {
-                    AddSettingCheckbox("    Skip copies that change nothing",
-                                       bbCopySkipSameSetting, "Fewer buffer uploads");
+                    AddSettingCheckbox("    Skip copies that change nothing", bbCopySkipSameSetting,
+                                       "Fewer buffer uploads");
                 }
                 subheading("Experimental");
                 live(
@@ -1617,8 +1614,7 @@ void SettingsWindow::DrawSettingName(const std::string& name) {
     const float y_mid = pos.y + line_height * 0.5f;
     auto* draw_list = ImGui::GetWindowDrawList();
     // From the row above down to this one's middle, then across to its name.
-    draw_list->AddLine(ImVec2(x, pos.y - line_height * 0.45f), ImVec2(x, y_mid), colour,
-                       thickness);
+    draw_list->AddLine(ImVec2(x, pos.y - line_height * 0.45f), ImVec2(x, y_mid), colour, thickness);
     draw_list->AddLine(ImVec2(x, y_mid), ImVec2(x + step * 0.45f, y_mid), colour, thickness);
     ImVec4 text = ImGui::GetStyleColorVec4(ImGuiCol_Text);
     text.w *= 0.8f;

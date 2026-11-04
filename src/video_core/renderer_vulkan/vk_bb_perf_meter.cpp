@@ -22,11 +22,11 @@ constexpr std::array<const char*, 20> RecSteps{
     "packet",     "pending ops", "targets",  "buffers", "tex memo",   "tex lookup",  "tex view",
     "tex layout", "tex writes",  "samplers", "dlss",    "begin pass", "vertex bufs", "index",
     "barriers",   "descriptors", "motion",   "dynamic", "record",     "reset"};
-constexpr std::array<const char*, 10> RecDetails{
-    "texture set key",       "texture set checks",      "texture set binding",
-    "shader buffer lookups", "vertex buffer lookups",   "memory sync for shaders",
-    "feature observers",     "shader buffer hazards",   "dynamic state",
-    "handoff"};
+constexpr std::array<const char*, 10> RecDetails{"texture set key",       "texture set checks",
+                                                 "texture set binding",   "shader buffer lookups",
+                                                 "vertex buffer lookups", "memory sync for shaders",
+                                                 "feature observers",     "shader buffer hazards",
+                                                 "dynamic state",         "handoff"};
 
 // Command thread states (Common::GuestStats::CmdState).
 enum State { Idle, Work, DrainWait, GuestWait, DisplayWait, Command, GpuWait };
@@ -48,7 +48,7 @@ struct Summary {
     double fin{}, fin_seconds{};                          ///< the finish thread's
     double rec_busy_s{};                                  ///< the recorder's busy seconds
     std::array<double, 5> fin_waits{}, fin_wait_s{};
-    double gpu_seconds{};                                 ///< seconds the GPU was measured
+    double gpu_seconds{}; ///< seconds the GPU was measured
     std::array<double, 6> cmd_step_ns{};
     double cmd_timed{};
     std::array<double, 20> rec_step_ns{};
@@ -182,8 +182,7 @@ void Update(const Inputs& in) {
     const double game = share({Idle, GuestWait});
     const double rec = std::clamp(in.recorder_busy_s / in.seconds, 0.0, 1.0);
     const double gpu = in.gpu_measured ? std::clamp(in.gpu_busy_s / in.seconds, 0.0, 1.0) : 0.0;
-    const double fin =
-        in.finisher_on ? std::clamp(in.finisher_busy_s / in.seconds, 0.0, 1.0) : 0.0;
+    const double fin = in.finisher_on ? std::clamp(in.finisher_busy_s / in.seconds, 0.0, 1.0) : 0.0;
 
     std::array<std::pair<const char*, double>, 5> loads{{{"GPU", gpu},
                                                          {"command thread", cmd},

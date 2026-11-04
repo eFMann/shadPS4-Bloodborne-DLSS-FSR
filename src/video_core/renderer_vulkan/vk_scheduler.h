@@ -39,10 +39,10 @@ namespace Vulkan {
 
 /// Recording-thread time of our own large jobs (statistics, logged with the sync waits).
 namespace RecordingCosts {
-inline std::atomic<s64> mirror_ns{0};      ///< velocity mirror batch replays
+inline std::atomic<s64> mirror_ns{0};       ///< velocity mirror batch replays
 inline std::atomic<u64> mirror_commands{0}; ///< commands replayed in them
 inline std::atomic<u64> mirror_batches{0};
-inline std::atomic<s64> upscaler_ns{0};    ///< DLSS evaluations
+inline std::atomic<s64> upscaler_ns{0}; ///< DLSS evaluations
 inline std::atomic<u64> upscaler_calls{0};
 /// FlushFrame: submissions on the recording thread, and the others by why (setting off, upload
 /// command buffer, several sessions, capture or profiler, ring nearly full).
@@ -667,12 +667,12 @@ public:
         CatchUp();
         if (capture) {
             // Captured for a later replay: the data goes with it.
-            std::vector<u8> copy(static_cast<const u8*>(data), static_cast<const u8*>(data) + bytes);
-            capture->emplace_back(
-                [f = std::decay_t<Func>(std::forward<Func>(func)),
-                 copy = std::move(copy)](vk::CommandBuffer cmdbuf) mutable {
-                    f(cmdbuf, copy.data());
-                });
+            std::vector<u8> copy(static_cast<const u8*>(data),
+                                 static_cast<const u8*>(data) + bytes);
+            capture->emplace_back([f = std::decay_t<Func>(std::forward<Func>(func)),
+                                   copy = std::move(copy)](vk::CommandBuffer cmdbuf) mutable {
+                f(cmdbuf, copy.data());
+            });
             return;
         }
         if (!recorder || direct_mode) {

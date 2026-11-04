@@ -140,8 +140,7 @@ Inner::~Inner() {
         std::unique_lock lk{g_upload_mtx};
         g_upload_list.emplace_back(UploadJob{
             .data = this->upload_data,
-            .destroy_frame =
-                g_frames_rendered.load(std::memory_order_relaxed) + DestroyDelayFrames,
+            .destroy_frame = g_frames_rendered.load(std::memory_order_relaxed) + DestroyDelayFrames,
         });
     }
 }

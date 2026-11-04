@@ -272,12 +272,11 @@ void CommandRecorder::Sync(std::source_location where) {
             std::this_thread::yield();
         }
     }
-    NoteSyncWait(where, (std::chrono::steady_clock::now() - start).count(), chunks, bytes,
-                 asleep);
+    NoteSyncWait(where, (std::chrono::steady_clock::now() - start).count(), chunks, bytes, asleep);
 }
 
-void CommandRecorder::NoteSyncWait(const std::source_location& where, s64 ns, u64 chunks,
-                                   u64 bytes, bool asleep) {
+void CommandRecorder::NoteSyncWait(const std::source_location& where, s64 ns, u64 chunks, u64 bytes,
+                                   bool asleep) {
     std::scoped_lock lk{sync_wait_mutex};
     ++sync_waits;
     sync_wait_ns += ns;
@@ -321,9 +320,11 @@ void CommandRecorder::NoteSyncWait(const std::source_location& where, s64 ns, u6
     const s64 mirror_ns = RecordingCosts::mirror_ns.exchange(0, std::memory_order_relaxed);
     const u64 mirror_commands =
         RecordingCosts::mirror_commands.exchange(0, std::memory_order_relaxed);
-    const u64 mirror_batches = RecordingCosts::mirror_batches.exchange(0, std::memory_order_relaxed);
+    const u64 mirror_batches =
+        RecordingCosts::mirror_batches.exchange(0, std::memory_order_relaxed);
     const s64 upscaler_ns = RecordingCosts::upscaler_ns.exchange(0, std::memory_order_relaxed);
-    const u64 upscaler_calls = RecordingCosts::upscaler_calls.exchange(0, std::memory_order_relaxed);
+    const u64 upscaler_calls =
+        RecordingCosts::upscaler_calls.exchange(0, std::memory_order_relaxed);
     std::array<u64, RecordingCosts::sync_submits.size()> sync_submits{};
     for (size_t i = 0; i < sync_submits.size(); ++i) {
         sync_submits[i] = RecordingCosts::sync_submits[i].exchange(0, std::memory_order_relaxed);
@@ -342,8 +343,7 @@ void CommandRecorder::NoteSyncWait(const std::source_location& where, s64 ns, u6
              RecordingCosts::async_submits.exchange(0, std::memory_order_relaxed),
              sync_submits[0] + sync_submits[1] + sync_submits[2] + sync_submits[3] +
                  sync_submits[4],
-             sync_submits[0], sync_submits[1], sync_submits[2], sync_submits[3],
-             sync_submits[4]);
+             sync_submits[0], sync_submits[1], sync_submits[2], sync_submits[3], sync_submits[4]);
     LOG_INFO(Render_Vulkan,
              "Recording thread syncs ({:.0f} s): {} waits, avg {:.0f} us, max {:.0f} us, "
              "{:.2f} ms a second in all; at a wait {:.1f} chunks were still to record and "
@@ -820,10 +820,10 @@ bool Scheduler::TrySubmitOnRecorder(SubmitInfo& info) {
         }
         {
             std::scoped_lock lk{submit_mutex};
-            QueueOp([queue = instance.GetGraphicsQueue(), info,
-                     cmd_buffers = std::move(cmd_buffers)] {
-                QueueSubmit(queue, info, cmd_buffers);
-            });
+            QueueOp(
+                [queue = instance.GetGraphicsQueue(), info, cmd_buffers = std::move(cmd_buffers)] {
+                    QueueSubmit(queue, info, cmd_buffers);
+                });
         }
         NoteSubmitted(signal_value);
         // The command pool is this thread's while the other one doesn't sync with it.

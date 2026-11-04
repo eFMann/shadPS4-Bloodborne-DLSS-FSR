@@ -596,8 +596,8 @@ private:
     };
     std::array<FinishEntry, FinishRingSize> finish_ring{};
     // The resolve thread's, then (a cache line of their own) the finish thread's.
-    DrawDescriptors* res = &finish_ring[0].descriptors; ///< being resolved
-    DrawHandoff* rh = &finish_ring[0].handoff;          ///< the resolve half's handoff
+    DrawDescriptors* res = &finish_ring[0].descriptors;             ///< being resolved
+    DrawHandoff* rh = &finish_ring[0].handoff;                      ///< the resolve half's handoff
     alignas(64) DrawDescriptors* fin = &finish_ring[0].descriptors; ///< being finished
     const DrawHandoff* fh = nullptr; ///< the finish half's, while it finishes an entry
     enum class FinishWait : u8 { Commands, Packet, Joined, RingFull, Idle, Count };
@@ -623,9 +623,9 @@ private:
             fin_wake.notify_one();
         }
     }
-    bool finisher_running{};                  ///< the resolve thread's
-    u32 pending_ops_counter{};                ///< the resolve thread's (PopPendingOperations)
-    u64 fin_write{};                          ///< entries handed over (the resolve thread's)
+    bool finisher_running{};   ///< the resolve thread's
+    u32 pending_ops_counter{}; ///< the resolve thread's (PopPendingOperations)
+    u64 fin_write{};           ///< entries handed over (the resolve thread's)
     alignas(64) std::atomic<u64> fin_published{0};
     alignas(64) std::atomic<u64> fin_done{0};
     alignas(64) std::atomic<u32> fin_wake{0};
@@ -1196,8 +1196,8 @@ public:
         TexBind,
         ShaderBuffers,
         VertexBuffers,
-        DmaSync, ///< buffers synchronised for shaders that read memory directly
-        Observers,   ///< our features' looks at each shader buffer (upscaler, VBAO, blur)
+        DmaSync,       ///< buffers synchronised for shaders that read memory directly
+        Observers,     ///< our features' looks at each shader buffer (upscaler, VBAO, blur)
         BufferHazards, ///< shader buffers checked against earlier writes (barriers)
         DynamicState,  ///< the dynamic state worked out from the registers
         Handoff,       ///< the line between the halves (the entry filled, bindings reset)

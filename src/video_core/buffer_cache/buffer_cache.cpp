@@ -1155,8 +1155,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     // memory, so the GPU's copy into the image doesn't cross PCIe.
     const auto staging = [&] {
         if (size - trim >= BackgroundCopyMin) {
-            if (const auto vram = staging_pool.RequestVram(size - trim,
-                                                           instance.StorageMinAlignment())) {
+            if (const auto vram =
+                    staging_pool.RequestVram(size - trim, instance.StorageMinAlignment())) {
                 return *vram;
             }
         }
@@ -2133,17 +2133,16 @@ void BufferCache::UploadRanges(const Buffer* arena,
                     const u64 length = std::min(BackgroundCopyPiece, copy.size - offset);
                     const u64 staged = copy.srcOffset + offset;
                     Common::GuestStats::async_copies.fetch_add(1, std::memory_order_relaxed);
-                    Common::CopyPool::Async([memory = memory, source = copy.dstOffset + offset,
-                                             destination = staging.mapped + staged, length,
-                                             buffer = staging.buffer,
-                                             flush = staging.offset + staged, protect_ticket,
-                                             tracker = &page_manager] {
-                        if (protect_ticket != 0) {
-                            tracker->WaitProtection(protect_ticket);
-                        }
-                        memory->CopySparseMemory(source, destination, length);
-                        buffer->Flush(flush, length);
-                    });
+                    Common::CopyPool::Async(
+                        [memory = memory, source = copy.dstOffset + offset,
+                         destination = staging.mapped + staged, length, buffer = staging.buffer,
+                         flush = staging.offset + staged, protect_ticket, tracker = &page_manager] {
+                            if (protect_ticket != 0) {
+                                tracker->WaitProtection(protect_ticket);
+                            }
+                            memory->CopySparseMemory(source, destination, length);
+                            buffer->Flush(flush, length);
+                        });
                 }
             }
             background = true;

@@ -312,14 +312,14 @@ struct QueuedCommands {
         scheduler.Record([flags = info.dependencyFlags, memory = std::move(memory),
                           buffers = std::move(buffers),
                           images = std::move(images)](vk::CommandBuffer command) {
-            command.pipelineBarrier2(vk::DependencyInfo{
-                .dependencyFlags = flags,
-                .memoryBarrierCount = static_cast<u32>(memory.size()),
-                .pMemoryBarriers = memory.data(),
-                .bufferMemoryBarrierCount = static_cast<u32>(buffers.size()),
-                .pBufferMemoryBarriers = buffers.data(),
-                .imageMemoryBarrierCount = static_cast<u32>(images.size()),
-                .pImageMemoryBarriers = images.data()});
+            command.pipelineBarrier2(
+                vk::DependencyInfo{.dependencyFlags = flags,
+                                   .memoryBarrierCount = static_cast<u32>(memory.size()),
+                                   .pMemoryBarriers = memory.data(),
+                                   .bufferMemoryBarrierCount = static_cast<u32>(buffers.size()),
+                                   .pBufferMemoryBarriers = buffers.data(),
+                                   .imageMemoryBarrierCount = static_cast<u32>(images.size()),
+                                   .pImageMemoryBarriers = images.data()});
         });
     }
     void bindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) const {
@@ -361,8 +361,8 @@ struct QueuedCommands {
             command.pushDescriptorSetKHR(point, layout, set, writes);
         });
     }
-    void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, u32 offset,
-                       u32 size, const void* values) const {
+    void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, u32 offset, u32 size,
+                       const void* values) const {
         std::array<u8, 128> data{};
         ASSERT(size <= data.size());
         std::memcpy(data.data(), values, size);
@@ -1793,8 +1793,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         // next evaluation (stock rendering from then on, as before).
         scheduler.Record([ngx, color = (linear ? linear_color : snapshot)->Resource(),
                           depth_resource, motion_resource = motion->Resource(),
-                          output_resource = upscaled->Resource(), eval,
-                          failure = &evaluate_failed,
+                          output_resource = upscaled->Resource(), eval, failure = &evaluate_failed,
                           mode = upscale_to ? 2 : 1](vk::CommandBuffer cmdbuf) {
             const auto start = std::chrono::steady_clock::now();
             if (!ngx->Evaluate(cmdbuf, color, depth_resource, motion_resource, output_resource,

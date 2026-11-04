@@ -419,26 +419,26 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     }
     // Through the recording thread (a few a frame): a direct command buffer made the draw
     // recorder wait for it.
-    scheduler.RecordUncaptured([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                                handle = buffer->Handle(),
-                                download_copies = std::move(download_copies),
-                                upload_copies = std::move(upload_copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImageToBuffer(src_image, vk::ImageLayout::eTransferSrcOptimal, handle,
-                                 download_copies);
-        const vk::MemoryBarrier2 post_copy_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-        };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .memoryBarrierCount = 1u,
-            .pMemoryBarriers = &post_copy_barrier,
+    scheduler.RecordUncaptured(
+        [src_image = src->GetImage(), dst_image = dst->GetImage(), handle = buffer->Handle(),
+         download_copies = std::move(download_copies),
+         upload_copies = std::move(upload_copies)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImageToBuffer(src_image, vk::ImageLayout::eTransferSrcOptimal, handle,
+                                     download_copies);
+            const vk::MemoryBarrier2 post_copy_barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .memoryBarrierCount = 1u,
+                .pMemoryBarriers = &post_copy_barrier,
+            });
+            cmdbuf.copyBufferToImage(handle, dst_image, vk::ImageLayout::eTransferDstOptimal,
+                                     upload_copies);
         });
-        cmdbuf.copyBufferToImage(handle, dst_image, vk::ImageLayout::eTransferDstOptimal,
-                                 upload_copies);
-    });
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -664,10 +664,10 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     };
     // Through the recording thread (a few thousand clears a second): a direct command buffer
     // made the draw recorder wait for it.
-    scheduler.RecordUncaptured([image = dst->GetImage(), color = clear_value.color,
-                                vk_range](vk::CommandBuffer cmdbuf) {
-        cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
-    });
+    scheduler.RecordUncaptured(
+        [image = dst->GetImage(), color = clear_value.color, vk_range](vk::CommandBuffer cmdbuf) {
+            cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
+        });
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
