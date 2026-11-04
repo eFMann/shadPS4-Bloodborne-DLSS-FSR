@@ -164,8 +164,8 @@ constexpr bool ShowReflections = true;
 // 8 frames), until they are settled.
 constexpr bool ShowReflectionTuning = false;
 
-constexpr std::array UpscalerValues{"auto", "dlss", "fsr", "fsr4"};
-constexpr std::array UpscalerNames{"Automatic", "DLSS", "FSR 3.1", "FSR 4 (add-on)"};
+constexpr std::array UpscalerValues{"auto", "dlss", "fsr", "fsr4", "amdfsr"};
+constexpr std::array UpscalerNames{"Automatic", "DLSS", "FSR 3.1", "FSR 4 (add-on)", "FSR (AMD)"};
 constexpr std::array PresetValues{13, 11, 10, 12, 0};
 constexpr std::array PresetNames{"M (recommended)", "K", "J", "L", "NVIDIA default"};
 
@@ -878,11 +878,27 @@ void DlssLayer::DrawWindow() {
         for (size_t i = 0; i < UpscalerValues.size(); ++i)
             if (upscaler.starts_with(UpscalerValues[i]))
                 upscaler_index = int(i); // "fsr4" also starts with "fsr" and comes later
-        // FSR 4 is listed only when its add-on is installed.
-        const int upscaler_count = int(UpscalerNames.size()) - (status.fsr4_installed ? 0 : 1);
-        if (Combo("Upscaler", &upscaler_index, UpscalerNames.data(), upscaler_count))
-            settings.Set("upscaler", UpscalerValues[upscaler_index]);
-        if (!status.dlss_problem.empty() && upscaler_index != 2)
+        // AMD FSR is named with its runtime's version, e.g. "FSR 4.1.2 (AMD)".
+        const auto upscaler_name = [&](int index) {
+            return index == 4 && !status.amd_fsr_label.empty() ? status.amd_fsr_label.c_str()
+                                                               : UpscalerNames[index];
+        };
+        // FSR 4 is listed only when its add-on is installed, AMD FSR only when its folder is.
+        const auto upscaler_listed = [&](int index) {
+            return index == 3   ? status.fsr4_installed
+                   : index == 4 ? !status.amd_fsr_label.empty()
+                                : true;
+        };
+        if (BeginCombo("Upscaler", upscaler_name(upscaler_index))) {
+            for (int i = 0; i < int(UpscalerValues.size()); ++i) {
+                if (upscaler_listed(i) && Selectable(upscaler_name(i), i == upscaler_index)) {
+                    upscaler_index = i;
+                    settings.Set("upscaler", UpscalerValues[i]);
+                }
+            }
+            EndCombo();
+        }
+        if (!status.dlss_problem.empty() && upscaler_index != 2 && upscaler_index != 4)
             TextDisabled("%s", status.dlss_problem.c_str());
 
         const int preset = std::atoi(settings.Get("preset", "13").c_str());

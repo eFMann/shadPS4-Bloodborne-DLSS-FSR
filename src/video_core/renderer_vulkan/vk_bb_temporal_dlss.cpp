@@ -52,7 +52,8 @@
 namespace Vulkan {
 
 bool BbTemporalDlssRequested() {
-    return DlssNgx::Present() || FsrUpscaler::Present() || Fsr4Addon::Present();
+    return DlssNgx::Present() || FsrUpscaler::Present() || Fsr4Addon::Present() ||
+           FsrUpscaler::Present(FsrUpscaler::Runtime::AmdFsr);
 }
 
 std::filesystem::path BbDlssSettingsPath() {
@@ -60,6 +61,13 @@ std::filesystem::path BbDlssSettingsPath() {
 }
 
 namespace {
+std::string AmdFsrLabel() {
+    if (!FsrUpscaler::Present(FsrUpscaler::Runtime::AmdFsr))
+        return {};
+    const auto version = FsrUpscaler::AmdFsrVersion();
+    return version.empty() ? "FSR (AMD)" : fmt::format("FSR {} (AMD)", version);
+}
+
 std::mutex status_mutex;
 BbDlssStatus status;
 std::string ngx_problem;
@@ -99,6 +107,7 @@ BbDlssStatus BbTemporalDlssStatus() {
     copy.active = std::chrono::steady_clock::now() - last_evaluation < std::chrono::seconds{1};
     copy.dlss_problem = ngx_problem;
     copy.fsr4_installed = Fsr4Addon::Present();
+    copy.amd_fsr_label = AmdFsrLabel();
     if (!BbTemporalDlssRequested())
         copy.reason =
             "No upscaler files were found next to " BB_LIBRARY_NAME("shadPS4.exe", "shadps4") ".";
@@ -478,7 +487,7 @@ struct Tune {
     u32 preset = 13;       // M: user-tuned default
     vk::Extent2D output{}; // zero: the window size
     int quality = -1;      // -1: from scale
-    int upscaler = 0;      // 0 automatic, 1 DLSS, 2 FSR 3.1, 3 FSR 4
+    int upscaler = 0;      // 0 automatic, 1 DLSS, 2 FSR 3.1, 3 FSR 4, 4 AMD FSR
     bool motion_blur = false;
     bool character_motion = true; // skinned meshes' own motion vectors (vk_bb_object_motion)
     // The HUD as its own layer, as see-through as measured between frames (see
@@ -488,10 +497,14 @@ struct Tune {
     bool texture_lod_bias = true; // sharper scene textures while upscaling (BbSceneMipBias)
 };
 
-enum class Backend { None, Dlss, Fsr, Fsr4 };
+enum class Backend { None, Dlss, Fsr, Fsr4, AmdFsr };
 
 const char* BackendName(Backend backend) {
-    return backend == Backend::Dlss ? "DLSS" : backend == Backend::Fsr4 ? "FSR 4" : "FSR 3.1";
+    static const std::string amd_fsr = AmdFsrLabel();
+    return backend == Backend::Dlss     ? "DLSS"
+           : backend == Backend::Fsr4   ? "FSR 4"
+           : backend == Backend::AmdFsr ? amd_fsr.c_str()
+                                        : "FSR 3.1";
 }
 } // namespace
 
@@ -630,10 +643,10 @@ struct BbTemporalDlss::Impl {
     // panels cannot shimmer. The scene stays upscaled.
     std::unique_ptr<VideoCore::Buffer> coverage, dimming;
     bool menu{};
-    std::unique_ptr<FsrUpscaler> fsr;
+    std::unique_ptr<FsrUpscaler> fsr, amd_fsr;
     std::unique_ptr<Fsr4Addon> fsr4;
     std::optional<Fsr4Addon::ContextDesc> fsr4_rejected_size;
-    bool fsr_tried{}, fsr4_tried{}, camera_logged{};
+    bool fsr_tried{}, amd_fsr_tried{}, fsr4_tried{}, camera_logged{};
     BbObjectMotion* object_motion{};
     u64 character_motion_frames{};
 
@@ -718,7 +731,8 @@ struct BbTemporalDlss::Impl {
             else if (key == "character_motion")
                 next.character_motion = number != 0;
             else if (key == "upscaler")
-                next.upscaler = value.starts_with("dlss")   ? 1
+                next.upscaler = value.starts_with("amdfsr") ? 4
+                                : value.starts_with("dlss") ? 1
                                 : value.starts_with("fsr4") ? 3
                                 : value.starts_with("fsr")  ? 2
                                                             : 0;
@@ -1007,6 +1021,13 @@ struct BbTemporalDlss::Impl {
             }
             return fsr != nullptr;
         };
+        const auto amd_fsr_ready = [&] {
+            if (!amd_fsr && !amd_fsr_tried) {
+                amd_fsr_tried = true;
+                amd_fsr = FsrUpscaler::Create(instance, FsrUpscaler::Runtime::AmdFsr);
+            }
+            return amd_fsr != nullptr;
+        };
         const auto fsr4_ready = [&] {
             if (rejected_size)
                 return false;
@@ -1025,6 +1046,8 @@ struct BbTemporalDlss::Impl {
             if (fsr4_ready())
                 return Backend::Fsr4;
             return rejected_size && fsr_ready() ? Backend::Fsr : Backend::None;
+        case 4:
+            return amd_fsr_ready() ? Backend::AmdFsr : Backend::None;
         default:
             return dlss           ? Backend::Dlss
                    : fsr4_ready() ? Backend::Fsr4
@@ -1047,6 +1070,11 @@ struct BbTemporalDlss::Impl {
             return dlss.empty() ? "DLSS is not available on this system." : dlss;
         if (tune.upscaler == 2)
             return no_fsr;
+        if (tune.upscaler == 4)
+            return FsrUpscaler::Present(FsrUpscaler::Runtime::AmdFsr)
+                       ? "AMD FSR could not be loaded (see the log; the amd_fsr folder needs "
+                         "amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll)."
+                       : "AMD FSR needs the amd_fsr folder next to shadPS4.exe (Windows only).";
         if (tune.upscaler == 3) {
             if (fsr4_rejected_size)
                 return "FSR 4 is unavailable at this resolution. " + no_fsr;
@@ -1501,6 +1529,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
             ngx->ReleaseFeatureAfterGpuDrain();
         if (backend == Backend::Fsr && fsr)
             fsr->DestroyContextAfterGpuDrain();
+        if (backend == Backend::AmdFsr && amd_fsr)
+            amd_fsr->DestroyContextAfterGpuDrain();
         if (backend == Backend::Fsr4 && fsr4)
             fsr4->ReleaseContextAfterGpuDrain();
         backend = chosen;
@@ -1551,9 +1581,10 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     } else {
         const FsrUpscaler::ContextDesc desc{in, out, tune.depth_inverted, hdr,
                                             hdr && tune.auto_exposure};
-        if (!fsr->HasContext(desc)) {
+        auto& upscaler = backend == Backend::AmdFsr ? *amd_fsr : *fsr;
+        if (!upscaler.HasContext(desc)) {
             scheduler.Finish();
-            if (!fsr->CreateContext(desc)) {
+            if (!upscaler.CreateContext(desc)) {
                 (upscale_to ? decoupled_unsupported : failed) = true;
                 LOG_ERROR(Render_Vulkan, "[FSR] Context creation failed; stock rendering");
                 return false;
@@ -1811,9 +1842,10 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                       ? fsr4->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
                                        depth_resource, motion->Resource(), upscaled->Resource(),
                                        eval, FsrCamera(), hdr ? (tune.auto_exposure ? 1 : 2) : 0)
-                      : fsr->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
-                                      depth_resource, motion->Resource(), upscaled->Resource(),
-                                      eval, FsrCamera());
+                      : (backend == Backend::AmdFsr ? amd_fsr : fsr)
+                            ->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
+                                       depth_resource, motion->Resource(), upscaled->Resource(),
+                                       eval, FsrCamera());
     }
     scheduler.GetDynamicState().Invalidate(); // the upscaler records its own Vulkan state
     if (!success) {
@@ -2640,6 +2672,7 @@ void BbTemporalDlss::Shutdown(const Instance& instance, Scheduler& scheduler) {
     s.stopped = true;
     scheduler.EndRendering();
     scheduler.Finish();
+    s.amd_fsr.reset();
     s.fsr.reset();
     s.fsr4.reset();
     if (auto* ngx = instance.GetDlssNgx()) {
