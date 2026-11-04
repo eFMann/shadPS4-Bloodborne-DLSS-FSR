@@ -503,6 +503,12 @@ bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific
         switch_on(m_general.redzone_patches);
         switch_on(m_vulkan.pipeline_cache_enabled);
     }
+    if (version < 5) {
+        switch_on(m_vulkan.bb_draw_finisher);
+        switch_on(m_vulkan.bb_async_submit);
+        switch_on(m_vulkan.bb_gx_pipelines);
+        switch_on(m_gpu.bb_early_writeback);
+    }
     if (game_specific && m_gpu.bb_defaults.game_specific_value) {
         m_gpu.bb_defaults.game_specific_value = BbDefaultsVersion;
     }

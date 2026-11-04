@@ -420,8 +420,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // "Copy only kept texture levels" and "Direct texture copies". 4: the threaded renderer's settings
 // that F3 lists only as advanced on, "Real occlusion tests" off (white flicker), the
 // screen-space reflections back to the game's (hidden from F1 for now), "Windows Guest Red Zone
-// Protection" on (crashes without it) and "Enable Shader Cache" on.
-constexpr int BbDefaultsVersion = 4;
+// Protection" on (crashes without it) and "Enable Shader Cache" on. 5: "Draw recorder on two
+// threads", "Submit on the recording thread", "Faster pipeline lookup (1.09)" and "Early GPU data
+// write-back" on (on for everyone, so problems with them get reported).
+constexpr int BbDefaultsVersion = 5;
 
 struct GPUSettings {
     Setting<u32> window_width{1280};
@@ -534,7 +536,7 @@ struct GPUSettings {
     // Threaded renderer: memory a game thread had to wait for a GPU readback of is sent to the GPU
     // as soon as GPU work writes it again, and copied back once the GPU has finished, so the
     // game's next write does not wait. Off: read back only when the game touches it, as before.
-    Setting<bool> bb_early_writeback{false};
+    Setting<bool> bb_early_writeback{true};
     // Threaded renderer: occlusion query results written in order with the queued draws. Off:
     // the decoding thread waits for every queued draw first, as before.
     Setting<bool> bb_occlusion_in_order{true};
@@ -812,17 +814,17 @@ struct VulkanSettings {
     // Pipelines from the engine's objects (F3, Performance; Bloodborne 1.09, applies at a start):
     // a draw whose GX objects were seen before takes the pipeline they gave then, instead of
     // working it out from the registers. Global only.
-    Setting<bool> bb_gx_pipelines{false};
+    Setting<bool> bb_gx_pipelines{true};
     // Recorder split census (F3, Diagnostics): which of the recorder's calls each half of a
     // split recorder would make, in the log every 20 s. Global only.
     Setting<bool> bb_recorder_census{false};
     // Draw recorder on two threads (F3, Performance; with the threaded renderer, applies at
     // once): the recorder's command recording on a thread of its own. Global only.
-    Setting<bool> bb_draw_finisher{false};
+    Setting<bool> bb_draw_finisher{true};
     // Submit on the recording thread (F3, Performance; with the threaded renderer, applies at
     // once): the frame's and the guest submissions' command buffers are ended and submitted by
     // the recording thread, so the GPU threads don't wait for it to catch up. Global only.
-    Setting<bool> bb_async_submit{false};
+    Setting<bool> bb_async_submit{true};
     // Stage uploads in VRAM (F3, Performance; Resizable BAR / Smart Access Memory on a
     // dedicated graphics card, applies at once): streaming uploads are copied by the copy threads
     // straight into a fixed 128 MiB area of graphics card memory instead of system RAM, so the GPU
