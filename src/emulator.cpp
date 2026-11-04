@@ -142,6 +142,18 @@ static void StartExitWatchdog(std::chrono::seconds limit = std::chrono::seconds{
         Common::Log::Flush();
         TerminateProcess(GetCurrentProcess(), 0);
     }).detach();
+#else
+    static std::atomic_flag started = ATOMIC_FLAG_INIT;
+    if (started.test_and_set()) {
+        return;
+    }
+    std::thread([limit] {
+        std::this_thread::sleep_for(limit);
+        LOG_CRITICAL(Loader, "Exit stuck for {} s at: {}; ending the process", limit.count(),
+                     exit_step.load());
+        Common::Log::Flush();
+        _exit(0);
+    }).detach();
 #endif
 }
 
@@ -702,9 +714,14 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Faster Windows locks and sleeps (threaded renderer toggle): decided before the game's
     // threads start, as a lock can't change implementation while in use.
+    // Windows only: the locks and sleeps it replaces are Windows' own.
+#ifdef _WIN32
     Common::BbTuning::fast_locks.store(Common::BbTuning::IsBloodborne(id) &&
                                        EmulatorSettings.IsThreadedRenderer() &&
                                        EmulatorSettings.IsBbFastLocks());
+#else
+    Common::BbTuning::fast_locks.store(false);
+#endif
     LOG_INFO(Loader, "Faster Windows locks and sleeps: {}",
              Common::BbTuning::FastLocks() ? "on" : "off");
 

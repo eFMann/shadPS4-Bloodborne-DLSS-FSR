@@ -137,6 +137,10 @@ public:
     static constexpr u32 NoDrainReason = 0xFFFF;
     /// The GPU command thread or the draw recording thread.
     [[nodiscard]] bool IsGpuSideThread() const;
+#ifdef __linux__
+    /// IsGpuSideThread for another thread, by its kernel thread id (userfaultfd's faults).
+    [[nodiscard]] bool IsGpuSideThreadId(u32 tid) const;
+#endif
 
     /// Threaded renderer: runs `task` with a copy of `data` in order with the draws handed to
     /// the draw recording thread (on that thread), or here at once when none are. `write_addr`
@@ -660,6 +664,9 @@ private:
     alignas(64) bool fin_profile{};
     std::chrono::steady_clock::time_point fin_profile_last{};
     static inline thread_local bool on_finish_thread = false;
+#ifdef __linux__
+    std::atomic<u32> finish_tid{0};
+#endif
     std::atomic<u64> fin_busy_ticks{0}; ///< TSC ticks
     std::array<std::atomic<u64>, static_cast<size_t>(FinishWait::Count)> fin_waits{};
     std::array<std::atomic<s64>, static_cast<size_t>(FinishWait::Count)> fin_wait_ns{};

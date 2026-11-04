@@ -1513,6 +1513,9 @@ void Rasterizer::StopFinisher() {
 void Rasterizer::RunFinisher() {
     Common::SetCurrentThreadName("shadPS4:GpuDrawFinisher");
     on_finish_thread = true;
+#ifdef __linux__
+    finish_tid.store(gettid(), std::memory_order_relaxed);
+#endif
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     const u32 threads = std::thread::hardware_concurrency();
     const auto spin_time = std::chrono::microseconds(threads >= 12 ? 200 : 50);
@@ -7299,6 +7302,14 @@ void Rasterizer::LogDrawPipeStats() {
     pipe_stats_drain_time = draw_pipe->drain_time;
     pipe_stats_busy = busy;
 }
+
+#ifdef __linux__
+bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
+    return tid != 0 &&
+           (tid == liverpool->GetGpuCommandProcessorThreadId() ||
+            tid == DrawPipe::StageBThreadId() || tid == finish_tid.load(std::memory_order_relaxed));
+}
+#endif
 
 std::thread::id Rasterizer::GetGpuCommandProcessorThread() {
     return liverpool->GetGpuCommandProcessorThread();

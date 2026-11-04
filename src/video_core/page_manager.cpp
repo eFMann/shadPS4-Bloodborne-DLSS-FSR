@@ -522,8 +522,8 @@ public:
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
             const auto ptid = msg.arg.pagefault.feat.ptid;
-            rasterizer->InvalidateMemory(addr, 1,
-                                         ptid == rasterizer->GetGpuCommandProcessorThreadId());
+            // The GPU threads (command thread, draw recorder, finisher) hold the locks.
+            rasterizer->InvalidateMemory(addr, 1, rasterizer->IsGpuSideThreadId(ptid));
 
             // Some calls to InvalidateMemory never reach the UFFDIO_WRITEPROTECT ioctl in
             // ::Protect, therefore we use MODE_DONTWAKE and wake the thread with UFFDIO_WAKE here

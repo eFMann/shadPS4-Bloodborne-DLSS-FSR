@@ -22,6 +22,9 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 #include "common/assert.h"
 #include "common/guest_stats.h"
@@ -73,6 +76,13 @@ public:
     [[nodiscard]] static bool OnStageB() noexcept {
         return role == Role::StageB;
     }
+#ifdef __linux__
+    /// Stage B's kernel thread id (0 before it starts), for userfaultfd's faults, which are
+    /// handled on another thread.
+    [[nodiscard]] static u32 StageBThreadId() noexcept {
+        return stage_b_tid.load(std::memory_order_relaxed);
+    }
+#endif
 
     /// Stage A: space for a packet of `size` bytes, valid until Commit().
     u8* Begin(u32 size) {
@@ -183,6 +193,9 @@ private:
         Common::SetCurrentThreadName("shadPS4:GpuDrawRecorder");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         role = Role::StageB;
+#ifdef __linux__
+        stage_b_tid.store(gettid(), std::memory_order_relaxed);
+#endif
         Common::GuestStats::on_recorder = true;
         u64 at = 0;
         while (true) {
@@ -231,6 +244,9 @@ private:
     }
 
     static inline thread_local Role role = Role::None;
+#ifdef __linux__
+    static inline std::atomic<u32> stage_b_tid{0};
+#endif
     Handler handler;
     void* context;
     std::unique_ptr<u8[]> ring;

@@ -1166,8 +1166,10 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 }
             }
             if (tr && advanced) {
+#ifdef _WIN32
                 AddSettingCheckbox("Faster Windows locks and sleeps", bbFastLocksSetting,
                                    "Less CPU overhead (needs a restart)");
+#endif
                 AddSettingCheckbox("Overlap GPU submissions", bbSubmitOverlapSetting,
                                    "The next submission is decoded while the last is recorded");
                 AddSettingCheckbox("Overlap game and GPU frames", bbOverlapFramesSetting,
@@ -1216,11 +1218,13 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                     [](bool v) { EmulatorSettings.SetBbGxPipelines(v); },
                     "Pipelines taken from the engine's objects; stops by itself on any "
                     "difference (needs a restart)");
+#ifdef _WIN32
                 const bool off_core0 = live(
                     "Keep render threads off core 0", EmulatorSettings.IsBbRenderThreadsOffCore0(),
                     [](bool v) { EmulatorSettings.SetBbRenderThreadsOffCore0(v); },
                     "Windows: the render threads avoid the core that handles most interrupts");
                 Common::RenderAffinity::Set(off_core0);
+#endif
             }
 
             // ---------------------------------------------------------------------------------
@@ -1336,7 +1340,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingSection("Interface", "The emulator's in-game windows (F1, F3, pop-ups).",
                               false);
             AddSettingCheckbox("Menus sized by screen pixels", bbIgnoreDisplayScaleSetting,
-                               "Ignores Windows display scaling (125%, 150%), as games do");
+                               "Ignores the desktop's display scaling (125%, 150%), as games do");
 
             // ---------------------------------------------------------------------------------
             AddSettingSection("Diagnostics", "For troubleshooting. Slower when on: leave off.",
