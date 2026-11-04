@@ -53,7 +53,8 @@ Both rendered at 1280x720; open them full size to compare.
 - FSR 3.1 and FSR frame generation: any GPU that runs shadPS4
 - FSR 4 add-on (optional): a GPU with INT8 dot products and compute shader derivatives, such as
   a Radeon RX 6000 or newer, an RTX card or an Intel Arc card
-- AMD FSR 4.1 (optional, Windows): a Radeon RX 6000 or newer and a current Adrenalin driver
+- AMD FSR 4.1 (optional, Windows): a Radeon RX 9000 series card (RDNA 4; older Radeons are
+  untested) and a current Adrenalin driver
 
 ## Install
 
@@ -117,8 +118,8 @@ the first release that runs it on Vulkan. Windows only.
 2. Copy `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from the SDK's
    [`Kits/FidelityFX/signedbin`](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
    into it.
-3. Start the game and pick *FSR 4.1.2 (AMD)* in F1 (the version comes from the DLL).
-   *Automatic* does not pick it.
+3. Start the game and pick *FSR 4.1.2 (AMD)* in F1 (the version comes from the DLL), or set
+   `upscaler=amdfsr` in `dlss.ini`. *Automatic* does not pick it.
 
 Delete the folder to remove it. FSR 3.1 and the FSR 4 add-on are unaffected. Tested on a
 Radeon RX 9070 XT (driver 26.10.1), 2560x1440 to 3840x2160.

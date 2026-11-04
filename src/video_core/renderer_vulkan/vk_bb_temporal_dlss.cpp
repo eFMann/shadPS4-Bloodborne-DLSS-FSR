@@ -436,7 +436,7 @@ constexpr char DefaultSettings[] =
 enabled=1
 
 # auto = DLSS on NVIDIA RTX cards, else FSR 4 when its add-on is installed, else FSR 3.1;
-# or dlss, fsr4, fsr
+# or dlss, fsr4, fsr, amdfsr (AMD FSR 4.1, never picked by auto)
 upscaler=auto
 
 # DLSS model: 13 = M, 11 = K, 10 = J, 12 = L, 0 = NVIDIA default
@@ -1585,6 +1585,13 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         if (!upscaler.HasContext(desc)) {
             scheduler.Finish();
             if (!upscaler.CreateContext(desc)) {
+                if (backend == Backend::AmdFsr) {
+                    // Unloaded, not failed: F1 shows the reason and FSR 3.1 stays selectable.
+                    amd_fsr.reset();
+                    backend = Backend::None;
+                    LOG_ERROR(Render_Vulkan, "[FSR] AMD FSR context creation failed; unloaded");
+                    return false;
+                }
                 (upscale_to ? decoupled_unsupported : failed) = true;
                 LOG_ERROR(Render_Vulkan, "[FSR] Context creation failed; stock rendering");
                 return false;
