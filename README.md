@@ -12,7 +12,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 > for the threaded renderer, frame pacing, character motion vectors and VRAM work he has already
 > contributed. Old links to `IFreemz/shadPS4-Bloodborne-DLSS-FSR` redirect here.
 
-> **New: [2.1.0](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0), the biggest update yet.** A new multi-threaded renderer (up to 3x the frame rate with the BB PC Remaster mod), almost all stutters gone, resolution and FPS cap set in F1 (no resolution or FPS patches needed), Better ambient occlusion and Better SSR built in, a Linux build, and shadPS4 0.21.0. See the [release notes](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0). Bug reports are welcome in the [issues](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues).
+> **New: [2.1.1](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/latest), the biggest update yet.** A new multi-threaded renderer (up to 3x the frame rate with the BB PC Remaster mod), almost all stutters gone, resolution and FPS cap set in F1 (no resolution or FPS patches needed), Better ambient occlusion and Better SSR built in, a Linux build, and shadPS4 0.21.0. See the [release notes](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/latest). Bug reports are welcome in the [issues](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues).
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
@@ -242,7 +242,7 @@ left out of the timing. Routes without enemies repeat best: enemies can act diff
 ### HDR with RenoDX
 
 > [!WARNING]
-> **RenoDX doesn't work with 2.0.0 and later builds yet, including 2.1.0.** shadPS4 0.20.0 and
+> **RenoDX doesn't work with 2.0.0 and later builds yet, including 2.1.x.** shadPS4 0.20.0 and
 > newer compile the game's shaders differently, so RenoDX doesn't recognise them until it gets an
 > update. For HDR, use
 > [1.8.6](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.6) or [2.1.0-pre.1](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1) (experimental) for now.
