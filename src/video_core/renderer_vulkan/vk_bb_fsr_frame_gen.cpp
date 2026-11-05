@@ -4,20 +4,31 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <optional>
+#include <unordered_map>
+
+#include <fmt/format.h>
 
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_bb_fsr_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_fsr_upscaler.h"
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+#if defined(_WIN32) || defined(__linux__)
+#ifndef _WIN32
+// ffx_api.h marks its declarations __declspec(dllexport).
+#define __declspec(x)
+#endif
 #include <ffx_api/ffx_framegeneration.h>
 #include <ffx_api/vk/ffx_api_vk.h>
-#include <windows.h>
+#ifndef _WIN32
+#undef __declspec
+#endif
+#include "video_core/renderer_vulkan/vk_bb_library.h"
 #define BB_FSR_FRAME_GEN 1
 #endif
 
@@ -26,7 +37,12 @@ namespace Vulkan::FsrFrameGen {
 namespace {
 bool selected{};
 std::string problem;
+std::string wanted_generator{"auto"};
 } // namespace
+
+void SetGenerator(std::string_view generator) {
+    wanted_generator = generator;
+}
 
 void Select() {
     selected = true;
@@ -45,7 +61,7 @@ std::string Problem() {
 
 namespace {
 struct Api {
-    HMODULE module{};
+    void* module{};
     PfnFfxCreateContext create{};
     PfnFfxDestroyContext destroy{};
     PfnFfxConfigure configure{};
@@ -54,6 +70,15 @@ struct Api {
 };
 Api api;
 bool active{};
+// DLSS Frame Generation as the generator (Linux, RTX 40 and 50 series): the swapchain still
+// presents and paces the frames, and DLSS-G writes the generated one where FSR would.
+DlssNgx* dlss{};
+bool use_dlss{};
+std::atomic<u32> wanted_multiplier{2};
+// Generated frames per rendered frame the swapchain was given (0: not yet, for this swapchain).
+u32 applied_generated{};
+// The key of the Linux library's patched swapchain (fsr3_linux/patches).
+constexpr u64 GeneratedFramesKey = 0x5348;
 
 vk::PhysicalDevice physical_device;
 vk::Device device;
@@ -96,7 +121,11 @@ FfxApiResource Image(vk::Image image, vk::Format format, vk::Extent2D extent, ui
     return resource;
 }
 
+ffxReturnCode_t GenerateWithDlss(ffxDispatchDescFrameGeneration* params);
+
 ffxReturnCode_t DispatchGeneration(ffxDispatchDescFrameGeneration* params, void* user) {
+    if (use_dlss)
+        return GenerateWithDlss(params);
     // FFX's swapchain passes scRGB (RenoDX HDR) with a luminance range of 0..0, which leaves
     // the UI found by comparing with the HUD-less image out of the generated frames.
     if (params->backbufferTransferFunction == FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB &&
@@ -160,15 +189,262 @@ bool EnsureContext(vk::Extent2D display, vk::Extent2D render, bool inverted) {
              display.height, max_render.width, max_render.height);
     return true;
 }
+
+struct OwnedImage {
+    vk::Image image;
+    vk::DeviceMemory memory;
+    vk::ImageView view;
+    vk::Extent2D extent{};
+    vk::Format format{};
+    bool written{};
+};
+// Copies of the frame's inputs: the upscaler reuses its own before the swapchain generates.
+OwnedImage dlss_depth, dlss_motion, dlss_hudless;
+std::optional<FrameGen::FrameInputs> dlss_inputs;
+bool dlss_has_hudless{};
+bool dlss_reset{};
+std::unordered_map<VkImage, vk::ImageView> dlss_views;
+bool dlss_feature{};
+vk::Extent2D dlss_feature_display{}, dlss_feature_render{};
+VkFormat dlss_feature_format{};
+bool dlss_failure_logged{};
+
+// Motion vectors are in render pixels. bbport verified DLSS-G with a scale of 1 on Linux;
+// SHADPS4_DLSSG_MVEC_SCALE=render gives the 1 / render size Streamline gets on Windows, or a
+// number, to compare.
+std::array<float, 2> MvecScale(vk::Extent2D render) {
+    static const std::string setting = [] {
+        const char* value = std::getenv("SHADPS4_DLSSG_MVEC_SCALE");
+        return std::string{value ? value : ""};
+    }();
+    if (setting == "render")
+        return {1.0f / float(render.width), 1.0f / float(render.height)};
+    if (!setting.empty())
+        return {float(std::atof(setting.c_str())), float(std::atof(setting.c_str()))};
+    return {1.0f, 1.0f};
+}
+
+void DestroyOwned(OwnedImage& owned) {
+    if (owned.view)
+        device.destroyImageView(owned.view);
+    if (owned.image)
+        device.destroyImage(owned.image);
+    if (owned.memory)
+        device.freeMemory(owned.memory);
+    owned = {};
+}
+
+bool EnsureOwned(OwnedImage& owned, vk::Extent2D extent, vk::Format format) {
+    if (owned.image && owned.extent == extent && owned.format == format)
+        return true;
+    DestroyOwned(owned);
+    const auto [image_result, image] = device.createImage(vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+    });
+    if (image_result != vk::Result::eSuccess)
+        return false;
+    owned.image = image;
+    const auto requirements = device.getImageMemoryRequirements(image);
+    const auto properties = physical_device.getMemoryProperties();
+    u32 type = ~0u;
+    for (u32 i = 0; i < properties.memoryTypeCount && type == ~0u; ++i)
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal))
+            type = i;
+    if (type == ~0u)
+        return DestroyOwned(owned), false;
+    const auto [memory_result, memory] = device.allocateMemory(
+        vk::MemoryAllocateInfo{.allocationSize = requirements.size, .memoryTypeIndex = type});
+    if (memory_result != vk::Result::eSuccess)
+        return DestroyOwned(owned), false;
+    owned.memory = memory;
+    if (device.bindImageMemory(image, memory, 0) != vk::Result::eSuccess)
+        return DestroyOwned(owned), false;
+    const auto [view_result, view] = device.createImageView(vk::ImageViewCreateInfo{
+        .image = image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (view_result != vk::Result::eSuccess)
+        return DestroyOwned(owned), false;
+    owned.view = view;
+    owned.extent = extent;
+    owned.format = format;
+    return true;
+}
+
+void Transition(vk::CommandBuffer command, vk::Image image, vk::ImageLayout from,
+                vk::ImageLayout to) {
+    const vk::ImageMemoryBarrier barrier{
+        .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+        .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+        .oldLayout = from,
+        .newLayout = to,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                            vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, barrier);
+}
+
+// From the shader-read layout the presenter leaves the inputs in to the copy, kept general.
+bool CopyInput(vk::CommandBuffer command, vk::Image source, OwnedImage& copy, vk::Extent2D extent,
+               vk::Format format) {
+    if (!EnsureOwned(copy, extent, format))
+        return false;
+    Transition(command, source, vk::ImageLayout::eShaderReadOnlyOptimal,
+               vk::ImageLayout::eTransferSrcOptimal);
+    Transition(command, copy.image,
+               copy.written ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+               vk::ImageLayout::eTransferDstOptimal);
+    const vk::ImageCopy region{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .extent = {extent.width, extent.height, 1},
+    };
+    command.copyImage(source, vk::ImageLayout::eTransferSrcOptimal, copy.image,
+                      vk::ImageLayout::eTransferDstOptimal, region);
+    Transition(command, source, vk::ImageLayout::eTransferSrcOptimal,
+               vk::ImageLayout::eShaderReadOnlyOptimal);
+    Transition(command, copy.image, vk::ImageLayout::eTransferDstOptimal,
+               vk::ImageLayout::eGeneral);
+    copy.written = true;
+    return true;
+}
+
+vk::ImageView ViewOf(VkImage image) {
+    if (const auto it = dlss_views.find(image); it != dlss_views.end())
+        return it->second;
+    const auto [result, view] = device.createImageView(vk::ImageViewCreateInfo{
+        .image = image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = static_cast<vk::Format>(current_format),
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (result != vk::Result::eSuccess)
+        return {};
+    dlss_views.emplace(image, view);
+    return view;
+}
+
+// The swapchain's images change with it; the caller has drained the GPU.
+void ReleaseDlssAfterGpuDrain() {
+    if (dlss_feature)
+        dlss->FrameGenReleaseAfterGpuDrain();
+    dlss_feature = false;
+    for (const auto& [_, view] : dlss_views)
+        device.destroyImageView(view);
+    dlss_views.clear();
+}
+
+void StoreDlssInputs(vk::CommandBuffer command, const FrameGen::FrameInputs& inputs,
+                     const FrameGen::OverlayInputs* overlays) {
+    if (!CopyInput(command, inputs.depth, dlss_depth, inputs.render, vk::Format::eR32Sfloat) ||
+        !CopyInput(command, inputs.motion, dlss_motion, inputs.render, vk::Format::eR16G16Sfloat)) {
+        dlss_inputs.reset();
+        return;
+    }
+    dlss_has_hudless = overlays && overlays->hudless &&
+                       CopyInput(command, overlays->hudless, dlss_hudless, overlays->extent,
+                                 overlays->hudless_format);
+    dlss_inputs = inputs;
+    dlss_inputs->resources.reset();
+    dlss_reset |= inputs.reset;
+}
+
+ffxReturnCode_t GenerateWithDlss(ffxDispatchDescFrameGeneration* params) {
+    // DLSS-G does not take scRGB.
+    if (!dlss_inputs || current_format == VK_FORMAT_R16G16B16A16_SFLOAT)
+        return FFX_API_RETURN_ERROR;
+    const auto command = vk::CommandBuffer{static_cast<VkCommandBuffer>(params->commandList)};
+    const vk::Extent2D display{params->presentColor.description.width,
+                               params->presentColor.description.height};
+    const vk::Extent2D render = dlss_inputs->render;
+    if (!dlss_feature || dlss_feature_display != display || dlss_feature_render != render ||
+        dlss_feature_format != current_format) {
+        if (dlss_feature) {
+            (void)device.waitIdle();
+            dlss->FrameGenReleaseAfterGpuDrain();
+            dlss_feature = false;
+        }
+        dlss_feature = dlss->FrameGenCreate(
+            command, {display, render, static_cast<vk::Format>(current_format)});
+        if (!dlss_feature) {
+            if (!dlss_failure_logged)
+                LOG_ERROR(Render_Vulkan, "[FSR-FG] DLSS frame generation could not start");
+            dlss_failure_logged = true;
+            return FFX_API_RETURN_ERROR;
+        }
+        dlss_feature_display = display;
+        dlss_feature_render = render;
+        dlss_feature_format = current_format;
+    }
+    const auto backbuffer_image = static_cast<VkImage>(params->presentColor.resource);
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    const auto format = static_cast<vk::Format>(current_format);
+    const DlssNgx::Resource backbuffer{backbuffer_image, ViewOf(backbuffer_image), range, format,
+                                       display};
+    const DlssNgx::Resource depth{dlss_depth.image, dlss_depth.view, range, dlss_depth.format,
+                                  render};
+    const DlssNgx::Resource motion{dlss_motion.image, dlss_motion.view, range, dlss_motion.format,
+                                   render};
+    const DlssNgx::Resource hudless{dlss_hudless.image, dlss_hudless.view, range,
+                                    dlss_hudless.format, dlss_hudless.extent};
+    const bool with_hudless = dlss_has_hudless && dlss_hudless.extent == display;
+    if (!backbuffer.view)
+        return FFX_API_RETURN_ERROR;
+    // The swapchain hands over the frame in the shader-read layout, the outputs in the general
+    // one; each generated frame in order.
+    Transition(command, backbuffer_image, vk::ImageLayout::eShaderReadOnlyOptimal,
+               vk::ImageLayout::eGeneral);
+    const u32 count = std::max(params->numGeneratedFrames, 1u);
+    bool generated = true;
+    for (u32 i = 0; i < count && generated; ++i) {
+        const auto output_image = static_cast<VkImage>(params->outputs[i].resource);
+        const DlssNgx::Resource output{output_image, ViewOf(output_image), range, format, display};
+        generated =
+            output.view &&
+            dlss->FrameGenEvaluate(command, backbuffer, depth, motion, output,
+                                   with_hudless ? &hudless : nullptr, *dlss_inputs,
+                                   MvecScale(render), dlss_reset || params->reset, count, i + 1);
+    }
+    Transition(command, backbuffer_image, vk::ImageLayout::eGeneral,
+               vk::ImageLayout::eShaderReadOnlyOptimal);
+    dlss_reset = false;
+    return generated ? FFX_API_RETURN_OK : FFX_API_RETURN_ERROR;
+}
 } // namespace
 
-bool PlanQueues(vk::Instance instance, vk::PhysicalDevice physical, u32 graphics_family,
-                QueuePlan& plan) {
+bool PlanQueues([[maybe_unused]] vk::Instance instance, vk::PhysicalDevice physical,
+                u32 graphics_family, [[maybe_unused]] vk::SurfaceKHR surface, QueuePlan& plan) {
     const auto families = physical.getQueueFamilyProperties();
+#ifdef _WIN32
     // vkGetPhysicalDeviceWin32PresentationSupportKHR, from VK_KHR_win32_surface.
     using PresentationSupport = VkBool32(VKAPI_PTR*)(VkPhysicalDevice, uint32_t);
     const auto presentation_support = reinterpret_cast<PresentationSupport>(
         instance.getProcAddr("vkGetPhysicalDeviceWin32PresentationSupportKHR"));
+    const auto can_present = [&](u32 family) {
+        return presentation_support &&
+               presentation_support(static_cast<VkPhysicalDevice>(physical), family);
+    };
+#else
+    const auto can_present = [&](u32 family) {
+        if (!surface)
+            return false;
+        const auto [result, supported] = physical.getSurfaceSupportKHR(family, surface);
+        return result == vk::Result::eSuccess && supported;
+    };
+#endif
     std::vector<u32> used(families.size());
     used[graphics_family] = 1; // the emulator's queue
     const auto take = [&](auto&& wanted, bool prefer_other_family) -> QueuePlan::Slot {
@@ -184,12 +460,7 @@ bool PlanQueues(vk::Instance instance, vk::PhysicalDevice physical, u32 graphics
         }
         return {};
     };
-    plan.present = take(
-        [&](u32 family) {
-            return presentation_support &&
-                   presentation_support(static_cast<VkPhysicalDevice>(physical), family);
-        },
-        false);
+    plan.present = take(can_present, false);
     plan.acquire = take([](u32) { return true; }, true);
     plan.compute = take(
         [&](u32 family) {
@@ -209,7 +480,7 @@ bool PlanQueues(vk::Instance instance, vk::PhysicalDevice physical, u32 graphics
 }
 
 void SetDevice(vk::PhysicalDevice physical, vk::Device device_, vk::Queue game_queue,
-               u32 game_family, const QueuePlan& plan) {
+               u32 game_family, const QueuePlan& plan, DlssNgx* dlss_ngx) {
     if (!selected)
         return;
     physical_device = physical;
@@ -229,25 +500,38 @@ void SetDevice(vk::PhysicalDevice physical, vk::Device device_, vk::Queue game_q
     acquire = queue(plan.acquire);
     compute = queue(plan.compute);
 
-    const auto path = []() {
-        std::wstring buffer(MAX_PATH, L'\0');
-        buffer.resize(GetModuleFileNameW(nullptr, buffer.data(), DWORD(buffer.size())));
-        return std::filesystem::path{buffer}.parent_path() / L"amd_fidelityfx_vk.dll";
-    }();
-    api.module = LoadLibraryW(path.c_str());
+    constexpr char name[] = BB_LIBRARY_NAME("amd_fidelityfx_vk.dll", "libamd_fidelityfx_vk.so");
+    api.module = BbLibrary::Load(BbLibrary::ExecutableDirectory() / name);
     if (!api.module)
-        return Fail("amd_fidelityfx_vk.dll is missing next to shadPS4.exe.");
-    const auto get = [](auto& function, const char* name) {
-        function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
-            GetProcAddress(api.module, name));
+        return Fail(fmt::format("{} is missing next to {}.", name,
+                                BB_LIBRARY_NAME("shadPS4.exe", "shadps4")));
+    const auto get = [](auto& function, const char* symbol) {
+        function = BbLibrary::Find<std::remove_reference_t<decltype(function)>>(api.module, symbol);
         return function != nullptr;
     };
     if (!get(api.create, "ffxCreateContext") || !get(api.destroy, "ffxDestroyContext") ||
         !get(api.configure, "ffxConfigure") || !get(api.query, "ffxQuery") ||
         !get(api.dispatch, "ffxDispatch"))
-        return Fail("amd_fidelityfx_vk.dll is missing entry points.");
+        return Fail(fmt::format("{} is missing entry points.", name));
+    dlss = dlss_ngx;
+    use_dlss = wanted_generator != "fsr" && dlss && dlss->FrameGenMaxCount() > 0;
+    if (!use_dlss && wanted_generator == "dlss")
+        return Fail("DLSS frame generation needs an NVIDIA RTX 40 or 50 series GPU, a current "
+                    "driver and libnvidia-ngx-dlssg.so next to shadps4.");
     active = true;
-    LOG_INFO(Render_Vulkan, "[FSR-FG] Ready");
+    LOG_INFO(Render_Vulkan, "[FSR-FG] Ready, generating with {}", use_dlss ? "DLSS" : "FSR");
+}
+
+bool UsingDlss() {
+    return active && use_dlss;
+}
+
+void SetMultiplier(u32 frames_shown) {
+    wanted_multiplier = frames_shown;
+}
+
+u32 MaxMultiplier() {
+    return UsingDlss() ? dlss->FrameGenMaxCount() + 1 : 2;
 }
 
 bool Active() {
@@ -257,6 +541,12 @@ bool Active() {
 void Shutdown() {
     if (!api.module)
         return;
+    if (use_dlss) {
+        (void)device.waitIdle();
+        ReleaseDlssAfterGpuDrain();
+        for (auto* owned : {&dlss_depth, &dlss_motion, &dlss_hudless})
+            DestroyOwned(*owned);
+    }
     if (context) {
         api.destroy(&context, nullptr);
         context = {};
@@ -302,6 +592,7 @@ vk::Result CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::Swapchain
     }
     swapchain = handle;
     current_swapchain = handle;
+    applied_generated = 0;
     current_format = create_info.imageFormat;
     last_present_count = functions.pOutGetLastPresentCountFFXAPI
                              ? functions.pOutGetLastPresentCountFFXAPI(handle)
@@ -312,6 +603,10 @@ vk::Result CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::Swapchain
 void DestroySwapchain(vk::SwapchainKHR swapchain) {
     // The generation context presents to it.
     DestroyContext();
+    if (use_dlss) {
+        (void)device.waitIdle();
+        ReleaseDlssAfterGpuDrain();
+    }
     if (functions.pOutDestroySwapchainFFXAPI)
         functions.pOutDestroySwapchainFFXAPI(device, swapchain, nullptr, swapchain_context);
     if (static_cast<VkSwapchainKHR>(swapchain) == current_swapchain)
@@ -353,6 +648,23 @@ void SetFrame(const FrameGen::FrameInputs* inputs, const FrameGen::OverlayInputs
     if (!context)
         return;
 
+    if (use_dlss) {
+        const u32 generated = std::clamp(wanted_multiplier.load(), 2u, MaxMultiplier()) - 1;
+        if (generated != applied_generated) {
+            u32 value = generated;
+            ffxConfigureDescFrameGenerationSwapChainKeyValueVK key{};
+            key.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_VK;
+            key.key = GeneratedFramesKey;
+            key.ptr = &value;
+            if (api.configure(&swapchain_context, &key.header) == FFX_API_RETURN_OK)
+                LOG_INFO(Render_Vulkan, "[FSR-FG] DLSS-G {}x", generated + 1);
+            else
+                LOG_WARNING(Render_Vulkan, "[FSR-FG] The swapchain took no multiplier ({}x)",
+                            generated + 1);
+            applied_generated = generated;
+        }
+    }
+
     ++frame_id;
     ffxConfigureDescFrameGeneration config{};
     config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
@@ -377,6 +689,8 @@ void SetFrame(const FrameGen::FrameInputs* inputs, const FrameGen::OverlayInputs
     }
     if (!inputs)
         return;
+    if (use_dlss)
+        return StoreDlssInputs(command, *inputs, overlays);
 
     ffxDispatchDescFrameGenerationPrepareCameraInfo camera{};
     camera.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
@@ -418,11 +732,18 @@ u32 TakeShown() {
 
 #else
 
-bool PlanQueues(vk::Instance, vk::PhysicalDevice, u32, QueuePlan&) {
+bool UsingDlss() {
+    return false;
+}
+void SetMultiplier(u32) {}
+u32 MaxMultiplier() {
+    return 2;
+}
+bool PlanQueues(vk::Instance, vk::PhysicalDevice, u32, vk::SurfaceKHR, QueuePlan&) {
     selected = false;
     return false;
 }
-void SetDevice(vk::PhysicalDevice, vk::Device, vk::Queue, u32, const QueuePlan&) {}
+void SetDevice(vk::PhysicalDevice, vk::Device, vk::Queue, u32, const QueuePlan&, DlssNgx*) {}
 bool Active() {
     return false;
 }

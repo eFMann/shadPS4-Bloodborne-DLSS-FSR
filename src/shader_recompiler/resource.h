@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
@@ -100,7 +101,7 @@ struct BufferResource {
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer;
-        if (!sharp_fetch.Fetch(info.flattened_ud_buf.data(), &buffer)) {
+        if (!sharp_fetch.Fetch(info.FlatUserData().data(), &buffer)) {
             return AmdGpu::Buffer::Null();
         }
         if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
@@ -109,7 +110,7 @@ struct BufferResource {
             buffer.stride = 0;
             buffer.num_records <<= post_op_dw2_shift;
         } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
-            buffer.base_address += info.pgm_base;
+            buffer.base_address += info.ProgramBase();
         }
         if (!buffer.Valid()) {
             return AmdGpu::Buffer::Null();
@@ -125,6 +126,14 @@ enum class MipStorageFallbackMode : u16 {
     ConstantIndex,
 };
 
+/// Reads that depend on the texture's exact size in texels (a smaller copy would read wrong).
+enum ExactTexelRead : u8 {
+    ExactTexelFetch = 1 << 0,
+    ExactTexelSizeQuery = 1 << 1,
+    ExactTexelLodQuery = 1 << 2,
+    ExactTexelUnnormalized = 1 << 3,
+};
+
 struct ImageResource {
     SharpFetch<AmdGpu::Image> sharp_fetch{};
     bool is_depth{};
@@ -133,12 +142,13 @@ struct ImageResource {
     bool is_written{};
     bool is_r128{};
     u8 constant_mip_index{};
+    u8 exact_texel_reads{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
-        if (!Fetch(info.flattened_ud_buf.data(), &image)) {
+        if (!Fetch(info.FlatUserData().data(), &image)) {
             return AmdGpu::Image::Null(is_depth);
         }
         if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
@@ -187,9 +197,9 @@ struct SamplerResource {
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
-        sharp_fetch.Fetch(info.flattened_ud_buf.data(), &sampler);
+        sharp_fetch.Fetch(info.FlatUserData().data(), &sampler);
         if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
-            const u32 tsharp_dw3 = info.flattened_ud_buf[post_op_tsharp_dw3_off];
+            const u32 tsharp_dw3 = info.FlatUserData()[post_op_tsharp_dw3_off];
             if (((tsharp_dw3 >> 12) & 0xff) == 0) {
                 sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
@@ -225,18 +235,35 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
+    static constexpr u32 MotionParamIndex = BufOffsetIndex + 3;
+    /// Vertex shaders with the upscaler jitter (runtime_info.h, ClipJitter) declare all 56 bytes
+    /// of buf_offsets (bindings 32-47 in a uvec4, 48-55 in a uvec2), then motion_param and
+    /// clip_jitter. The layout above leaves bindings 40-55 outside its members, so a member
+    /// after it would be read as their buffer offsets.
+    static constexpr u32 JitterMotionParamIndex = BufOffsetIndex + 4;
+    static constexpr u32 JitterClipJitterIndex = BufOffsetIndex + 5;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    /// Character motion vectors: device address of this draw's parameters (low, high).
+    std::array<u32, 2> motion_param;
+    /// Upscaler jitter in normalized device coordinates (x, y), times w (runtime_info.h,
+    /// ClipJitter). 0 for draws that are not jittered.
+    std::array<float, 2> clip_jitter;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
         buf_offsets[binding] = offset;
     }
 };
+static_assert(offsetof(PushData, buf_offsets) == 16 && offsetof(PushData, motion_param) == 72 &&
+                  offsetof(PushData, clip_jitter) == 80,
+              "the clip jitter push data layout (spirv_emit_context.cpp) assumes these offsets");
+static_assert(offsetof(PushData, motion_param) % 8 == 0,
+              "motion_param is read as a uvec2 and must be 8-byte aligned");
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

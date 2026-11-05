@@ -1,0 +1,5 @@
+The data covered by this license reference is the 90 FPS++ patch for Bloodborne 1.09 by Kyo,
+as published in shadPS4's patch repository (https://github.com/shadps4-emu/ps4_cheats,
+PATCHES/Bloodborne.xml), where it is distributed for use with shadPS4. That repository publishes
+no license for it. It is included here, unchanged, so that the frame rate setting does not
+depend on the version of the patch file a user has; all rights to it remain with its author.

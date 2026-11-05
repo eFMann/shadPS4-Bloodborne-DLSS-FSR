@@ -3,6 +3,15 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -82,8 +91,29 @@ public:
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    Program* PreloadVariant(Serialization::Archive& ar, size_t& perm_idx);
 
-    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+    /// `may_defer` (GPU command thread, threaded renderer): a new pipeline for a scene draw
+    /// (depth tested, into a depth target used in each of the last 8 game frames) is built on a
+    /// background thread and null returned, so the draw is skipped until it is ready (Background
+    /// pipeline compiles setting).
+    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
+                                                bool may_defer = false);
+
+    /// Counts game frames (any thread): render target history for deferred compiles.
+    void OnGameFrame() noexcept {
+        game_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// A pipeline the caller remembers for this draw's state (the GX pipeline memo): what
+    /// GetGraphicsPipeline does besides finding it (each stage's user data and resource tables
+    /// read for this draw, the depth target's use). Null when finished background work is
+    /// waiting: GetGraphicsPipeline then. Direct draws only.
+    const GraphicsPipeline* ReuseGraphicsPipeline(const GraphicsPipeline* pipeline);
+    /// Changes when pipelines are destroyed (shader replacement): remembered ones are void then.
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation;
+    }
 
     const ComputePipeline* GetComputePipeline();
 
@@ -119,6 +149,25 @@ private:
         return num_new_pipelines > 0;
     }
 
+    // Background pipeline compiles.
+    void NoteDepthTarget();
+    [[nodiscard]] bool MayDefer() const;
+    void StartBackgroundCompile();
+    void StartBackgroundShader(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                               const Shader::ShaderParams& params,
+                               const Shader::RuntimeInfo& runtime_info,
+                               const Shader::Backend::Bindings& binding,
+                               std::optional<Shader::StageSpecialization> spec);
+    [[nodiscard]] bool IsShaderPending(u64 hash,
+                                       const Shader::StageSpecialization* spec = nullptr) const;
+    void CollectBackgroundPipelines(bool shaders = true);
+    void CompileWorker(std::stop_token stop);
+    // The driver's own pipeline cache, kept between sessions.
+    [[nodiscard]] std::filesystem::path DriverCachePath() const;
+    vk::UniquePipelineCache CreateDriverCache();
+    void SaveDriverCache();
+    void SaveDriverCacheInBackground();
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -133,6 +182,10 @@ private:
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    bool motion_select{}; // the stages being built write character motion vectors
+    // Character motion choice per vertex shader (by code address), so a G-buffer draw builds
+    // its stages once instead of twice.
+    tsl::robin_map<u64, bool> motion_choices;
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     Shader::Gcn::FetchShaderData* fetch_shader{};
@@ -140,10 +193,61 @@ private:
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
 
+    struct FinishedShader {
+        u64 hash;
+        Shader::HwStage hw_stage;
+        std::unique_ptr<Program> program; ///< a new program (null: a new variant)
+        std::optional<Shader::StageSpecialization> spec;
+        std::vector<u32> spv;
+        vk::ShaderModule module;
+        double ms;
+    };
+    struct FinishedPipeline {
+        GraphicsPipelineKey key;
+        u64 hash;
+        std::unique_ptr<GraphicsPipeline> pipeline;
+        GraphicsPipeline::SerializationSupport sdata;
+        double ms;
+    };
+    std::mutex compile_mutex;
+    std::condition_variable_any compile_cv;
+    std::deque<std::function<void()>> compile_jobs;
+    std::mutex finished_mutex;
+    std::vector<FinishedPipeline> finished_pipelines;
+    std::vector<FinishedShader> finished_shaders;
+    void CollectBackgroundShader(FinishedShader& done);
+    std::atomic<u32> num_finished{0};
+    u64 generation{};
+    tsl::robin_map<GraphicsPipelineKey, u8> pending_pipelines; ///< GPU command thread only
+    /// Shaders being translated in the background (GPU command thread only): a new program,
+    /// and new variants of known ones.
+    struct PendingShader {
+        bool new_program{};
+        std::vector<Shader::StageSpecialization> variants;
+    };
+    tsl::robin_map<u64, PendingShader> pending_shaders;
+    bool translate_in_background{}; ///< the draw being prepared may skip a new shader
+    bool stage_deferred{};          ///< ... and did
+    Program* fetch_program{};       ///< vertex shader program and variant with a fetch shader
+    size_t fetch_perm{};
+    struct DepthTargetUse {
+        VAddr address;
+        u32 frames; ///< bit n: used n game frames ago
+    };
+    std::array<DepthTargetUse, 32> depth_targets{};
+    u64 depth_target_frame{};
+    VAddr last_depth_target{};
+    std::atomic<u64> game_frames{0};
+    std::atomic<bool> driver_save_queued{false};
+    u32 driver_saved_pipelines{};
+    std::chrono::steady_clock::time_point driver_saved_at{};
+
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+    // Last: stopped (joined) first, while everything their jobs use still exists.
+    std::vector<std::jthread> compile_threads;
 };
 
 } // namespace Vulkan

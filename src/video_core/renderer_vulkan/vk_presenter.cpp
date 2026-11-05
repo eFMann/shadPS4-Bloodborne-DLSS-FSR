@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <SDL3/SDL_video.h>
+#include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/guest_stats.h"
 #include "common/io_file.h"
 #include "common/number_utils.h"
 #include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -30,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_retro_hdr.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/vram_owners.h"
 
 #include <algorithm>
 #include <array>
@@ -52,8 +57,23 @@
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#include "common/frame_pacing.h"
 
 namespace Vulkan {
+
+namespace {
+
+u32 FrameImagesOwner() {
+    static const u32 owner = VideoCore::VramOwners::Register("presentation frames");
+    return owner;
+}
+
+u32 HudlessImagesOwner() {
+    static const u32 owner = VideoCore::VramOwners::Register("HUD-less frame copies");
+    return owner;
+}
+
+} // namespace
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -552,6 +572,8 @@ Presenter::~Presenter() {
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
         DestroyHudless(frame);
+        VideoCore::VramOwners::Track(FrameImagesOwner(), instance.GetAllocator(), frame.allocation,
+                                     false);
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
@@ -576,8 +598,11 @@ void Presenter::DestroyHudless(Frame& frame) {
         ImGui::Vulkan::RemoveTexture(frame.hudless_texture);
     if (frame.hudless_view)
         instance.GetDevice().destroyImageView(frame.hudless_view);
-    if (frame.hudless_image)
+    if (frame.hudless_image) {
+        VideoCore::VramOwners::Track(HudlessImagesOwner(), instance.GetAllocator(),
+                                     frame.hudless_allocation, false);
         vmaDestroyImage(instance.GetAllocator(), frame.hudless_image, frame.hudless_allocation);
+    }
     frame.hudless_texture = nullptr;
     frame.hudless_view = vk::ImageView{};
     frame.hudless_image = vk::Image{};
@@ -594,6 +619,8 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         device.destroyImageView(frame->image_view);
     }
     if (frame->image) {
+        VideoCore::VramOwners::Track(FrameImagesOwner(), instance.GetAllocator(), frame->allocation,
+                                     false);
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
 
@@ -630,6 +657,8 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         UNREACHABLE();
     }
     frame->image = vk::Image{unsafe_image};
+    VideoCore::VramOwners::Track(FrameImagesOwner(), instance.GetAllocator(), frame->allocation,
+                                 true);
     SetObjectName(device, frame->image, "Frame image #{}", frame->id);
 
     const vk::ImageViewCreateInfo view_info = {
@@ -936,9 +965,29 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                VAddr cpu_address) {
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
-    texture_cache.UpdateImage(image_id);
+    {
+        Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Display};
+        texture_cache.UpdateImage(image_id);
+    }
+
+    // Keep rendering while presenting: with a frame limiter (RTSS) sleeping in the present, the
+    // GPU threads no longer wait for it mid-frame, so nothing held the game back: frames queued
+    // up two or three deep (25-40 ms from the game's flip to the display) and were shown on the
+    // limiter's even rhythm while they had been made unevenly (judder with a flat frame graph).
+    // The wait moves here, to the frame's end: the next frame waits for the last one's present.
+    const bool keep_rendering = KeepRenderingWhilePresenting();
+    if (keep_rendering) {
+        std::unique_lock lock{awaiting_mutex};
+        awaiting_cv.wait_for(lock, std::chrono::milliseconds{100},
+                             [this] { return frames_awaiting_present == 0; });
+    }
 
     Frame* frame = GetRenderFrame();
+    if (keep_rendering) {
+        std::scoped_lock lock{awaiting_mutex};
+        frame->awaiting_present = true;
+        ++frames_awaiting_present;
+    }
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -960,7 +1009,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     draw_scheduler.EndRendering();
-    const auto cmdbuf = draw_scheduler.CommandBuffer();
+    // The presentation passes go into a command buffer of their own, submitted after the
+    // frame's: a direct command buffer here waited for the recording thread to record the whole
+    // frame first (about 0.4 ms a frame in the heavy areas).
+    const auto cmdbuf = draw_scheduler.TailCommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &pre_barrier,
@@ -1075,6 +1127,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 frame->has_hudless = false;
             } else {
                 frame->hudless_image = vk::Image{hudless_image};
+                VideoCore::VramOwners::Track(HudlessImagesOwner(), instance.GetAllocator(),
+                                             frame->hudless_allocation, true);
                 frame->hudless_view =
                     Check<"create HUD-less frame view">(instance.GetDevice().createImageView(
                         vk::ImageViewCreateInfo{.image = frame->hudless_image,
@@ -1105,7 +1159,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         Frame hudless_frame = *frame;
         hudless_frame.image = frame->hudless_image;
         hudless_frame.image_view = frame->hudless_view;
-        pp_pass.Render(cmdbuf, hudless_view, source_size, hudless_frame, pp_settings);
+        // With the real frame's alpha: drawn see-through, FSR would take all of it for HUD.
+        pp_pass.Render(cmdbuf, hudless_view, source_size, hudless_frame, pp_settings, image_view);
         const auto hudless_read = vk::ImageMemoryBarrier2{
             .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
             .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
@@ -1132,11 +1187,33 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             });
     }
 
-    // Flush frame creation commands.
+    // Flush frame creation commands (with threaded recording, submitted by the recording thread
+    // once it has recorded them: no wait here).
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
-    draw_scheduler.Flush(info);
+    draw_scheduler.FlushFrame(info);
+
+    // Threaded renderer (after bbport's BB_FRAMES_AHEAD): the GPU command thread runs at most
+    // N guest frames ahead of the GPU (default 1 as in bbport; SHADPS4_BB_FRAMES_AHEAD, 0 =
+    // unbounded). Every GPU readback (the guest writing memory a shader wrote, about once a
+    // second in Bloodborne) waits for all queued GPU work: ~40 ms unbounded, ~25 ms with 2 (a
+    // visible stutter), about a frame with 1, which costs 2-3 FPS (bbport measured 2.5%).
+    static const u32 frames_ahead = [] {
+        const char* env = std::getenv("SHADPS4_BB_FRAMES_AHEAD");
+        return env ? static_cast<u32>(std::max(0, std::atoi(env))) : 1u;
+    }();
+    if (frames_ahead != 0 && rasterizer->ThreadedRendererActive()) {
+        recent_frame_ticks.push_back(frame->ready_tick);
+        if (recent_frame_ticks.size() > frames_ahead) {
+            const u64 tick = recent_frame_ticks.front();
+            recent_frame_ticks.pop_front();
+            draw_scheduler.Wait(tick);
+        }
+    } else {
+        recent_frame_ticks.clear();
+    }
+    rasterizer->OnGameFrame();
     return frame;
 }
 
@@ -1213,7 +1290,23 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+bool Presenter::KeepRenderingWhilePresenting() const {
+    return !instance.HasSeparatePresentQueue() && !FrameGen::Requested() && rasterizer &&
+           rasterizer->ThreadedRendererActive() && EmulatorSettings.IsBbRenderDuringPresent();
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    Common::Crumbs::Add("present (game frame)", is_game_frame);
+    SCOPE_EXIT {
+        if (!is_reusing_frame && frame->awaiting_present) {
+            {
+                std::scoped_lock lock{awaiting_mutex};
+                frame->awaiting_present = false;
+                --frames_awaiting_present;
+            }
+            awaiting_cv.notify_all();
+        }
+    };
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1239,7 +1332,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     const auto acquire_image = [&] {
         FrameGen::TimingScope timing{"acquire"};
-        return swapchain.AcquireNextImage();
+        const auto start = std::chrono::steady_clock::now();
+        const bool acquired = swapchain.AcquireNextImage();
+        Common::GuestStats::present_acquire_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
+                .count(),
+            std::memory_order_relaxed);
+        return acquired;
     };
     if (!acquire_image()) {
         {
@@ -1370,7 +1470,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
                 const ImVec2 screen = ImGui::GetCursorScreenPos();
-                ImGui::Dlss::SetGameArea(screen.x, screen.y);
+                ImGui::Dlss::SetGameArea(screen.x, screen.y, size.x, size.y);
                 // ImGui coordinates to window pixels.
                 const ImVec2 scale = ImGui::GetIO().DisplayFramebufferScale;
                 game_area = vk::Rect2D{{s32(screen.x * scale.x), s32(screen.y * scale.y)},
@@ -1486,6 +1586,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                        game_area);
 
     SubmitInfo info{};
+    // The frame's own submission may still be on its way (FlushFrame submits on the recording
+    // thread): this one waits for it on the same queue, so it must not go first.
+    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+        draw_scheduler.WaitSubmitted(frame->ready_tick);
+    }
     // The first wait covers all commands, including Streamline's volatile input copies.
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
@@ -1497,15 +1602,36 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Present to swapchain.
     {
         FrameGen::TimingScope lock_timing{"present_and_lock"};
-        std::scoped_lock present_lock{instance.HasSeparatePresentQueue() ? Scheduler::present_mutex
-                                                                         : Scheduler::submit_mutex};
+        // Keep rendering while presenting: a frame limiter (RTSS) sleeps in the present call; under
+        // submit_mutex that stopped the GPU threads' submissions for up to a frame, so the next
+        // frame was late and missed the limiter's next slot too. Their queue operations now wait
+        // in order and run when the present returns; presents stay serialized.
+        const bool keep_rendering = KeepRenderingWhilePresenting();
+        std::scoped_lock present_lock{instance.HasSeparatePresentQueue() || keep_rendering
+                                          ? Scheduler::present_mutex
+                                          : Scheduler::submit_mutex};
         FrameGen::BeginPresent();
         FrameGen::TimingScope present_timing{"present"};
         bool presented;
         {
             FrameGen::TimingScope timing{"queue_present"};
+            const auto start = std::chrono::steady_clock::now();
+            if (keep_rendering) {
+                Scheduler::BeginDeferringQueueOps();
+            }
             presented = swapchain.Present();
+            const auto present_end = std::chrono::steady_clock::now();
+            if (keep_rendering) {
+                Scheduler::EndDeferringQueueOps();
+            }
+            Common::GuestStats::present_queue_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(present_end - start).count(),
+                std::memory_order_relaxed);
+            Common::GuestStats::presents.fetch_add(1, std::memory_order_relaxed);
             FrameGen::ReplayPresentStall(true);
+        }
+        if (is_game_frame && !is_reusing_frame) {
+            Common::FramePacing::Record(Common::FramePacing::Event::Present);
         }
         {
             FrameGen::TimingScope timing{"end_present"};
@@ -1513,7 +1639,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         if (!presented) {
             std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
-            if (instance.HasSeparatePresentQueue()) {
+            if (instance.HasSeparatePresentQueue() || keep_rendering) {
                 submit_lock.lock();
             }
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
@@ -1528,6 +1654,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 }
 
 Frame* Presenter::GetRenderFrame() {
+    const auto wait_start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        Common::GuestStats::present_frame_wait_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 wait_start)
+                .count(),
+            std::memory_order_relaxed);
+    };
     // Wait for free presentation frames
     Frame* frame;
     {

@@ -5,7 +5,9 @@
 
 #include <functional>
 #include <map>
+#include <string_view>
 #include <variant>
+#include <vector>
 #include <SDL3/SDL.h>
 #include <imgui.h>
 
@@ -32,6 +34,7 @@ private:
         Folders,
         Log,
         Experimental,
+        Bloodborne,
     };
 
     void SaveSettings(std::string profile);
@@ -43,14 +46,25 @@ private:
     void GetProfileInfo();
 
     void DrawMainContent(bool* open, const std::function<void()>& applySettings);
+    bool CloseKeyPressed() const;
+    std::vector<SettingsCategory> VisibleCategories() const;
     void DrawSettingsTable(SettingsCategory);
     void DrawProfileSelector();
     void DrawGameFolderManager();
     void DrawCategoryTabs();
     void AddCategory(std::string name, std::variant<SDL_Texture*, ImGui::RefCountedTexture> texture,
-                     SettingsCategory category);
+                     SettingsCategory category, float center_x, float max_text_width);
 
+    /// A setting's name; leading spaces (4 a level) draw it as a sub-setting of the row above.
+    void DrawSettingName(const std::string& name);
     void AddSettingCheckbox(std::string name, bool& value);
+    /// A checkbox with a short grey hint beside it (seen without hovering, also on a pad).
+    void AddSettingCheckbox(std::string name, bool& value, const char* hint);
+    void AddHint(std::string_view hint);
+    void ShowTooltip(std::string_view text);
+    /// A section heading row: a coloured title, and a short note beside it.
+    void AddSettingSection(const char* title, const char* note, bool experimental);
+    void DrawBbImageSettings();
     void AddSettingSliderInt(std::string name, int& value, int min, int max);
     void AddSettingSliderFloat(std::string name, float& value, int min, int max, int precision);
     void AddSettingCombo(std::string name, int& value, std::vector<std::string> options);
@@ -66,12 +80,29 @@ private:
     std::string runningGameSerial = "";
     bool isGameRunning = false;
     bool closeOnSave = false;
+    /// Controller: a setting row has the focus this frame (d-pad right then jumps to Save).
+    bool rowFocused = false;
+    void NoteRowFocus() {
+        rowFocused |= ImGui::IsItemFocused();
+    }
+    int openedFrame = 0; ///< ImGui frame the window was opened on (Prepare)
+    /// Bloodborne tab: a setting that can cause visual artefacts waiting for "Turn on".
+    bool* bbRiskTarget = nullptr;
+    std::string bbRiskName;
+    std::string bbRiskText;
+    bool bbRiskOpenRequest = false;
+    /// Restart prompt: settings that apply at a start, as the game started (LoadSettings) and
+    /// those changed at the last save.
+    std::vector<std::pair<const char*, int>> RestartValues() const;
+    std::vector<std::string> restartChanged;
+    bool restartPromptRequest = false;
     int deleteProfileIndex = -1;
 
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> profilesTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> generalTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> experimentalTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> graphicsTexture;
+    std::variant<SDL_Texture*, ImGui::RefCountedTexture> bloodborneTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> inputTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> trophyTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> logTexture;
@@ -114,6 +145,9 @@ private:
                                                             "Fullscreen (Borderless)"};
     const std::vector<std::string> audioBackendOptions = {"SDL", "OpenAL"};
     const std::vector<std::string> presentModeOptions = {"Mailbox", "Fifo", "Immediate"};
+    const std::vector<std::string> anisotropyOptions = {"Game default", "2x", "4x", "8x", "16x"};
+    const std::vector<std::string> drawDataMemoryOptions = {"Auto", "On", "Off"};
+    const std::vector<std::string> textureQualityOptions = {"Full", "High", "Medium"};
     const std::vector<std::string> hideCursorOptions = {"Never", "Idle", "Always"};
     const std::vector<std::string> trophySideOptions = {"left", "right", "top", "bottom"};
     const std::vector<std::string> readbacksModeOptions = {"Disabled", "Relaxed", "Precise"};
@@ -134,6 +168,59 @@ private:
     int windowHeightSetting;
     bool hdrAllowedSetting;
     bool fsrEnabledSetting;
+    bool threadedRendererSetting;
+    bool threadedRendererDiagnosticsSetting;
+    bool threadedRendererGpuProfileSetting;
+    bool bbReadbackQueueSetting;
+    bool bbStreamingSetting;
+    bool bbMergedCopiesSetting;
+    bool bbMergedNoStreamSourcesSetting;
+    bool bbMergedLargeBatchesSetting;
+    bool bbFastLocksSetting;
+    bool bbFlipWhenReadySetting;
+    bool bbVramReclaimSetting;
+    bool bbBufferEvictionSetting;
+    bool bbLoadScreenCleanupSetting;
+    bool bbMoreVramSetting;
+    bool bbVramPastBudgetSetting;
+    bool bbBackgroundTextureCopiesSetting;
+    bool bbGeometryInPlaceSetting;
+    bool bbSkipEmptyDrawsSetting;
+    bool bbBackgroundPipelinesSetting;
+    int bbDrawDataMemorySetting; ///< index into drawDataMemoryOptions
+    bool bbIgnoreDisplayScaleSetting;
+    bool bbExactProtectionSetting;
+    bool bbBatchedUploadsSetting;
+    bool bbTextureSetMemoSetting;
+    bool bbRingGeometrySetting;
+    bool bbSubmitOverlapSetting;
+    bool bbOverlapFramesSetting;
+    bool bbEarlyWritebackSetting;
+    bool bbOcclusionInOrderSetting;
+    bool bbFastPixelMathSetting;
+    bool bbConstantsNoWaitSetting;
+    bool bbHardwareInterpolationSetting;
+    bool bbRealOcclusionSetting;
+    bool bbCopyThreadSetting;
+    bool bbRenderDuringPresentSetting;
+    bool bbSkipLeftOutLevelsSetting;
+    bool bbDirectTextureCopiesSetting;
+    int bbCopyThreadsSetting; ///< index into copyThreadOptions
+    bool renderdocSetting;
+    int bbRdocCaptureFramesSetting;
+    bool bbCachedTextureStagingSetting;
+    bool bbLowerDetailFirstSetting;
+    bool bbClearShaderWrittenSetting;
+    bool bbCeSkipHugeWritesSetting;
+    bool bbEvictKeepProtectionSetting;
+    bool bbEvictKeepReturningSetting;
+    bool bbProtectHelperThreadSetting;
+    bool bbCpuCopyShaderSetting;
+    bool bbCopySkipSameSetting;
+    bool bbClearOneLayerSetting;
+    bool bbSpreadLoadsSetting;
+    bool bbStutterDetailSetting;
+    int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;
     float rcasAttenuationSetting;
 

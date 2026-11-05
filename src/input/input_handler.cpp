@@ -182,6 +182,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_volume_up", "kpplus"},
             {"hotkey_volume_down", "kpminus"},
             {"hotkey_emulator_settings", "f3"},
+            {"hotkey_emulator_settings_controller", "l3, r3"},
             {"hotkey_toggle_friends", "f2"},
             {"hotkey_toggle_dlss", "f1"},
         };
@@ -514,7 +515,7 @@ void ParseInputConfig(const std::string game_id = "") {
                     {"rightjoystick", rightjoystick_deadzone},
                     {"l2", lefttrigger_deadzone},
                     {"r2", righttrigger_deadzone},
-                };
+            };
             output_gamepad_id = output_gamepad_id == -1 ? 1 : output_gamepad_id;
 
             if (auto it = deadzone_map.find(device); it != deadzone_map.end()) {

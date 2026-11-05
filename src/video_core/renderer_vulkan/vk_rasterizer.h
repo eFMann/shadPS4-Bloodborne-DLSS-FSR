@@ -3,15 +3,31 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <source_location>
+#include <stop_token>
+#include <thread>
+#include <unordered_map>
 
+#include "common/guest_stats.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/regs.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bb_object_motion.h"
+#include "video_core/renderer_vulkan/vk_bb_ssr.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
+#include "video_core/renderer_vulkan/vk_bb_vbao.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -25,11 +41,24 @@ class MemoryManager;
 
 namespace Vulkan {
 
+class ComputePipeline;
 class GraphicsPipeline;
 class Runtime;
 
 class Rasterizer {
 public:
+    /// The Bloodborne threaded renderer is in use.
+    [[nodiscard]] bool ThreadedRendererActive() const noexcept {
+        return draw_pipe != nullptr && pipe_enabled.load(std::memory_order_relaxed);
+    }
+
+    /// SHADPS4_PIPE_DRAINS=1: wait for the draw recorder before draws FilterDraw handles and
+    /// before DmaData, as before (instead of running them in order on the recorder).
+    static bool DrainForSpecialPackets();
+
+    /// Once per game frame (the presenter, when the frame is prepared): stutter report.
+    void OnGameFrame();
+
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
@@ -84,6 +113,7 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    bool OnWriteFault(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -91,9 +121,56 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     u64 Flush();
+    /// GPU command thread, after each decoded submission: early write-back (see
+    /// BufferCache::SetEarlyWriteback) sends a batch that writes hot memory, and copies back
+    /// the hot writes whose GPU work has finished.
+    void OnSubmissionDecoded();
     void Finish();
     void OnSubmit();
     void OnFence();
+
+    /// Threaded renderer: on the GPU command thread, waits until the draw recording thread
+    /// has run every draw handed to it (vk_draw_pipe.h); a no-op on every other thread.
+    /// `reason`: the PM4 opcode that drained, if any (statistics).
+    void DrainDrawPipe(u32 reason = NoDrainReason,
+                       std::source_location where = std::source_location::current());
+    static constexpr u32 NoDrainReason = 0xFFFF;
+    /// The GPU command thread or the draw recording thread.
+    [[nodiscard]] bool IsGpuSideThread() const;
+#ifdef __linux__
+    /// IsGpuSideThread for another thread, by its kernel thread id (userfaultfd's faults).
+    [[nodiscard]] bool IsGpuSideThreadId(u32 tid) const;
+#endif
+
+    /// Threaded renderer: runs `task` with a copy of `data` in order with the draws handed to
+    /// the draw recording thread (on that thread), or here at once when none are. `write_addr`
+    /// and `write_size`: guest memory the task writes, kept from early reads by the constant
+    /// ring until it has run.
+    using OrderedTask = void (*)(Rasterizer& rasterizer, const u8* data);
+    /// Returns the number of the queued packet, or 0 when the task ran here.
+    /// `writer`: what writes [write_addr, +write_size) (statistics; a static string).
+    u64 RunInOrder(OrderedTask task, const void* data, u32 size, VAddr write_addr = 0,
+                   u64 write_size = 0, const char* writer = "queued task");
+    /// Constant RAM dumps: what queued, not yet recorded work does with a guest range. Stage A
+    /// only.
+    struct QueuedUse {
+        bool read_later; ///< a queued draw or dispatch reads a buffer there when recorded
+        bool written;    ///< a queued task (DMA, fence) or shader writes there
+        bool overflow;   ///< too many queued reads to tell
+        /// The first queued write there: what it is, its shader, its size, and how many packets
+        /// back it was queued.
+        const char* writer;
+        u64 writer_shader;
+        u64 writer_bytes;
+        u64 writer_packets_back;
+        /// Constant dumps past huge writes: overlapping huge shader writes left out.
+        u32 huge_writes_skipped;
+    };
+    QueuedUse CheckQueuedUse(VAddr address, u64 size);
+    /// Whether the draw recording thread has run the packet with this number.
+    [[nodiscard]] bool DrawPipeRan(u64 packet) const {
+        return !draw_pipe || draw_pipe->ConsumedPackets() >= packet;
+    }
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -116,32 +193,246 @@ public:
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
+    /// A draw's dynamic state as its registers give it: worked out by the recorder's resolve
+    /// half (ResolveDynamicState), applied to the scheduler's by its finish half.
+    struct DrawDynamic {
+        Viewports viewports;
+        Scissors scissors;
+        bool depth_test{}, depth_write{};
+        vk::CompareOp depth_compare{};
+        bool depth_bounds_test{};
+        float depth_bounds_min{}, depth_bounds_max{};
+        bool depth_bias{};
+        float depth_bias_constant{}, depth_bias_clamp{}, depth_bias_slope{};
+        bool stencil_test{};
+        StencilOps stencil_front_ops{}, stencil_back_ops{};
+        u32 stencil_front_reference{}, stencil_back_reference{};
+        u32 stencil_front_write_mask{}, stencil_back_write_mask{};
+        u32 stencil_front_compare_mask{}, stencil_back_compare_mask{};
+        bool primitive_restart{}, rasterizer_discard{};
+        vk::CullModeFlags cull_mode{};
+        vk::FrontFace front_face{};
+        float line_width{};
+        std::array<float, 4> blend_constants{};
+        ColorWriteMasks color_write_masks{};
+        bool feedback_loop{};
+    };
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
-    void UpdateViewportScissorState() const;
-    void UpdateDepthStencilState() const;
-    void UpdatePrimitiveState(bool is_indexed) const;
-    void UpdateRasterizationState() const;
-    void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
+    void ResolveDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                             DrawDynamic& out) const;
+    void ApplyDynamicState(const DrawDynamic& dynamic) const;
+    void UpdateViewportScissorState(DrawDynamic& out) const;
+    void UpdateDepthStencilState(DrawDynamic& out) const;
+    void UpdatePrimitiveState(bool is_indexed, DrawDynamic& out) const;
+    void UpdateRasterizationState(DrawDynamic& out) const;
+    void UpdateColorBlendingState(const GraphicsPipeline* pipeline, DrawDynamic& out) const;
 
     bool FilterDraw();
+    bool FilterDrawPasses() const;
+    /// Stage A: true for a draw that cannot write anything (no pixel shader, no depth or
+    /// stencil test, no memory writes in its shaders, no stream out), e.g. occlusion query
+    /// geometry, whose results are not emulated. Such draws are skipped (setting).
+    bool DrawWritesNothing(const GraphicsPipeline* pipeline);
+    const GraphicsPipeline* no_write_pipeline{}; ///< stage A memo: last pipeline checked
+    bool no_write_shaders{};
+    u64 empty_draws_skipped{};   ///< stage A
+    u64 depth_test_only_draws{}; ///< stage A: no pixel shader, depth/stencil read only
+    u64 pipe_stats_empty_draws_skipped{};
+    u64 pipe_stats_depth_test_only_draws{};
+
+    // Threaded renderer (vk_draw_pipe.h).
+    struct IndirectArgs {
+        VAddr address;
+        VAddr count_address;
+        u32 offset;
+        u32 stride;
+        u32 max_count;
+    };
+    enum class PacketKind : u8 { Draw, DrawIndirect, Dispatch, DispatchIndirect, Task };
+    bool UseDrawPipe() const;
+    void QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_indexed, u32 index_offset,
+                   const IndirectArgs& args);
+    static void RunDrawPacket(void* context, const u8* data, u32 size);
+    static void RunDrawPacketBody(Rasterizer& self, const u8* data, u32 size);
+    /// "Detailed stutter reports" (with diagnostics): every draw timed by section, every packet
+    /// timed by kind, and both shown for each stutter. Slower; for finding stutter causes.
+    static bool HitchProfile();
+    void LogGxPipelineDifference(const void* remembered, const GraphicsPipeline* worked_out);
+    u64 GxTargetSignature() const;
+    u64 gx_targets{}; ///< this draw's GxTargetSignature (command thread)
+    std::array<std::atomic<u64>, 5> packet_kind_ns{}; ///< draw recorder, by PacketKind
+    void DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
+                            const IndirectArgs& args);
+    void DispatchRecord(const ComputePipeline* pipeline);
+    void DispatchIndirectRecord(const ComputePipeline* pipeline, const IndirectArgs& args);
+    void LogDrawPipeStats();
+    /// Logs a game frame that took noticeably longer than usual, with what happened during it.
+    void ReportHitch();
+    /// Every 10 s with diagnostics on: where VRAM goes (images, buffers, the rest).
+    void LogVramReport();
+    /// GPU profile (vk_gpu_profiler.h): a timestamp where a render pass or dispatch starts.
+    void MarkPass(const GraphicsPipeline* pipeline, const RenderState& state);
+    void MarkDispatch(const ComputePipeline* pipeline);
+    struct HitchSnapshot {
+        std::chrono::steady_clock::time_point time{};
+        std::chrono::nanoseconds busy{}, drain{};
+        u64 packets{}, gpu_wait_ns{}, gpu_waits{}, pipelines{}, background_pipelines{},
+            background_shaders{}, background_skips{}, background_wait_ns{}, arena_binds{},
+            protect_ns{}, protect_calls{}, faults{};
+        std::array<u64, static_cast<size_t>(Common::GuestStats::CmdState::Count) * 2> states{};
+        u64 present_acquire_ns{}, present_queue_ns{}, present_frame_wait_ns{}, presents{},
+            queue_ops_behind_present{}, skipped_bytes{}, direct_bytes{}, gpu_busy_ns{},
+            gpu_idle_ns{}, gpu_submits{}, queue_submit_ns{}, allocs{}, alloc_ns{}, slow_allocs{},
+            slow_alloc_ns{}, detail_deferred{}, detail_deferred_bytes{}, detail_restored{},
+            detail_restored_bytes{}, detail_forced{}, cmd_protect_calls{}, cmd_protect_ns{},
+            cmd_resident_ns{}, cmd_buffer_upload_bytes{}, cmd_buffer_upload_ns{}, a_hitch_draws{};
+        std::array<u64, 256> cmd_opcode_ns{}, cmd_opcode_count{};
+        std::array<u64, static_cast<size_t>(Common::GuestStats::Detail::Count) + 1> protect_ns_by{},
+            protect_calls_by{};
+        u64 stream_copies{}, stream_copy_bytes{}, buffer_syncs{}, buffer_sync_ranges{},
+            buffer_sync_inline_bytes{}, buffer_mem_allocs{}, buffer_mem_alloc_ns{}, cmd_drain_ns{},
+            cmd_compute_ns{}, cmd_compute_packets{}, ce_dumps{}, ce_dump_drains{},
+            ce_dump_drain_ns{}, ce_dump_write_ns{}, ce_outside_ns{}, ce_wait_reads{},
+            ce_wait_writes{}, ce_wait_overflow{}, ce_huge_write_skips{}, evicted_refills{},
+            evicted_refill_bytes{}, helper_protect_calls{}, helper_protect_ns{},
+            evicted_bytes_total{}, flips{}, flip_drain_ns{}, flip_signal_ns{};
+        std::array<u64, 4> evicted_returned{};
+        std::array<s64, 6> a_hitch_ns{}; ///< by ASection (declared below)
+        std::array<u64, Common::GuestStats::upload_age_bytes.size()> upload_ages{};
+        std::array<u64, Common::GuestStats::upload_path_bytes.size()> upload_paths{};
+        std::array<u64, Common::GuestStats::UploadPackets> upload_packets{};
+        std::array<u64, Common::GuestStats::new_storage_bytes.size()> new_storage{};
+        u64 new_storage_zero{};
+        u64 new_storage_cleared{};
+        u64 mutex_waits{}, sleeps{}, sleep_ns{}, uploads{}, upload_bytes{}, upload_ns{},
+            image_copy_ns{}, buffer_bytes{}, buffer_ns{}, resident_ns{}, staging_count{},
+            staging_bytes{}, staging_ns{}, async_copies{}, async_wait_ns{}, file_opens{},
+            resident_bytes{}, diag_ns{};
+        std::array<u64, 4> housekeeping{};
+        std::array<s64, 20> sections{}; ///< draw recorder profile (Section), HitchProfile
+        std::array<u64, 5> packet_kinds{};
+        std::array<u64, static_cast<size_t>(Common::GuestStats::Detail::Count)> details{};
+        u64 recorder_protect_calls{};
+        VideoCore::TextureCache::CleanupCounters cleanup{};
+    };
+    HitchSnapshot hitch_last{};
+    /// Diagnostics setting (statistics, time breakdown, hitch reports, draw profile).
+    std::atomic<bool> diagnostics{false};
+    /// Samples (every ~250 us) of the command thread's state x draw recorder busy/idle.
+    std::array<std::atomic<u64>, static_cast<size_t>(Common::GuestStats::CmdState::Count) * 2>
+        state_samples{};
+    std::jthread state_sampler;
+    /// Performance meter (F3, Diagnostics): the sampler's own samples and its once-a-second verdict
+    /// (Vulkan::PerfMeter); with it on, the draw profiles and the GPU's timestamps run too.
+    std::atomic<bool> perf_meter{false};
+    std::array<std::atomic<u64>, static_cast<size_t>(Common::GuestStats::CmdState::Count)>
+        meter_samples{};
+    void MeterSecond(std::chrono::steady_clock::time_point& start);
+    struct MeterMarks {
+        std::chrono::nanoseconds recorder_busy{};
+        u64 gpu_busy_ns{};
+        u64 gpu_submits{};
+        u64 consumed{};
+        std::array<s64, 6> cmd_ns{};
+        u64 cmd_draws{};
+        std::array<s64, 20> rec_ns{};
+        std::array<s64, 10> rec_detail{};
+        u64 rec_draws{};
+        s64 fin_busy{};
+        std::array<u64, 5> fin_waits{};
+        std::array<s64, 5> fin_wait_ns{};
+    } meter_marks{};
+    /// Profiles (diagnostics or the performance meter).
+    bool Profiling() const {
+        return diagnostics.load(std::memory_order_relaxed) ||
+               perf_meter.load(std::memory_order_relaxed);
+    }
+    double hitch_avg_ms{};
+    u64 hitch_frames{};
+    u32 hitch_run{};                      ///< slow frames in a row
+    std::array<s64, 4> housekeeping_ns{}; ///< previous frame: buffer tick, downloads, GC, runtime
+    std::array<std::atomic<u64>, 4> housekeeping_total{}; ///< the same, added up
+    std::atomic<u64> diag_log_ns{}; ///< time spent writing the 10 s statistics and VRAM report
+    /// Registers, render target size hints and compute registers of the draw being recorded:
+    /// the draw recording thread's copy there, the live ones elsewhere.
+    const AmdGpu::Regs& Regs() const;
+    AmdGpu::CbDbExtent CbExtent(u32 cb) const;
+    AmdGpu::CbDbExtent DbExtent() const;
+    const AmdGpu::ComputeProgram& CsRegs() const;
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    /// F1's "Log motion blur inputs": logs every input of the next motion blur passes.
+    void DumpBlurInputs(const Pipeline* pipeline);
+    /// Reads the textures DumpBlurInputs queued back from the GPU and logs what they hold (NaN
+    /// and infinite values, the largest and average magnitude). Before a draw binds anything.
+    void ReadBackBlurTextures();
+    u32 blur_dump_left{};
+    struct BlurReadback {
+        VideoCore::ImageId id;
+        u64 uid;
+        std::string after_writer; ///< set when read back right after a watched writer
+        bool read_as_bytes{};     ///< sampled as 8_8_8_8 though the image has another format
+    };
+    std::vector<BlurReadback> blur_readbacks;
+    /// Textures the readback found NaN in: every draw, dispatch and clear that writes them is
+    /// logged for the next draws (blur_watch_left).
+    std::vector<VAddr> blur_watch;
+    u32 blur_watch_left{};
+    /// The watched texture read back after each of its writers, for this many writers.
+    u32 blur_writer_checks_left{};
+    u32 blur_writer_input_dumps_left{}; ///< writers whose textures are also read back
+    VideoCore::ImageId blur_watch_image{};
+    u64 blur_watch_uid{};
+    u64 blur_last_nans{};
+    void LogBlurWatchWriters(const Pipeline* pipeline);
+    /// NaN and infinite floats in the guest memory of the stage's buffers.
+    std::string DescribeBufferNans(const Shader::Info& stage);
+    /// The same for the draw's float vertex attributes (the GPU's copy when GPU-written).
+    std::string DescribeVertexNans(const GraphicsPipeline& pipeline);
+    /// Whether `address` is a texture the blur watch is following.
+    bool BlurWatched(VAddr address) const {
+        return blur_watch_left != 0 && std::ranges::find(blur_watch, address) != blur_watch.end();
+    }
+    std::unique_ptr<VideoCore::Buffer> blur_readback_buffer;
+    std::unique_ptr<VideoCore::Buffer> blur_buffer_readback;
+    /// The GPU's copy of a buffer range (what a draw recorded now reads), into
+    /// blur_buffer_readback. Returns the mapped bytes, empty when it can't be read.
+    std::span<const u8> ReadBackBuffer(VAddr address, u64 size);
+    /// Statistics: a new image a shader writes, uploaded from guest memory first.
+    /// Returns true when the shader only writes it, bound whole with a thread for every texel.
+    bool NoteNewStorageImage(const VideoCore::Image& image, const VideoCore::ImageViewInfo& view,
+                             const Shader::ImageResource& res, const Shader::Info& stage);
+    void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
     void ResetBindings(bool is_compute);
+    /// The images' per-draw binding marks (FindImage's merges and the texture memo read them while
+    /// resolving), cleared once a draw is resolved.
+    void ResetImageBindings();
+    /// The bound buffers' accesses noted for the next draws' barriers (the resolve half's buffer
+    /// tracking), and the list cleared.
+    void TrackBufferAccess(bool is_compute);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
+    /// Clears `range` to `value` as `format`, the format the game clears it in. An image kept
+    /// in another format of the same size (memory used by targets of several formats) is
+    /// cleared through a view in that format, so it holds the game's bytes; a clear in the
+    /// image's own format converts the value to it instead.
+    void ClearImageAs(VideoCore::Image& image, const VideoCore::SubresourceRange& range,
+                      vk::Format format, const vk::ClearValue& value);
 
 private:
     friend class VideoCore::BufferCache;
@@ -149,13 +440,112 @@ private:
     const Instance& instance;
     BbVelocityMirror velocity_mirror;
     BbTemporalDlss temporal_dlss;
+    std::unique_ptr<BbObjectMotion> object_motion; // character motion vectors (temporal DLSS)
     std::array<float, 2> draw_jitter{}; // viewport offset of the current draw (temporal DLSS)
+    /// Character motion inputs of a skinned draw that need no history: worked out on stage A
+    /// with the threaded renderer, so the draw recorder only does the bookkeeping.
+    struct MotionPrep {
+        u64 geometry; ///< hash of the vertex stream V#s
+        u64 palette;  ///< hash of small bone palettes (gated draws)
+        VAddr index_address;
+        u32 vertex_offset, instance_offset;
+        u32 index_size, num_indices, num_instances;
+        u64 topology;              ///< hash of the index list
+        Motion::VertexRange range; ///< vertices the draw references
+        bool gated;                ///< no character-size skeleton: history only while bones move
+        bool valid;                ///< false: no motion for this draw (still, or no usable indices)
+    };
+    MotionPrep ComputeMotionPrep(const GraphicsPipeline* pipeline, bool is_indexed,
+                                 u32 index_offset);
+    // Character motion state of whichever thread prepares draws (stage A when threaded): the
+    // last bone palette per small-skeleton draw, and the index ranges.
+    struct MotionGate {
+        u64 palette;
+        u64 frame; ///< submission (game frame) it was last seen in
+    };
+    tsl::robin_map<u64, MotionGate> motion_gate;
+    tsl::robin_map<u64, u32> motion_gate_counts; ///< draws per identity this frame
+    u64 motion_gate_frame{};
+    Motion::IndexRangeCache motion_index_ranges;
+    u64 motion_preps{};
+    MotionPrep packet_motion_storage{};
+    const MotionPrep* packet_motion{}; ///< stage B: the current packet's, if prepared
     void TemporalDlssDraw(const GraphicsPipeline* pipeline, bool indirect);
     void CopyInsteadOfDraw(const BbTemporalDlss::DrawReplacement& source);
     void ReplayDisplayCopy(const GraphicsPipeline* pipeline, const RenderState& state,
-                           const std::function<void()>& draw);
+                           const std::function<void()>& draw,
+                           std::optional<BbTemporalDlss::DisplayCopyReplay> replay);
+    /// The draw's depth target for the velocity mirror (the resolve half's: texture cache).
+    std::optional<BbVelocityMirror::DepthSource> MirrorDepth();
     void ReplayVelocityMirror(const GraphicsPipeline* pipeline, const RenderState& state,
-                              const std::function<void()>& draw);
+                              bool is_indexed, const std::function<void()>& draw);
+    /// Records the current draw's vertex input, index buffer, descriptors and full dynamic
+    /// state (with the given viewport/scissor) from the values it last bound.
+    void RecordDrawBindings(const GraphicsPipeline* pipeline, bool is_indexed,
+                            const Viewports* viewports, const Scissors* scissors);
+    void RebindAfterMirror(const GraphicsPipeline* pipeline, const RenderState& state,
+                           bool is_indexed, u64 flushes_before);
+    void RecordVertexBindings();
+    void RecordIndexBinding();
+    struct LastVertexBind {
+        bool dynamic = false;
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        u32 num_buffers = 0;
+        VertexInputs<vk::Buffer> buffers;
+        VertexInputs<vk::DeviceSize> offsets;
+        VertexInputs<vk::DeviceSize> sizes;
+        VertexInputs<vk::DeviceSize> strides;
+    } last_vertex;
+    struct LastIndexBind {
+        vk::Buffer handle;
+        u64 offset = 0;
+        u32 size = 0;
+        vk::IndexType type = vk::IndexType::eUint16;
+    } last_index;
+    /// Recorder split: what a draw's resolve half hands its finish half (FinishEntry). While
+    /// `defer_binds` is set, the vertex and index buffer bindings are only marked; the finish
+    /// half records them.
+    struct DrawHandoff {
+        bool flush_barriers = false;
+        Runtime::TakenBarriers barriers;
+        bool bind_vertex = false;
+        bool bind_index = false;
+        /// The vertex and index bindings as the draw left them (the velocity mirror's rebinds
+        /// read them after the draw).
+        LastVertexBind vertex;
+        LastIndexBind index;
+        /// The velocity mirror's depth target (the draw's).
+        std::optional<BbVelocityMirror::DepthSource> mirror;
+        /// What the draw's registers give the finish half: its dynamic state, offsets and
+        /// counts (the resolve half moves on to the next draw's registers).
+        DrawDynamic dynamic;
+        /// The same dynamic state as the draw handed over before (`dynamic` not filled): the
+        /// finish half applies the one it kept.
+        bool dynamic_same = false;
+        u32 vertex_offset = 0, instance_offset = 0;
+        u32 num_indices = 0, num_instances = 0;
+        /// Our features' per-draw decisions (DrawFeature bits) and the display copy to replay.
+        /// A draw with any of them needs both halves: its finish reads the resolve half's
+        /// textures and targets, and the features use the caches as well as commands.
+        u8 features = 0;
+        std::optional<BbTemporalDlss::DisplayCopyReplay> display_copy;
+    };
+    enum DrawFeature : u8 {
+        SsrReplaces = 1 << 0,   ///< the game's reflection trace (BetterSsrReplacesDraw)
+        SsrAfter = 1 << 1,      ///< an input of the better reflections (BetterSsrAfterDraw)
+        VbaoLeavesOut = 1 << 2, ///< an AO draw VBAO may leave out (BetterAoLeavesOutDraw)
+        VbaoAfter = 1 << 3,     ///< the game's AO passes (BetterAoAfterDraw)
+    };
+    /// The resolve half: which of our features the draw's finish half has to run.
+    u8 DrawFeatures(const GraphicsPipeline* pipeline) const;
+    /// The resolve half: the character motion of a skinned draw (its history parameters, into
+    /// the draw's push constants).
+    void PrepareObjectMotion(const GraphicsPipeline* pipeline, const MotionPrep& prep);
+    bool defer_binds = false;
+    void RecordVertexBindings(const LastVertexBind& v);
+    void RecordIndexBinding(const LastIndexBind& index);
+    bool mirror_rebind = false;
     Scheduler& scheduler;
     Runtime& runtime;
     VideoCore::PageManager page_manager;
@@ -177,10 +567,112 @@ private:
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
 
-    boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
-    // Index in image_infos of each shader's first texture, for the RenoDX display copy replay.
-    boost::container::static_vector<std::pair<u64, u32>, 4> first_texture_infos;
-    boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+    // A draw's descriptor writes, the infos they point into and its push constants. Recorder
+    // split: the resolve half fills `res` (its entry in the finish ring); the finish half reads
+    // `fin` (the entry it finishes).
+    struct DrawDescriptors {
+        boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+        // Index in image_infos of each shader's first texture, for the RenoDX display copy
+        // replay.
+        boost::container::static_vector<std::pair<u64, u32>, 4> first_texture_infos;
+        boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+        u32 set_write_index{};
+        Pipeline::DescriptorWrites set_writes;
+        Shader::PushData push_data;
+    };
+    // Recorder split, step 3: the draw recorder on two threads (F3, Performance, "Draw recorder
+    // on two threads"). The resolve thread (the threaded renderer's draw recorder) owns the
+    // caches: render targets, textures, buffers, image layouts, uploads. The finish thread owns
+    // the command side: barriers recorded, descriptors, dynamic state, render passes, the draw,
+    // the velocity mirror and occlusion queries. Each draw goes from one to the other in an
+    // entry of this ring (its handoff, descriptor writes and render state). The resolve thread
+    // waits for the finish thread to run dry (catches up) before it uses the command side itself
+    // (the scheduler calls back), before any other packet (dispatches, indirect draws, ordered
+    // tasks), after a draw that needs both halves (our features), when the ring is full, and
+    // when it runs out of packets (so the GPU command thread's drains cover both). Off: each
+    // entry is finished right after it is resolved, on the one thread.
+    static constexpr u32 FinishRingSize = 32;
+    struct FinishEntry {
+        DrawHandoff handoff;
+        DrawDescriptors descriptors;
+        const GraphicsPipeline* pipeline{};
+        RenderState state{};
+        bool is_indexed{};
+        bool profile{}; ///< a profiled draw (performance meter)
+        bool joined{};  ///< needs both halves: the resolve thread waits for it
+    };
+    std::array<FinishEntry, FinishRingSize> finish_ring{};
+    // The resolve thread's, then (a cache line of their own) the finish thread's.
+    DrawDescriptors* res = &finish_ring[0].descriptors;             ///< being resolved
+    DrawHandoff* rh = &finish_ring[0].handoff;                      ///< the resolve half's handoff
+    alignas(64) DrawDescriptors* fin = &finish_ring[0].descriptors; ///< being finished
+    const DrawHandoff* fh = nullptr; ///< the finish half's, while it finishes an entry
+    enum class FinishWait : u8 { Commands, Packet, Joined, RingFull, Idle, Count };
+    void FinishDraw(FinishEntry& entry);
+    /// The resolve thread: hands the entry over (or finishes it at once when off).
+    void PushFinish(FinishEntry& entry);
+    /// The resolve thread: waits until the finish thread has finished every entry.
+    void CatchUpFinisher(FinishWait why);
+    void ApplyFinisherSetting();
+    void StartFinisher();
+    void StopFinisher();
+    void RunFinisher();
+    static void SchedulerCatchUp(void* context);
+    /// The GPU command thread: the recorder and its finish thread both idle.
+    bool RecorderIdle() const;
+    /// The GPU command thread, after draining the recorder: waits for the finish thread.
+    void WaitFinisherIdle();
+    std::atomic<bool> finisher_wanted{false}; ///< the setting (with the threaded renderer)
+    /// The resolve thread: wakes the finish thread if it sleeps.
+    void WakeFinisher() {
+        if (fin_sleeping.load(std::memory_order_seq_cst)) {
+            fin_wake.fetch_add(1, std::memory_order_seq_cst);
+            fin_wake.notify_one();
+        }
+    }
+    bool finisher_running{};   ///< the resolve thread's
+    u32 pending_ops_counter{}; ///< the resolve thread's (PopPendingOperations)
+    u64 fin_write{};           ///< entries handed over (the resolve thread's)
+    alignas(64) std::atomic<u64> fin_published{0};
+    alignas(64) std::atomic<u64> fin_done{0};
+    alignas(64) std::atomic<u32> fin_wake{0};
+    std::atomic<bool> fin_sleeping{false};
+    std::atomic<bool> fin_stop{false};
+    std::thread finisher_thread;
+    /// The resolve thread's view of the open render pass while the finish thread runs: whether
+    /// the draws handed over leave the target memo's pass open (Scheduler::IsRenderingWith
+    /// would catch up).
+    bool memo_pass_open{};
+    /// Dynamic state memo (the resolve thread): the registers it is worked out from holding the
+    /// values they had when it was last worked out, and its other inputs the same, the draw
+    /// hands over "the same" instead.
+    bool dynamic_memo_valid = false;
+    std::vector<u32> dynamic_memo_regs; ///< the registers' values when it was worked out
+    static const std::vector<std::pair<u32, u32>>& DynamicStateRanges();
+    /// Whether the dynamic state's registers hold the remembered values (`remember`: and
+    /// remember the current ones).
+    bool DynamicRegsSame(const AmdGpu::Regs& regs, bool remember);
+    std::array<float, 2> dynamic_memo_jitter{};
+    ColorWriteMasks dynamic_memo_masks{};
+    bool dynamic_memo_feedback{};
+    bool dynamic_memo_indexed{};
+    u64 dynamic_memo_hits{}, dynamic_memo_misses{};
+    /// The last dynamic state worked out, and the check: every 256th draw handed over as "the
+    /// same" works it out anyway; on any difference the memo turns itself off (logged).
+    DrawDynamic dynamic_memo_value;
+    bool dynamic_memo_off{true};
+    static bool SameDynamic(const DrawDynamic& a, const DrawDynamic& b);
+    /// The finish half's last dynamic state (for draws handed over as "the same").
+    DrawDynamic fin_dynamic;
+    alignas(64) bool fin_profile{};
+    std::chrono::steady_clock::time_point fin_profile_last{};
+    static inline thread_local bool on_finish_thread = false;
+#ifdef __linux__
+    std::atomic<u32> finish_tid{0};
+#endif
+    std::atomic<u64> fin_busy_ticks{0}; ///< TSC ticks
+    std::array<std::atomic<u64>, static_cast<size_t>(FinishWait::Count)> fin_waits{};
+    std::array<std::atomic<s64>, static_cast<size_t>(FinishWait::Count)> fin_wait_ns{};
 
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
@@ -191,13 +683,614 @@ private:
     std::vector<BoundBuffer> bound_buffers;
     std::vector<VideoCore::ImageId> bound_images;
 
-    u32 set_write_index{};
-    Pipeline::DescriptorWrites set_writes;
-    Shader::PushData push_data;
-
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+
+    // Threaded renderer state. The draw recording thread's copies below are only written by it,
+    // or by the GPU command thread while it is idle. alignas(64) in this class keeps fields
+    // the two threads write every draw on separate cache lines.
+    std::unique_ptr<AmdGpu::Regs> pipe_regs;
+    std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
+    AmdGpu::CbDbExtent pipe_db_extent{};
+    AmdGpu::ComputeProgram pipe_cs{};
+    alignas(64) bool pipe_synced{};   ///< stage A from here (draw recorder fields above)
+    std::atomic<bool> pipe_enabled{}; // read by the presentation thread
+    std::vector<u16> pipe_blocks;
+    std::chrono::steady_clock::time_point pipe_stats_time{};
+    std::chrono::steady_clock::time_point vram_report_time{};
+    u64 pipe_stats_packets{};
+    u64 pipe_stats_drains{};
+    std::chrono::nanoseconds pipe_stats_drain_time{};
+    std::chrono::nanoseconds pipe_stats_busy{};
+    struct DrainSite {
+        const char* function;
+        u32 line;
+        u32 reason;
+        u64 count;
+        std::chrono::nanoseconds time;
+    };
+    std::unordered_map<u64, DrainSite> pipe_drain_sites;
+
+    // Render state memo (after bbport): most draws continue the render pass the previous draw
+    // opened, with the same targets; such a draw reuses that draw's render state instead of
+    // looking up the target views, metadata and layouts again.
+    struct TargetSignature {
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS + 1> ids{};
+        std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS + 1> views{};
+        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
+        u32 mrt_mask{};
+        u32 depth_control{};
+        bool depth_valid{};
+        bool stencil_valid{};
+        bool operator==(const TargetSignature&) const = default;
+    };
+    TargetSignature MakeTargetSignature(const GraphicsPipeline* pipeline) const;
+    bool TargetMemoUsable(const TargetSignature& signature);
+    struct TargetMemo {
+        bool valid{};
+        TargetSignature signature;
+        RenderState state;
+    } target_memo;
+    std::atomic<bool> target_memo_enabled{};
+    std::atomic<u64> target_memo_hits{};
+    std::atomic<u64> target_memo_misses{};
+    u64 pipe_stats_memo_hits{};
+    u64 pipe_stats_memo_misses{};
+
+    // Image lookup memos (after bbport): FindImage walks the texture cache's page table for
+    // every texture and render target of every draw. Its result for the same descriptor holds
+    // while no image is registered or unregistered (TextureCache::RegistryGeneration).
+    using ImageDesc = VideoCore::TextureCache::ImageDesc;
+    struct TextureMemoEntry {
+        std::array<u64, 4> sharp{};
+        u32 flags{};
+        bool valid{};
+        u64 generation{};
+        VideoCore::ImageId image_id{};
+        ImageDesc desc{};
+    };
+    static constexpr u32 TextureMemoSize = 4096;
+    std::unique_ptr<std::array<TextureMemoEntry, TextureMemoSize>> texture_memo;
+    // Texture set memo (after bbport): a stage's resolved sampled textures (image after the
+    // depth redirect, view, backing, view info) remembered by its T#s. A hit only redoes the
+    // per-draw effects (found tick, binding flags, layout transition, usage) and writes the
+    // descriptors: no image lookup, view search or image update per texture.
+    struct TextureSetEntry {
+        VideoCore::ImageId id{}; ///< null: null descriptor
+        vk::ImageView view{};
+        const void* backing{};
+        VideoCore::ImageViewInfo view_info{};
+    };
+    struct TextureSet {
+        static constexpr u32 MaxImages = 16; ///< larger sets are not remembered
+        u64 key{};
+        const Shader::Info* stage{};
+        u64 generation{~0ull};
+        u32 count{};
+        std::array<std::array<u64, 4>, MaxImages> sharps{};
+        std::array<TextureSetEntry, MaxImages> entries{};
+    };
+    // Direct-mapped by key: with ~2300 sets a frame (4700 draws, BB PC Remaster) 4096 slots lost
+    // ~40% to two sets sharing a slot (71% reused); 16384 keep collisions near 13%. Only the
+    // slots in use are touched, so the larger table costs memory (~21 MiB), not cache.
+    static constexpr u32 TextureSetCount = 16384;
+    std::unique_ptr<std::array<TextureSet, TextureSetCount>> texture_sets;
+    std::atomic<u64> texture_set_hits{};
+    std::atomic<u64> texture_set_misses{};
+    u64 pipe_stats_set_hits{};
+    u64 pipe_stats_set_misses{};
+    struct TargetLookupMemo {
+        std::array<u32, 32> key{};
+        u32 key_words{};
+        bool valid{};
+        u64 generation{};
+        VideoCore::ImageId image_id{};
+        ImageDesc desc{};
+    };
+    std::array<TargetLookupMemo, AmdGpu::NUM_COLOR_BUFFERS + 1> target_lookup_memo;
+    VideoCore::ImageId FindTargetImage(u32 slot, ImageDesc& desc, const void* key, u32 key_bytes);
+    // Sampler memo: GetSampler hashes the S# and takes a lock for every sampler of every draw.
+    struct SamplerMemoEntry {
+        std::array<u64, 2> sharp{};
+        bool is_depth{};
+        float lod_bias{};
+        bool valid{};
+        u64 generation{};
+        u64 touched_gc_tick{};
+        vk::Sampler handle{};
+    };
+    static constexpr u32 SamplerMemoSize = 1024;
+    std::unique_ptr<std::array<SamplerMemoEntry, SamplerMemoSize>> sampler_memo;
+    alignas(64) std::atomic<u64> write_faults{}; ///< guest fault handlers
+    alignas(64) u64 stat_draws{};                ///< stage A: draws seen (queued or run here)
+    u64 stat_frames{};                           ///< stage A: submissions done (one per game frame)
+    u64 pipe_stats_draws{};
+    u64 pipe_stats_frames{};
+
+public:
+    /// Real occlusion tests (GPU command thread): a counter dump the game asked for.
+    void OcclusionDump(u64* results, u64 value, u32 pairs);
+
+private:
+    struct OcclusionTask {
+        u64* results;
+        u64 begin_value;
+        u32 pairs;
+        u32 stage_a_draws;
+        bool begin;
+        u64 frame; ///< game frame the GPU command thread saw the dump in
+        std::chrono::steady_clock::time_point time;
+        /// What the test's last box was drawn against (stage A's registers).
+        u64 depth_address{};
+        u32 depth_extent{};  ///< the size hint (0: none)
+        u32 depth_control{}; ///< DB_DEPTH_CONTROL
+        u32 index{};         ///< the game's n-th test of its frame
+    };
+    struct {
+        VAddr begin_address{};
+        u64 begin_value{};
+        u32 draws{};
+        bool open{};
+        u64 depth_address{};
+        u32 depth_extent{};
+        u32 depth_control{};
+        u32 pairs{};
+        u32 index{};
+    } occlusion_a; ///< GPU command thread
+    u64 occlusion_index_frame{};
+    u32 occlusion_next_index{};
+    struct {
+        bool open{};
+        bool dropped{};
+        u32 pairs{};
+        u32 draws_seen{};
+        u64* results{};
+        u64 begin_value{};
+        u64 frame{};
+        std::chrono::steady_clock::time_point time{};
+        u64 depth_address{};
+        u32 depth_extent{};
+        u32 depth_control{};
+        u64 depth_view{};   ///< the depth attachment its boxes were recorded with
+        u32 render_size{};  ///< the render pass's width | height << 16
+        bool depth_clear{}; ///< that pass clears its depth
+        u32 index{};
+        boost::container::small_vector<u32, 4> queries;
+    } occlusion_b; ///< draw recorder
+    struct PendingOcclusion {
+        u64* results;
+        u64 begin_value;
+        u32 pairs;
+        u64 tick;
+        boost::container::small_vector<u32, 4> queries;
+        bool known;
+        u64 frame;
+        std::chrono::steady_clock::time_point time;
+        std::chrono::steady_clock::time_point closed; ///< the draw recorder ended it
+        u64 depth_address{};
+        u32 depth_extent{};
+        u32 depth_control{};
+        u64 depth_view{};
+        u32 render_size{};
+        bool depth_clear{};
+        u32 index{};
+    };
+    /// One-frame hidden blips: a test's last three answers (visible, hidden, visible in
+    /// consecutive frames) with what each was drawn against. Under occlusion_mutex.
+    struct OcclusionSlotAnswer {
+        u64 frame{};
+        u64 count{};
+        u64 depth_address{};
+        u32 depth_extent{};
+        u32 depth_control{};
+        u64 depth_view{};
+        u32 render_size{};
+        bool depth_clear{};
+        bool known{};
+    };
+    std::unordered_map<u64*, std::array<OcclusionSlotAnswer, 3>> occlusion_slots;
+    /// The same by the test's place in the game's frame (n-th test), frame after frame, whatever
+    /// result slot it uses.
+    struct OcclusionIndexAnswer {
+        u64 frame{};
+        u64 count{};
+        u64* results{};
+    };
+    std::unordered_map<u32, std::array<OcclusionIndexAnswer, 3>> occlusion_indices;
+    std::atomic<u64> occlusion_index_blips{};
+    u64 pipe_stats_occlusion_index_blips{};
+    u32 occlusion_index_blips_logged{};
+    std::array<std::atomic<u64>, 4> occlusion_slot_gaps{}; ///< frames between a slot's answers
+    std::atomic<u64> occlusion_blips{};
+    /// Better ambient occlusion (GT-VBAO, after bbport 0.7): made when the setting is first on.
+    std::unique_ptr<BbVbao> vbao;
+    /// The first textures of the draw's pixel shader (after BindResources). image_bindings holds
+    /// the last bound stage's (the vertex shader's), and is not filled when a remembered texture
+    /// set is reused.
+    std::array<VideoCore::ImageId, 3> stage_textures{};
+    /// Better reflections: made when the setting is first on.
+    std::unique_ptr<BbSsr> ssr;
+    /// The game's reflection constants (its trace pixel shader's buffer 0), from BindBuffers.
+    BbSsr::Constants ssr_constants{};
+    const void* ssr_guest_constants{};
+    /// Before recording the draw: whether it is the game's reflection trace, written instead by
+    /// the better reflections (when on).
+    bool BetterSsrReplacesDraw(const GraphicsPipeline* pipeline);
+    /// After a draw: the game's passes the full-resolution reflections take inputs from.
+    void BetterSsrAfterDraw(const GraphicsPipeline* pipeline);
+    /// After the draw that ends the game's AO: overwrites it with VBAO (when on).
+    void BetterAoAfterDraw(const GraphicsPipeline* pipeline);
+    /// Before recording the draw: whether it is one of the game's AO draws VBAO replaces.
+    bool BetterAoLeavesOutDraw(const GraphicsPipeline* pipeline);
+    u64 pipe_stats_occlusion_blips{};
+    u32 occlusion_blips_logged{};
+    /// Pending answers, the query pool's busy flags and its host resets: under occlusion_mutex.
+    std::mutex occlusion_mutex;
+    std::deque<PendingOcclusion> occlusion_pending;
+    std::atomic<u32> occlusion_waiting{};
+    /// Game frames (OnSubmit) and answer statistics: frames from the test to its answer (0, 1,
+    /// 2, 3+), the time, and tests the game began again before the previous answer reached it.
+    std::atomic<u64> occlusion_frame{};
+    std::array<std::atomic<u64>, 4> occlusion_late_frames{};
+    std::atomic<u64> occlusion_late_ns{};
+    std::atomic<u64> occlusion_retested{};
+    /// Where an answer's time went: GPU command thread to draw recorder (test begun to ended
+    /// there), waiting for its submission, and the GPU (submission to answer).
+    std::array<std::atomic<u64>, 3> occlusion_span_ns{};
+    std::atomic<u64> occlusion_span_count{};
+    std::array<u64, 4> pipe_stats_occlusion_span{};
+    /// Submission times by tick (an answer looks its test's up).
+    struct SubmitTime {
+        std::atomic<u64> tick{~0ULL};
+        std::atomic<s64> ns{};
+    };
+    std::array<SubmitTime, 256> submit_times{};
+    std::array<u64, 6> pipe_stats_occlusion_late{};
+    /// The GPU's count for a finished test (under occlusion_mutex), written to game memory by
+    /// WriteOcclusionAnswer after the lock is released (a write fault there may wait for the
+    /// GPU command thread).
+    struct OcclusionAnswer {
+        u64* results;
+        u64 begin;
+        u32 pairs;
+        u64 count;
+    };
+    OcclusionAnswer AnswerOcclusion(const PendingOcclusion& test);
+    void WriteOcclusionAnswer(const OcclusionAnswer& answer);
+    static constexpr u32 OcclusionPoolSize = 4096;
+    static constexpr u32 NoOcclusionQuery = ~0u;
+    vk::UniqueQueryPool occlusion_pool;
+    std::vector<bool> occlusion_busy;
+    u32 occlusion_next{};
+    std::atomic<u64> occlusion_tests{};
+    std::atomic<u64> occlusion_answered{};
+    std::atomic<u64> occlusion_hidden{};
+    std::atomic<u64> occlusion_unknown{};
+    u32 occlusion_poll_counter{};
+    std::array<u64, 5> pipe_stats_occlusion{};
+    void OcclusionTaskRun(const OcclusionTask& task);
+    bool OcclusionRedirectBegin();
+    void OcclusionRedirectEnd();
+    void OcclusionMarkRedirected();
+    struct {
+        bool valid{};
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        AmdGpu::Address htile{};
+        AmdGpu::CbDbExtent extent{};
+        u64 frame{};    ///< game frame it was last drawn with depth writes in
+        bool written{}; ///< drawn with depth writes at all
+    } scene_depth;      ///< GPU command thread
+    /// Tests moved to the scene's depth: drawn in this game frame with depth writes, or only in
+    /// an earlier one (the test then sees where things were a frame ago).
+    std::atomic<u64> occlusion_depth_current{};
+    std::atomic<u64> occlusion_depth_older{};
+    std::array<u64, 2> pipe_stats_occlusion_depth{};
+    struct {
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        AmdGpu::Address htile{};
+        AmdGpu::CbDbExtent extent{};
+        std::array<AmdGpu::ViewportBounds, AmdGpu::NUM_VIEWPORTS> viewports{};
+        AmdGpu::Scissor screen_scissor{};
+        AmdGpu::ViewportScissor window_scissor{};
+        AmdGpu::ViewportScissor generic_scissor{};
+        std::array<AmdGpu::ViewportScissor, AmdGpu::NUM_VIEWPORTS> viewport_scissors{};
+    } occlusion_saved;
+    std::atomic<u64> occlusion_redirects{};
+    void OcclusionClose(u32 stage_a_draws);
+    u32 OcclusionQueryBegin();
+    void OcclusionQueryEnd(u32 query);
+    void PollOcclusion();
+
+    u64 pipe_stats_faults{};
+    alignas(64) std::atomic<u64> image_memo_hits{}; ///< draw recorder
+    std::atomic<u64> image_memo_misses{};
+    u64 pipe_stats_image_hits{};
+    u64 pipe_stats_image_misses{};
+
+    // Constant ring (after bbport): the GPU command thread copies the small read-only buffers
+    // of a draw (the stream path of BufferCache::ObtainBuffer, and the flattened user data)
+    // into a ring of its own when it queues the draw; the draw recorder only binds them.
+    struct PrefetchedBuffer {
+        u8 stage;  ///< ordinal among the pipeline's present stages
+        u8 buffer; ///< index in the stage's buffer list
+        /// PrefetchScene when the data looked like the game's scene constants as it was copied
+        /// (far plane 3000, 1/far, the render size): the upscaler and VBAO look only at those.
+        u16 flags;
+        u32 size;
+        u64 offset; ///< in const_ring
+    };
+    static constexpr u16 PrefetchScene = 1;
+    static constexpr u64 ConstRingSize = 32ull << 20;
+    std::unique_ptr<VideoCore::Buffer> const_ring;
+    /// Stage A: next position (grows forever; offset = position % size).
+    alignas(64) u64 ring_head{};
+    u64 ring_free_until{}; ///< stage A: positions below this are no longer read by the GPU
+    struct RingRetire {
+        u64 end;
+        u64 tick;
+    };
+    static constexpr u32 RingRetireSize = 4096;
+    std::array<RingRetire, RingRetireSize> ring_retire{};
+    // Fields of the two threads on separate cache lines: a write by one thread to a line the
+    // other reads every draw costs both a cache miss.
+    alignas(64) std::atomic<u64> ring_retire_w{}; ///< written by stage B
+    u64 ring_b_tick{}; ///< stage B: command buffer of its latest ring bytes
+    u64 ring_b_end{};  ///< stage B: ring position its recorded draws reach
+    alignas(64) std::atomic<u64> ring_retire_r{}; ///< written by stage A
+    /// Stage A: guest ranges that queued, not yet recorded draws write (storage buffers): a
+    /// prefetch overlapping one would read the memory before those writes.
+    struct PendingWrite {
+        u64 packet;
+        VAddr begin;
+        VAddr end;
+        /// Queued writes: what writes there (a static name) and the shader for storage writes.
+        const char* writer{};
+        u64 shader{};
+        bool shader_write{}; ///< a shader's storage write (else a task)
+    };
+    std::deque<PendingWrite> pending_writes;
+    /// Guest ranges queued packets read buffers from when recorded (not copied ahead).
+    std::deque<PendingWrite> queued_later_reads;
+    bool queued_reads_overflow{};
+    void NoteQueuedReads(const Pipeline* pipeline);
+    std::vector<PrefetchedBuffer> prefetch_scratch;
+    alignas(64) const PrefetchedBuffer* packet_prefetch{}; ///< stage B: the current packet's
+    u32 packet_num_prefetch{};
+    u32 bind_stage_ordinal{};
+    u32 prefetch_cursor{}; ///< stage B: next entry of packet_prefetch (same order as binding)
+    alignas(64) std::atomic<u64> ring_prefetches{}; ///< stage A
+    std::atomic<u64> ring_fallbacks{};
+    u64 pipe_stats_ring_prefetches{};
+    u64 pipe_stats_ring_fallbacks{};
+    u8* RingAlloc(u64 size, u64 alignment, u64& offset);
+    /// Stage A: takes in what the draw recorder reports as no longer read by the GPU.
+    void RingRetire();
+    void PrefetchBuffers(const Pipeline* pipeline);
+    /// Stage A: small or CPU-changed vertex/index data (what stage B would copy to the stream
+    /// buffer) copied into the constant ring now. Returns the ring offset, or NoRing.
+    static constexpr u64 NoRing = ~0ull;
+    u64 RingCopyGeometry(VAddr address, u64 size);
+    std::atomic<u64> geometry_ring_copies{};
+    u64 pipe_stats_geometry_ring_copies{};
+    /// The current packet's index buffer, copied into the ring by stage A.
+    struct RingIndex {
+        VAddr address{};
+        u32 size{};
+        u64 offset{NoRing};
+    } packet_index_ring;
+
+    /// Vertex inputs of a draw, worked out on stage A (which waits for stage B about half of
+    /// the time): the dynamic vertex input state, each stream's V#, and the stream memory
+    /// merged into ranges (sizes clamped to mapped memory). Stage B only obtains the buffers
+    /// and records the bindings.
+    struct PreparedRange {
+        VAddr base;
+        u64 size;
+        u64 ring; ///< offset in the constant ring when stage A copied it there, else NoRing
+    };
+    struct PreparedVertex {
+        u32 count;
+        u32 num_ranges;
+        const vk::VertexInputAttributeDescription2EXT* attributes;
+        const vk::VertexInputBindingDescription2EXT* bindings;
+        const AmdGpu::Buffer* buffers;
+        const u8* range_index; ///< per stream: its entry in `ranges`, NoRange without memory
+        const PreparedRange* ranges;
+    };
+    static constexpr u8 NoRange = 0xFF;
+    /// Stage A: fills the vtx_* scratch; false when the draw has no dynamic vertex input.
+    bool PrepareVertexInputs(const GraphicsPipeline* pipeline);
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> vtx_attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> vtx_bindings;
+    VertexInputs<AmdGpu::Buffer> vtx_buffers;
+    VertexInputs<u8> vtx_range_index;
+    VertexInputs<PreparedRange> vtx_ranges;
+    alignas(64) PreparedVertex packet_vertex_storage{}; ///< draw recorder
+    const PreparedVertex* packet_vertex{}; ///< stage B: the current packet's, if prepared
+    std::atomic<u64> vertex_prepared{};
+    std::atomic<u64> vertex_unprepared{};
+    u64 pipe_stats_vertex_prepared{};
+    u64 pipe_stats_vertex_unprepared{};
+    const PrefetchedBuffer* FindPrefetched(u32 buffer_index);
+
+    // Draw recorder profile: every 8th direct draw on stage B is timed by section.
+    enum class Section : u8 {
+        Packet,
+        Pending,
+        Targets,
+        Buffers,
+        TexSetHit,
+        TexLookup,
+        TexView,
+        TexLayout,
+        Textures,
+        Samplers,
+        Dlss,
+        BeginRendering,
+        VertexBuffers,
+        Vertex,
+        Barriers,
+        Descriptors,
+        Motion,
+        Dynamic,
+        Record,
+        Reset,
+        Count,
+    };
+    static constexpr std::array<const char*, static_cast<size_t>(Section::Count)> SectionNames{
+        "packet",
+        "pending ops",
+        "render targets",
+        "buffers",
+        "tex: set memo hit",
+        "tex: image lookup",
+        "tex: update+view",
+        "tex: layout+usage",
+        "tex: descriptor writes",
+        "samplers",
+        "dlss",
+        "begin pass",
+        "vertex buffers",
+        "index buffer",
+        "barriers",
+        "descriptors",
+        "character motion",
+        "dynamic",
+        "record+mirror",
+        "reset"};
+    // GPU command thread (stage A) profile: every 8th queued draw, by section; "decode" is the
+    // time since the previous draw was queued, less waits for the draw recorder.
+    enum class ASection : u8 { Decode, Pipeline, Prefetch, Vertex, Motion, Packet, Count };
+    static constexpr std::array<const char*, static_cast<size_t>(ASection::Count)> ASectionNames{
+        "decode+other", "pipeline select",        "constant ring copies",
+        "vertex prep",  "index copy+motion prep", "packet write"};
+    bool a_profile{};
+    u32 a_profile_counter{};
+    std::chrono::steady_clock::time_point a_last{}, a_lap{};
+    std::chrono::nanoseconds a_drain_mark{};
+    std::array<std::atomic<s64>, static_cast<size_t>(ASection::Count)> a_profile_ns{};
+    std::atomic<u64> a_profile_draws{};
+    std::array<s64, static_cast<size_t>(ASection::Count)> pipe_stats_a_ns{};
+    u64 pipe_stats_a_draws{};
+    // Stutter detail: every queued draw timed by section (stutter reports).
+    bool a_hitch{};
+    std::array<std::atomic<s64>, static_cast<size_t>(ASection::Count)> a_hitch_ns{};
+    std::atomic<u64> a_hitch_draws{};
+    void ALap(ASection finished) {
+        if (!a_profile && !a_hitch) [[likely]] {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (a_profile) {
+            a_profile_ns[static_cast<size_t>(finished)].fetch_add((now - a_lap).count(),
+                                                                  std::memory_order_relaxed);
+        }
+        if (a_hitch) {
+            a_hitch_ns[static_cast<size_t>(finished)].fetch_add((now - a_lap).count(),
+                                                                std::memory_order_relaxed);
+        }
+        a_lap = now;
+    }
+    void ABeginDraw();
+    void AEndDraw();
+    // Performance meter: parts of the recorder's steps, timed on the profiled draws (every 8th):
+    // the texture set's key (its descriptors read and hashed), a remembered set's checks (its
+    // images still current), its binding (layouts, descriptors), the shader buffers' and the
+    // vertex buffers' lookups in the buffer cache.
+public:
+    enum class RecDetail : u8 {
+        TexKey,
+        TexChecks,
+        TexBind,
+        ShaderBuffers,
+        VertexBuffers,
+        DmaSync,       ///< buffers synchronised for shaders that read memory directly
+        Observers,     ///< our features' looks at each shader buffer (upscaler, VBAO, blur)
+        BufferHazards, ///< shader buffers checked against earlier writes (barriers)
+        DynamicState,  ///< the dynamic state worked out from the registers
+        Handoff,       ///< the line between the halves (the entry filled, bindings reset)
+        Count
+    };
+    std::array<std::atomic<s64>, static_cast<size_t>(RecDetail::Count)> rec_detail_ns{};
+
+private:
+    std::chrono::steady_clock::time_point RecMark() const {
+        return profile_draw ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    }
+    void RecAdd(RecDetail part, std::chrono::steady_clock::time_point start) {
+        if (profile_draw) [[unlikely]] {
+            rec_detail_ns[static_cast<size_t>(part)].fetch_add(
+                (std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+        }
+    }
+    alignas(64) bool profile_draw{}; ///< draw recorder
+    u32 profile_counter{};
+    std::chrono::steady_clock::time_point profile_last{};
+    std::array<std::atomic<s64>, static_cast<size_t>(Section::Count)> profile_ns{};
+    std::atomic<u64> profile_draws{};
+    std::array<s64, static_cast<size_t>(Section::Count)> pipe_stats_profile_ns{};
+    u64 pipe_stats_profile_draws{};
+    void ProfileLap(Section finished) {
+        if (!profile_draw) [[likely]] {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        profile_ns[static_cast<size_t>(finished)].fetch_add((now - profile_last).count(),
+                                                            std::memory_order_relaxed);
+        profile_last = now;
+    }
+    /// ProfileLap for the finish half (its own thread when the recorder runs on two).
+    void FinLap(Section finished) {
+        if (!fin_profile) [[likely]] {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        profile_ns[static_cast<size_t>(finished)].fetch_add((now - fin_profile_last).count(),
+                                                            std::memory_order_relaxed);
+        fin_profile_last = now;
+    }
     float scene_lod_bias{}; ///< this draw's upscaler texture LOD bias (G-buffer draws only)
+    // Copy thread (bb_copy_thread): stage A's copies of guest memory into the constant ring
+    // (small read-only buffers, vertex and index data) made on their own thread. Each packet
+    // carries the number of jobs queued before it; the draw recorder runs it once those are done.
+    struct CopyJob {
+        VAddr guest;
+        u8* dest;
+        u64 offset;
+        u64 size;
+    };
+    static constexpr u64 CopyJobCount = 1ull << 16;
+    void RingCopy(VAddr guest, u8* dest, u64 offset, u64 size);
+    /// Hands the copy jobs made so far to the copy thread (before a packet that needs them).
+    void PublishCopies();
+    u64 copy_published_head{}; ///< stage A: copy_head as last published
+    /// Prefetch: per shader buffer binding, whether it held the scene constants (SceneProbeSeen)
+    /// and how often it was copied (stage A).
+    static constexpr u32 SceneProbeSeen = 1u << 31;
+    tsl::robin_map<const void*, u32> scene_probes;
+    void RunCopyThread(std::stop_token stop);
+    void WaitForCopies(u64 end);
+    std::unique_ptr<CopyJob[]> copy_jobs;
+    bool copy_thread_on{};
+    u64 copy_head{}; ///< stage A
+    alignas(64) std::atomic<u64> copy_published{};
+    alignas(64) std::atomic<u64> copy_done{};
+    alignas(64) std::atomic<u32> copy_wake{};
+    std::atomic<bool> copy_sleeping{};
+    std::atomic<s64> copy_busy_ns{};
+    std::atomic<u64> copy_waits{};
+    std::atomic<s64> copy_wait_ns{};
+    u64 pipe_stats_copy_jobs{};
+    s64 pipe_stats_copy_busy{};
+    u64 pipe_stats_copy_waits{};
+    s64 pipe_stats_copy_wait_ns{};
+    std::jthread copy_thread; ///< stopped after the draw recorder (below)
+    // Last member: destroyed (stopped) first, while everything the draw recording thread uses
+    // still exists.
+    std::unique_ptr<DrawPipe> draw_pipe;
 };
 
 } // namespace Vulkan

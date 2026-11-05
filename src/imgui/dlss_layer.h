@@ -10,6 +10,6 @@ void Register();
 void Unregister();
 void Toggle();
 // Where the game image is drawn this frame (ImGui coordinates), for the fps counter.
-void SetGameArea(float x, float y);
+void SetGameArea(float x, float y, float width, float height);
 
 } // namespace ImGui::Dlss

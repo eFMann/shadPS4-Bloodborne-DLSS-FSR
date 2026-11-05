@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <optional>
+#include <source_location>
 
 #include "common/enum.h"
 #include "common/incremental_id.h"
@@ -12,6 +15,7 @@
 #include "common/small_vector.h"
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
@@ -29,12 +33,16 @@ enum ImageFlagBits : u32 {
     Empty = 0,
     MaybeCpuDirty = 1 << 0, ///< The page this image is in was touched before the image address
     CpuDirty = 1 << 1,      ///< Contents have been modified from the CPU
-    GpuDirty = 1 << 2, ///< Contents have been modified from the GPU (valid data in buffer cache)
+    GpuDirty = 1 << 2, ///< Image contents have been modified from the GPU (valid data in buffer
+                       ///< cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
     Registered = 1 << 6,  ///< True when the image is registered
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
+
+/// Texture quality: an image a shader reads at its exact size keeps all its levels from now on.
+void KeepFullQuality(VAddr guest_address);
 
 struct UniqueImage {
     explicit UniqueImage() = default;
@@ -48,16 +56,22 @@ struct UniqueImage {
     UniqueImage(UniqueImage&& other)
         : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          size_bytes{std::exchange(other.size_bytes, 0)},
+          vram_owner{std::exchange(other.vram_owner, ~0u)} {}
     UniqueImage& operator=(UniqueImage&& other) {
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        size_bytes = std::exchange(other.size_bytes, 0);
+        vram_owner = std::exchange(other.vram_owner, ~0u);
         return *this;
     }
 
-    void Create(const vk::ImageCreateInfo& image_ci);
+    /// `owner`: who made it, for the VRAM report (by default the calling file and line).
+    void Create(const vk::ImageCreateInfo& image_ci,
+                std::source_location owner = std::source_location::current());
 
     void Destroy();
 
@@ -76,6 +90,7 @@ public:
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
     vk::DeviceSize size_bytes{};
+    u32 vram_owner{~0u}; ///< VramOwners slot of a device-local allocation
 };
 
 struct Image : public Common::LRUNode<> {
@@ -101,8 +116,13 @@ struct Image : public Common::LRUNode<> {
         return track_addr == 0 || track_addr_end == 0;
     }
 
-    bool SafeToDownload() const {
+    bool HasGpuValidData() const {
         return True(flags & ImageFlagBits::GpuModified) && False(flags & ImageFlagBits::Dirty);
+    }
+
+    bool CanBeDownloaded() {
+        return HasGpuValidData() && info.num_samples == 1 && !info.props.has_stencil &&
+               IsVulkanFormatCompatible(info.pixel_format, backing->image.image_ci.format);
     }
 
     void AssociateDepth(ImageId depth_image_id, u64 depth_image_uid) {
@@ -115,7 +135,39 @@ struct Image : public Common::LRUNode<> {
         depth_uid = {};
     }
 
+    /// VRAM the image takes: all its backings (sample counts), as allocated.
+    vk::DeviceSize SizeBytes() const {
+        vk::DeviceSize size = 0;
+        for (const auto& backing_image : backing_images) {
+            size += backing_image.image.size_bytes;
+        }
+        return size;
+    }
+
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
+
+    /// The levels the Vulkan image has: the guest's less those left out by texture quality.
+    SubresourceExtent HostResources() const {
+        return {static_cast<u16>(info.resources.levels - dropped_levels), info.resources.layers};
+    }
+
+    /// A range of guest levels as levels of the Vulkan image (the guest levels left out read
+    /// the largest one kept).
+    SubresourceRange HostRange(const SubresourceRange& range) const {
+        if (dropped_levels == 0) {
+            return range;
+        }
+        const u32 host_levels = info.resources.levels - dropped_levels;
+        const u32 base = std::min<u32>(
+            range.base.level >= dropped_levels ? range.base.level - dropped_levels : 0,
+            host_levels - 1);
+        const u32 end = std::min<u32>(
+            std::max<u32>(range.base.level + range.extent.levels, dropped_levels + 1) -
+                dropped_levels,
+            host_levels);
+        return {.base = {static_cast<u16>(base), range.base.layer},
+                .extent = {static_cast<u16>(std::max<u32>(end - base, 1)), range.extent.layers}};
+    }
 
     using Barriers = SmallVector<vk::ImageMemoryBarrier2, 32>;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
@@ -132,6 +184,9 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    /// Threaded renderer: GC tick + 1 at which UpdateImage last found this image clean, fully
+    /// tracked and touched; 0 once anything changes that. Only accessed through atomic_ref.
+    u64 clean_tick = 0;
     ImageId depth_id{};
     u64 depth_uid{};
 
@@ -152,10 +207,32 @@ public:
     };
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};
+    /// While registered: the texture cache's count of image memory (a backing added later, for
+    /// another sample count, is counted too).
+    std::atomic<u64>* memory_usage_counter{};
     u64 image_uid{};
     u64 lru_id{};
     u64 tick_accessed_last{};
-    u64 hash{};
+    u64 last_use_gc_tick{}; ///< VRAM cleanup: GC tick of the last use (atomic_ref access)
+    u64 cpu_hash{};
+    /// Hash of the guest memory when the GPU last wrote the image (0.21.0): a write-back is
+    /// skipped if the guest has written there since.
+    u64 gpu_hash{};
+    u64 head_hash{};
+    u64 tail_hash{};
+    /// Shader::ExactTexelRead bits of the shaders that read it (atomic_ref access).
+    u8 exact_texel_reads{};
+    /// Texture quality: the largest guest levels the Vulkan image leaves out (it is that much
+    /// smaller, and its level 0 is guest level dropped_levels).
+    u32 dropped_levels{};
+    /// Lower detail first: the image's largest level was not uploaded yet (a burst of new
+    /// textures); shaders sample from the next level down until it is (steady clock ns since).
+    bool detail_pending{};
+    u64 detail_pending_since_ns{};
+    /// Upload statistics: when the image's contents last became stale (steady clock ns; 0 for an
+    /// image not uploaded yet) and how (DirtySource).
+    u64 dirty_since_ns{};
+    u8 dirty_source{};
 
     struct {
         u32 texture : 1;

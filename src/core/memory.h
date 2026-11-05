@@ -29,6 +29,8 @@ class MemoryMapViewer;
 namespace Core {
 
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
+constexpr u64 GUEST_PAGE_BITS = 14;
+constexpr u64 GUEST_PAGE_SIZE = 1ULL << GUEST_PAGE_BITS;
 
 enum class MemoryProt : u32 {
     NoAccess = 0,
@@ -254,6 +256,10 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// True when the range is mapped and readable by the game: it can be copied from its own
+    /// addresses (Direct texture copies), not through the backing memory's view.
+    bool IsReadableMapping(VAddr virtual_addr, u64 size);
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
@@ -317,7 +323,7 @@ private:
         return std::prev(fmem_map.upper_bound(target));
     }
 
-    bool HasPhysicalBacking(VirtualMemoryArea vma) {
+    bool HasPhysicalBacking(const VirtualMemoryArea& vma) {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
                vma.type == VMAType::Pooled;
     }

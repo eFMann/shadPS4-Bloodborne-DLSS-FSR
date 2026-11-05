@@ -4,19 +4,28 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
-// AMD FSR 3.1 frame generation through amd_fidelityfx_vk.dll, for GPUs without DLSS-G. Like
-// DLSS-G it replaces the swapchain: the emulator renders into its images, and it presents a
-// generated frame before each rendered one from its own threads, on queues of its own.
+// AMD FSR 3.1 frame generation through amd_fidelityfx_vk.dll (libamd_fidelityfx_vk.so on Linux),
+// for GPUs without DLSS-G. Like DLSS-G it replaces the swapchain: the emulator renders into its
+// images, and it presents a generated frame before each rendered one from its own threads, on
+// queues of its own.
+namespace Vulkan {
+class DlssNgx;
+}
+
 namespace Vulkan::FsrFrameGen {
 
 // Used instead of DLSS-G (chosen in FrameGen::Load, before the device is created).
 void Select();
 bool Selected();
+// Without Streamline: what generates the frames this swapchain presents, from dlss.ini
+// fg_backend. "auto" uses DLSS-G when the GPU has it, "dlss" only DLSS-G, "fsr" FSR.
+void SetGenerator(std::string_view generator);
 
 // The queues it needs besides the emulator's: one to present from, one to acquire images on
 // and, if the GPU has one, a compute queue. A family index of ~0u means none.
@@ -28,15 +37,22 @@ struct QueuePlan {
     Slot present, acquire, compute;
 };
 // Picks them next to the emulator's queue (index 0 of `graphics_family`). False when the GPU
-// has no other queue that can present; frame generation then stays off.
+// has no other queue that can present; frame generation then stays off. `surface` is the
+// window's, for asking which queues present to it (unused on Windows).
 bool PlanQueues(vk::Instance instance, vk::PhysicalDevice physical, u32 graphics_family,
-                QueuePlan& plan);
-// Once the device exists. Loads the DLL.
+                vk::SurfaceKHR surface, QueuePlan& plan);
+// Once the device exists (and DLSS is initialized). Loads the DLL.
 void SetDevice(vk::PhysicalDevice physical, vk::Device device, vk::Queue game_queue,
-               u32 game_family, const QueuePlan& plan);
+               u32 game_family, const QueuePlan& plan, DlssNgx* dlss);
 
 // Selected, loaded and the device has its queues.
 bool Active();
+// Active, with DLSS-G generating the frames.
+bool UsingDlss();
+// Frames shown per rendered frame (dlss.ini fg_multiplier), within MaxMultiplier.
+void SetMultiplier(u32 frames_shown);
+// 2 with FSR, up to 4 with DLSS-G on RTX 50 series cards.
+u32 MaxMultiplier();
 // Why it is not active although it was selected (empty otherwise).
 std::string Problem();
 // Before the device is destroyed, after the swapchain.

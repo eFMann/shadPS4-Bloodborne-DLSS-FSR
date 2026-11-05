@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstddef>
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -71,8 +72,11 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_, Info& info_,
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
-      profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma) {
+      profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage},
+      fp_contraction{info.hw_stage == HwStage::Fragment && profile_.fragment_fp_contraction &&
+                     !info.stores.Get(IR::Attribute::Depth)},
+      binding{binding_} {
+    if (info.uses_dma || VertexMotion()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -355,7 +359,7 @@ void EmitContext::DefineInputs() {
         break;
     }
     case SwStage::Fragment: {
-        if (info.loads.GetAny(IR::Attribute::FragCoord) ||
+        if (FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) ||
             (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
              !profile.supports_amd_shader_explicit_vertex_parameter)) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
@@ -656,6 +660,12 @@ void EmitContext::DefineOutputs() {
                     AmdGpu::NumberFormat::Float, clip_distances, MaxEmulatedClipDistances, true);
                 Name(clip_distances, fmt::format("cldist_attr{}", 0));
             }
+            if (VertexMotion()) {
+                motion_out_cur = DefineOutput(F32[4], MotionVectors::CurrentLocation);
+                motion_out_prev = DefineOutput(F32[4], MotionVectors::PreviousLocation);
+                Name(motion_out_cur, "motion_cur");
+                Name(motion_out_prev, "motion_prev");
+            }
         }
         break;
     }
@@ -743,6 +753,12 @@ void EmitContext::DefineOutputs() {
             frag_outputs[i] = GetAttributeInfo(num_format, id, num_components, true);
             ++num_render_targets;
         }
+        if (FragmentMotion() && !Sirit::ValidId(frag_outputs[MotionVectors::Output].id)) {
+            motion_frag_out = DefineOutput(F32[4], MotionVectors::Output);
+            motion_in_cur = DefineInput(F32[4], MotionVectors::CurrentLocation);
+            motion_in_prev = DefineInput(F32[4], MotionVectors::PreviousLocation);
+            Name(motion_frag_out, "motion_vector");
+        }
         // Dual source blending allows at most 2 render targets, one for each source.
         // Fewer targets are allowed but the missing blending source values will be
         // undefined.
@@ -768,8 +784,19 @@ void EmitContext::DefineOutputs() {
 
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
-    const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]), "AuxData")};
+    // Only motion and clip jitter shaders declare motion_param and clip_jitter (the last
+    // members): every other shader keeps the exact SPIR-V of builds without them, which HDR mods
+    // such as RenoDX identify shaders by. Clip jitter shaders also declare the rest of
+    // buf_offsets (resource.h, JitterMotionParamIndex).
+    const bool jitter = VertexClipJitter();
+    const bool motion_member = VertexMotion() || jitter;
+    motion_param_member = jitter ? PushData::JitterMotionParamIndex : PushData::MotionParamIndex;
+    const Id struct_type{Name(
+        jitter ? TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4], U32[2], U32[2],
+                            F32[2])
+        : motion_member ? TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[2])
+                        : TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]),
+        "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
@@ -785,6 +812,21 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
+    if (jitter) {
+        MemberName(struct_type, PushData::BufOffsetIndex + 3, "buf_offsets3");
+        MemberDecorate(struct_type, PushData::BufOffsetIndex + 3, spv::Decoration::Offset, 64U);
+    }
+    if (motion_member) {
+        MemberName(struct_type, motion_param_member, "motion_param");
+        // After buf_offsets, wherever NUM_BUFFERS puts it (upstream raised it from 40 to 56).
+        MemberDecorate(struct_type, motion_param_member, spv::Decoration::Offset,
+                       static_cast<u32>(offsetof(PushData, motion_param)));
+    }
+    if (jitter) {
+        MemberName(struct_type, PushData::JitterClipJitterIndex, "clip_jitter");
+        MemberDecorate(struct_type, PushData::JitterClipJitterIndex, spv::Decoration::Offset,
+                       static_cast<u32>(offsetof(PushData, clip_jitter)));
+    }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);

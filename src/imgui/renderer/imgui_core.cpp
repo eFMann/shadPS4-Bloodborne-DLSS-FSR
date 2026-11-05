@@ -37,6 +37,7 @@ static std::mutex change_layers_mutex{};
 
 static ImGuiID dock_id;
 static std::atomic<std::uint32_t> force_gamepad_input_capture_count{0};
+static float display_scale = 1.0f; ///< Windows' display scaling of the game window
 
 namespace ImGui {
 
@@ -142,7 +143,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     dock_id = ImHashStr(label);
 
     if (const auto dpi = SDL_GetWindowDisplayScale(window.GetSDLWindow()); dpi > 0.0f) {
-        GetIO().FontGlobalScale *= dpi;
+        display_scale = dpi;
     }
 
     std::at_quick_exit([] { SaveIniSettingsToDisk(GetIO().IniFilename); });
@@ -200,8 +201,11 @@ bool ProcessEvent(SDL_Event* event) {
         return io.WantCaptureKeyboard && io.Ctx->NavWindow != nullptr &&
                io.Ctx->NavWindow->ID != dock_id;
     }
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        // Never blocked, as with keys: a button held when a window opened (L3+R3 for the
+        // settings) and let go in it stayed pressed for the bindings afterwards.
+        return false;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
@@ -235,6 +239,8 @@ ImGuiID NewFrame(bool is_reusing_frame) {
         }
     }
 
+    GetIO().FontGlobalScale =
+        0.5f * (EmulatorSettings.IsBbIgnoreDisplayScale() ? 1.0f : display_scale);
     Sdl::NewFrame(is_reusing_frame);
     ImGui::NewFrame();
     SetKeyOwner(ImGuiKey_GamepadFaceUp, ImHashStr("shadps4/pad"));
@@ -256,6 +262,7 @@ ImGuiID NewFrame(bool is_reusing_frame) {
 void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
             const vk::Extent2D& extent) {
     ImGui::Render();
+    TextureManager::FrameRendered();
     ImDrawData* draw_data = GetDrawData();
     // Font atlas uploads are recorded ahead of the render pass that samples them.
     Vulkan::UpdateTextures(*draw_data, cmdbuf);
@@ -312,6 +319,10 @@ void RenderGameFrame(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image
     if (draw_data && draw_data->CmdListsCount > 0)
         Vulkan::RenderGameFrame(*draw_data, cmdbuf, game_frame);
     cmdbuf.endRendering();
+}
+
+float DisplayScale() {
+    return display_scale;
 }
 
 bool MustKeepDrawing() {

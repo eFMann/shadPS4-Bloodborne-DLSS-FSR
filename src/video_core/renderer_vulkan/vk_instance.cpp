@@ -1,14 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cstdlib>
+
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/bb_tuning.h"
 #include "common/debug.h"
+#include "common/elf_info.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_bb_fsr_frame_gen.h"
@@ -16,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_fsr4_addon.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/vram_owners.h"
 
 #include <vk_mem_alloc.h>
 
@@ -170,12 +179,29 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
     CollectDeviceParameters();
+    if (properties.apiVersion >= VK_API_VERSION_1_2 &&
+        properties.apiVersion < TargetVulkanApiVersion && VideoCore::IsRenderDocLoaded()) {
+        // RenderDoc reports Vulkan 1.2 on drivers without bufferDeviceAddressCaptureReplay, but
+        // still forwards the device setup to the driver, so Vulkan 1.3 features keep working.
+        LOG_WARNING(Render_Vulkan, "RenderDoc limited this device to Vulkan {}.{}",
+                    VK_VERSION_MAJOR(properties.apiVersion),
+                    VK_VERSION_MINOR(properties.apiVersion));
+        properties.apiVersion = TargetVulkanApiVersion;
+    }
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,
                "Vulkan {}.{} is required, but only {}.{} is supported by device!",
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
+#ifndef _WIN32
+    if (FsrFrameGen::Selected())
+        presentation_probe = CreateSurface(*instance, window);
+#endif
     CreateDevice();
+    if (presentation_probe) {
+        instance->destroySurfaceKHR(presentation_probe);
+        presentation_probe = nullptr;
+    }
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
@@ -186,6 +212,10 @@ Instance::~Instance() {
     dlss_ngx.reset();
     if (ImGui::GetCurrentContext()) {
         ImGui::Core::Shutdown(GetDevice());
+    }
+    if (low_priority_textures) {
+        VideoCore::VramOwners::low_priority_textures = VK_NULL_HANDLE;
+        vmaDestroyPool(allocator, low_priority_textures);
     }
     vmaDestroyAllocator(allocator);
 }
@@ -207,6 +237,30 @@ std::string Instance::GetDriverVersionName() {
         return fmt::format("{}.{}", major, minor);
     }
     return GetReadableVersion(version);
+}
+
+vk::SampleCountFlags Instance::GetImageSampleCounts(
+    const vk::PhysicalDeviceImageFormatInfo2& info) const {
+    const u64 key = (u64(static_cast<u32>(info.format)) << 40) ^
+                    (u64(static_cast<u32>(info.type)) << 36) ^
+                    (u64(static_cast<u32>(info.tiling)) << 34) ^
+                    (u64(static_cast<VkImageUsageFlags>(info.usage)) << 12) ^
+                    u64(static_cast<VkImageCreateFlags>(info.flags));
+    std::scoped_lock lock{image_sample_counts_mutex};
+    if (const auto it = image_sample_counts.find(key); it != image_sample_counts.end()) {
+        return it->second;
+    }
+    const auto properties = physical_device.getImageFormatProperties2(info);
+    if (properties.result == vk::Result::eErrorFormatNotSupported) {
+        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
+                  vk::to_string(info.format), vk::to_string(info.type), vk::to_string(info.flags),
+                  vk::to_string(info.usage));
+    }
+    const vk::SampleCountFlags counts = properties.result == vk::Result::eSuccess
+                                            ? properties.value.imageFormatProperties.sampleCounts
+                                            : vk::SampleCountFlagBits::e1;
+    image_sample_counts.emplace(key, counts);
+    return counts;
 }
 
 bool Instance::CreateDevice() {
@@ -359,6 +413,17 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (EmulatorSettings.IsBbMoreVram() && EmulatorSettings.IsBbVramPastBudget()) {
+        const auto priority_features =
+            physical_device
+                .getFeatures2<vk::PhysicalDeviceFeatures2,
+                              vk::PhysicalDeviceMemoryPriorityFeaturesEXT>()
+                .get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+        memory_priority = priority_features.memoryPriority &&
+                          add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        LOG_INFO(Render_Vulkan, "Memory priorities (Go past the budget): {}",
+                 memory_priority ? "on" : "not supported by the driver");
+    }
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -416,12 +481,47 @@ bool Instance::CreateDevice() {
     }
 #endif
     if (FsrFrameGen::Selected() &&
-        FsrFrameGen::PlanQueues(*instance, physical_device, queue_family_index, fsr_queues)) {
+        FsrFrameGen::PlanQueues(*instance, physical_device, queue_family_index, presentation_probe,
+                                fsr_queues)) {
         for (const auto& slot : {fsr_queues.present, fsr_queues.acquire, fsr_queues.compute})
             if (slot.family != ~0u)
                 queue_counts[slot.family] = std::max(queue_counts[slot.family], slot.index + 1);
     }
-    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f};
+    // GPU readbacks: a queue beside rendering, preferring a copy engine, then an async compute
+    // queue, then a second graphics queue. Bloodborne threaded renderer with its toggle on
+    // only, and not with frame generation (Streamline and FSR frame generation manage queues of
+    // their own). Without it buffers stay exclusive to the graphics queue, as originally.
+    u32 readback_index = 0;
+    if (!FrameGen::Requested() &&
+        Common::BbTuning::IsBloodborne(Common::ElfInfo::Instance().GameSerial()) &&
+        EmulatorSettings.IsThreadedRenderer() && EmulatorSettings.IsBbReadbackQueue() &&
+        feature_chain.get<vk::PhysicalDeviceVulkan13Features>().synchronization2) {
+        using F = vk::QueueFlagBits;
+        const auto pick = [&](auto&& wanted) {
+            for (u32 family = 0; family < family_properties.size(); ++family) {
+                const auto flags = family_properties[family].queueFlags;
+                if (wanted(family, flags) &&
+                    queue_counts[family] < family_properties[family].queueCount) {
+                    readback_family = family;
+                    readback_index = queue_counts[family]++;
+                    return true;
+                }
+            }
+            return false;
+        };
+        const bool picked =
+            pick([](u32, vk::QueueFlags flags) {
+                return (flags & F::eTransfer) && !(flags & (F::eGraphics | F::eCompute));
+            }) ||
+            pick([](u32, vk::QueueFlags flags) {
+                return (flags & F::eCompute) && !(flags & F::eGraphics);
+            }) ||
+            pick([&](u32 family, vk::QueueFlags) { return family == queue_family_index; });
+        if (!picked) {
+            LOG_INFO(Render_Vulkan, "GPU readbacks: no second queue, using the graphics queue");
+        }
+    }
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     std::vector<vk::DeviceQueueCreateInfo> queue_infos;
     for (u32 family = 0; family < queue_counts.size(); ++family)
         if (queue_counts[family])
@@ -432,6 +532,10 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    if (!vk12_features.bufferDeviceAddress) {
+        LOG_WARNING(Render_Vulkan,
+                    "bufferDeviceAddress is unavailable, direct memory access cannot be used");
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = static_cast<u32>(queue_infos.size()),
@@ -457,6 +561,7 @@ bool Instance::CreateDevice() {
                 .wideLines = features.wideLines,
                 .multiViewport = features.multiViewport,
                 .samplerAnisotropy = features.samplerAnisotropy,
+                .occlusionQueryPrecise = features.occlusionQueryPrecise,
                 .vertexPipelineStoresAndAtomics = features.vertexPipelineStoresAndAtomics,
                 .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
@@ -574,6 +679,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceImageViewMinLodFeaturesEXT{
             .minLod = true,
         },
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
+            .memoryPriority = true,
+        },
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
@@ -637,6 +745,9 @@ bool Instance::CreateDevice() {
     if (!image_view_min_lod) {
         device_chain.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
     }
+    if (!memory_priority) {
+        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+    }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
@@ -656,12 +767,25 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, present_queue_index);
+    buffer_queue_families[0] = queue_family_index;
+    if (readback_family != ~0u) {
+        readback_queue = device->getQueue(readback_family, readback_index);
+        if (readback_family != queue_family_index) {
+            buffer_queue_families[1] = readback_family;
+            buffer_queue_family_count = 2;
+        }
+        const auto flags = family_properties[readback_family].queueFlags;
+        LOG_INFO(Render_Vulkan, "GPU readbacks: queue {}.{} ({})", readback_family, readback_index,
+                 (flags & vk::QueueFlagBits::eGraphics)  ? "second graphics queue"
+                 : (flags & vk::QueueFlagBits::eCompute) ? "async compute queue"
+                                                         : "copy engine");
+    }
     if (present_queue_index != 0) {
         LOG_INFO(Render_Vulkan, "[FRAME-GEN] Local test: render queue {}.0, present queue {}.{}",
                  queue_family_index, queue_family_index, present_queue_index);
     }
-    FsrFrameGen::SetDevice(physical_device, *device, graphics_queue, queue_family_index,
-                           fsr_queues);
+    FsrFrameGen::SetDevice(physical_device, *device, graphics_queue, queue_family_index, fsr_queues,
+                           dlss_ngx.get());
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -705,9 +829,14 @@ void Instance::CreateAllocator() {
     };
 
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .flags = (IsBufferDeviceAddressSupported() ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT
+                                                   : VmaAllocatorCreateFlags{}) |
+                 (memory_priority ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT : 0u),
         .physicalDevice = physical_device,
         .device = *device,
+        // 64 MiB blocks instead of 256: textures freed by the cache leave less half-empty
+        // memory behind (about 1 GB held but unused in big areas, pushing the rest out of VRAM).
+        .preferredLargeHeapBlockSize = 64_MB,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
@@ -718,6 +847,50 @@ void Instance::CreateAllocator() {
         UNREACHABLE_MSG("Failed to initialize VMA with error {}",
                         vk::to_string(vk::Result{result}));
     }
+    if (memory_priority) {
+        CreateLowPriorityTexturePool();
+    }
+}
+
+// "Go past the budget": block-compressed textures (the game's and a texture pack's, never drawn
+// into) get a pool of their own at a low priority; everything else stays at the default one and
+// guest buffers ask for the highest. Past the budget, Windows then moves texture copies to system
+// RAM first (slower to sample, nothing else breaks) if it moves any of the emulator's memory.
+void Instance::CreateLowPriorityTexturePool() {
+    const VkImageCreateInfo sample_image = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_BC1_RGBA_SRGB_BLOCK,
+        .extent = {2048, 2048, 1},
+        .mipLevels = 12,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+    };
+    const VmaAllocationCreateInfo sample_alloc = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    u32 memory_type = 0;
+    if (vmaFindMemoryTypeIndexForImageInfo(allocator, &sample_image, &sample_alloc, &memory_type) !=
+        VK_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "Memory priorities: no memory type for textures found");
+        return;
+    }
+    const VmaPoolCreateInfo pool_info = {
+        .memoryTypeIndex = memory_type,
+        .blockSize = 64_MB,
+        .priority = LowTexturePriority,
+    };
+    if (vmaCreatePool(allocator, &pool_info, &low_priority_textures) != VK_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "Memory priorities: the texture pool could not be created");
+        low_priority_textures = VK_NULL_HANDLE;
+        return;
+    }
+    VideoCore::VramOwners::low_priority_textures = low_priority_textures;
+    LOG_INFO(Render_Vulkan,
+             "Memory priorities: compressed textures in a pool of their own (memory type {}, "
+             "priority {}), guest buffers at {}",
+             memory_type, LowTexturePriority, HighBufferPriority);
 }
 
 void Instance::CollectDeviceParameters() {
@@ -775,16 +948,23 @@ void Instance::CollectPhysicalMemoryInfo() {
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
+    // The graphics card's own memory, for the graphics heap F1's Auto picks (BbResolution).
+    // The VRAM budget test setting stands in for it.
+    device_local_heap_bytes = local_memory;
+    const int test_mb = EmulatorSettings.GetBbVramBudgetTestMb();
+    Common::BbTuning::vram_bytes.store(test_mb > 0 ? u64(test_mb) << 20 : local_memory,
+                                       std::memory_order_relaxed);
     if (!IsIntegrated()) {
         // We reserve some memory for the system.
         const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
         total_memory_budget -= system_memory;
-        return;
+    } else {
+        // Leave at least 8 GB for the system on integrated GPUs.
+        const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
+        total_memory_budget =
+            static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
     }
-    // Leave at least 8 GB for the system on integrated GPUs.
-    const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
-    total_memory_budget =
-        static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
+    LOG_INFO(Render_Vulkan, "GPU memory budget is {} MiB", total_memory_budget / 1_MB);
 }
 
 void Instance::CollectImageFormatInfo() {
@@ -844,6 +1024,18 @@ void Instance::CollectToolingInfo() const {
     }
 }
 
+u64 Instance::GetTotalMemoryBudget() const {
+    // Read once (at game start): the caches size themselves from it.
+    static const u64 override_budget = [] {
+        const char* value = std::getenv("SHADPS4_VRAM_BUDGET_MB");
+        const u64 mib =
+            value ? u64{std::strtoull(value, nullptr, 10)}
+                  : static_cast<u64>(std::max(0, EmulatorSettings.GetBbVramBudgetTestMb()));
+        return mib << 20;
+    }();
+    return override_budget ? override_budget : total_memory_budget;
+}
+
 u64 Instance::GetDeviceMemoryUsage() const {
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
     vk::PhysicalDeviceMemoryProperties2 props = {
@@ -856,6 +1048,64 @@ u64 Instance::GetDeviceMemoryUsage() const {
         total_usage += memory_budget_props.heapUsage[heap];
     }
     return total_usage;
+}
+
+Instance::AllocatorUsage Instance::GetAllocatorUsage() const {
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    AllocatorUsage usage{};
+    const auto& memory_props = GetMemoryProperties();
+    for (u32 i = 0; i < memory_props.memoryHeapCount; ++i) {
+        if (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            usage.held += budgets[i].statistics.blockBytes;
+            usage.in_use += budgets[i].statistics.allocationBytes;
+        }
+    }
+    return usage;
+}
+
+Instance::VramLimits Instance::GetLiveVramLimits() const {
+    // Below the driver's budget: Windows, the overlay and other programs are outside it already.
+    constexpr u64 LimitMargin = 256_MB;
+    VramLimits limits{};
+    const u64 test_budget = GetTotalMemoryBudget();
+    limits.budget =
+        test_budget != total_memory_budget ? test_budget : GetMemoryHeapReport().local_budget;
+    limits.limit = limits.budget - std::min(limits.budget, LimitMargin);
+    // "Go past the budget": up to the card's own memory less a reserve for Windows' desktop and
+    // the programs it moves out (it raises the budget as it does). Never below the usual limit.
+    constexpr u64 WindowsReserve = 512_MB;
+    if (EmulatorSettings.IsBbVramPastBudget() && test_budget == total_memory_budget &&
+        device_local_heap_bytes > WindowsReserve) {
+        limits.limit = std::max(limits.limit, device_local_heap_bytes - WindowsReserve);
+    }
+    limits.pressure =
+        limits.limit - std::min(limits.limit, std::max<u64>(384_MB, limits.limit / 12));
+    limits.critical =
+        limits.limit - std::min(limits.limit, std::max<u64>(128_MB, limits.limit / 32));
+    return limits;
+}
+
+Instance::MemoryHeapReport Instance::GetMemoryHeapReport() const {
+    MemoryHeapReport report{};
+    if (!supports_memory_budget) {
+        return report;
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &memory_budget_props,
+    };
+    physical_device.getMemoryProperties2(&props);
+    const auto& memory_props = props.memoryProperties;
+    for (u32 i = 0; i < memory_props.memoryHeapCount; ++i) {
+        if (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            report.local_usage += memory_budget_props.heapUsage[i];
+            report.local_budget += memory_budget_props.heapBudget[i];
+        } else {
+            report.host_usage += memory_budget_props.heapUsage[i];
+        }
+    }
+    return report;
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

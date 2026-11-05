@@ -7,6 +7,7 @@
 #include <deque>
 #include <vector>
 
+#include "common/guest_stats.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_manager.h"
 
@@ -37,6 +38,13 @@ public:
         });
     }
 
+    /// Mark region as modified from the host GPU without uploading it again
+    void MarkRegionAsGpuModified(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->template ChangeRegionState<StateOp::None, StateOp::Set>(offset, size);
+        });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, bool is_write) noexcept {
         IteratePages(cpu_addr, size, [is_write](RegionManager* manager, u64 offset, u64 size) {
@@ -52,6 +60,13 @@ public:
     void MarkRegionAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
             manager->template ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
+        });
+    }
+
+    /// See RegionManager::ExtendWriteFault. The window must not cross a region.
+    void ExtendWriteFault(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->ExtendWriteFault(offset, size);
         });
     }
 
@@ -85,6 +100,15 @@ public:
                     manager->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::Set>(
                         offset, size, func);
                 } else {
+                    // Read-only bindings skip the region lock when no page in range is CPU
+                    // modified (after bbport). A guest write sets its page's bit in the fault
+                    // handler before the store, and the draw using the data reaches this thread
+                    // after the guest submitted it.
+                    if (!manager->template IsRegionModified<Type::CPU>(offset, size)) {
+                        Common::GuestStats::upload_checks_skipped.fetch_add(
+                            1, std::memory_order_relaxed);
+                        return;
+                    }
                     manager
                         ->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::None>(
                             offset, size, func);

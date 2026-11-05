@@ -41,6 +41,54 @@ option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 
+# Profile-guided optimisation (clang / clang-cl). BB_PGO=generate: an instrumented build that
+# writes user/pgo/shadps4-<pid>.profraw when the emulator exits (play it to train the profile).
+# BB_PGO=<path of a .profdata>: built with that profile. Empty: off.
+set(BB_PGO "" CACHE STRING "PGO: empty (off), generate, or the path of a .profdata file")
+if (NOT BB_PGO STREQUAL "")
+    if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "BB_PGO needs clang or clang-cl")
+    endif()
+    if (BB_PGO STREQUAL "generate")
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate>)
+        # The emulator's threads run the same code at once: atomic counters, or their counts
+        # are lost and the profile marks busy code colder than it is.
+        if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/clang:-fprofile-update=atomic>)
+        else()
+            add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-update=atomic>)
+        endif()
+        add_compile_definitions(BB_PGO_GENERATE)
+        if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            # lld-link / link.exe take the profile runtime as a library.
+            execute_process(COMMAND ${CMAKE_CXX_COMPILER} /clang:-print-resource-dir
+                            OUTPUT_VARIABLE BB_CLANG_RESOURCE_DIR
+                            OUTPUT_STRIP_TRAILING_WHITESPACE)
+            file(GLOB_RECURSE BB_PROFILE_RUNTIME "${BB_CLANG_RESOURCE_DIR}/lib/*clang_rt.profile*.lib")
+            list(FILTER BB_PROFILE_RUNTIME INCLUDE REGEX "x86_64|x86_64-pc-windows-msvc")
+            if (NOT BB_PROFILE_RUNTIME)
+                message(FATAL_ERROR "BB_PGO=generate: clang_rt.profile not found in ${BB_CLANG_RESOURCE_DIR}")
+            endif()
+            list(GET BB_PROFILE_RUNTIME 0 BB_PROFILE_RUNTIME)
+            message(STATUS "PGO: instrumented build, profile runtime ${BB_PROFILE_RUNTIME}")
+            link_libraries("${BB_PROFILE_RUNTIME}")
+        else()
+            add_link_options(-fprofile-instr-generate)
+            message(STATUS "PGO: instrumented build")
+        endif()
+    else()
+        if (NOT EXISTS "${BB_PGO}")
+            message(FATAL_ERROR "BB_PGO: profile ${BB_PGO} not found")
+        endif()
+        message(STATUS "PGO: using ${BB_PGO}")
+        add_compile_options(
+            "$<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-use=${BB_PGO}>"
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-unprofiled>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-out-of-date>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-missing>)
+    endif()
+endif()
+
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
     set(BASE_ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
@@ -213,7 +261,7 @@ execute_process(
 
 # Set Version
 set(EMULATOR_VERSION_MAJOR "0")
-set(EMULATOR_VERSION_MINOR "20")
+set(EMULATOR_VERSION_MINOR "21")
 set(EMULATOR_VERSION_PATCH "0")
 
 set_source_files_properties(src/dist/shadps4.rc PROPERTIES COMPILE_DEFINITIONS "EMULATOR_VERSION_MAJOR=${EMULATOR_VERSION_MAJOR};EMULATOR_VERSION_MINOR=${EMULATOR_VERSION_MINOR};EMULATOR_VERSION_PATCH=${EMULATOR_VERSION_PATCH}")
@@ -298,6 +346,7 @@ set(AUDIO_LIB src/core/libraries/audio/audioin.cpp
               src/core/libraries/audio/sdl_audio_in.cpp
               src/core/libraries/voice/voice.cpp
               src/core/libraries/voice/voice.h
+              src/core/libraries/voice/voice_error.h
               src/core/libraries/audio/audioout.cpp
               src/core/libraries/audio/audioout.h
               src/core/libraries/audio/audioout_backend.h
@@ -590,12 +639,18 @@ set(RANDOM_LIB src/core/libraries/random/random.cpp
 set(USBD_LIB src/core/libraries/usbd/usbd.cpp
              src/core/libraries/usbd/usbd.h
              src/core/libraries/usbd/usb_backend.h
+             src/core/libraries/usbd/usbstorage.cpp
+             src/core/libraries/usbd/usbstorage.h
              src/core/libraries/usbd/emulated/dimensions.cpp
              src/core/libraries/usbd/emulated/dimensions.h
              src/core/libraries/usbd/emulated/infinity.cpp
              src/core/libraries/usbd/emulated/infinity.h
              src/core/libraries/usbd/emulated/skylander.cpp
              src/core/libraries/usbd/emulated/skylander.h
+)
+
+set(MUSIC_LIB src/core/libraries/music/music_player_service.cpp
+              src/core/libraries/music/music_player_service.h
 )
 
 set(FIBER_LIB src/core/libraries/fiber/fiber_context.cpp
@@ -606,10 +661,14 @@ set(FIBER_LIB src/core/libraries/fiber/fiber_context.cpp
 
 set(VDEC_LIB src/core/libraries/videodec/video_utils.cpp
              src/core/libraries/videodec/video_utils.h
+             src/core/libraries/videodec/vdeccore.cpp
+             src/core/libraries/videodec/vdeccore.h
              src/core/libraries/videodec/vdecsw.cpp
              src/core/libraries/videodec/vdecsw.h
              src/core/libraries/videodec/vdecsw_impl.cpp
              src/core/libraries/videodec/vdecsw_impl.h
+             src/core/libraries/videodec/videocore_server.cpp
+             src/core/libraries/videodec/videocore_server.h
              src/core/libraries/videodec/videodec2_impl.cpp
              src/core/libraries/videodec/videodec2_impl.h
              src/core/libraries/videodec/videodec2.cpp
@@ -641,8 +700,9 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/trophy_ui.h
             src/core/libraries/np/np_party.cpp
             src/core/libraries/np/np_party.h
-            src/core/libraries/np/np_auth.cpp
-            src/core/libraries/np/np_auth.h
+            src/core/libraries/np/np_auth/np_auth.cpp
+            src/core/libraries/np/np_auth/np_auth.h
+            src/core/libraries/np/np_auth/np_auth_ctx.h
             src/core/libraries/np/np_sns_facebook_dialog.cpp
             src/core/libraries/np/np_sns_facebook_dialog.h
             src/core/libraries/np/np_partner.cpp
@@ -651,6 +711,7 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_handler/np_handler.cpp
             src/core/libraries/np/np_handler/np_handler.h
             src/core/libraries/np/np_handler/np_handler_friends.cpp
+            src/core/libraries/np/np_handler/np_handler_auth.cpp
             src/core/libraries/np/np_handler/np_handler_invitation.cpp
             src/core/libraries/np/np_handler/np_handler_score.cpp
             src/core/libraries/np/np_handler/np_handler_trophy.cpp
@@ -788,6 +849,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/bit_field.h
            src/common/bounded_threadsafe_queue.h
            src/common/concepts.h
+           src/common/crash_crumbs.cpp
+           src/common/crash_crumbs.h
            src/common/cstring.h
            src/common/debug.h
            src/common/decoder.cpp
@@ -834,6 +897,15 @@ set(COMMON src/common/logging/classes.cpp
            src/common/string_util.h
            src/common/thread.cpp
            src/common/thread.h
+           src/common/guest_stats.h
+           src/common/game_waits.cpp
+           src/common/game_waits.h
+           src/common/bb_tuning.h
+           src/common/frame_pacing.h
+           src/common/copy_pool.cpp
+           src/common/copy_pool.h
+           src/common/render_affinity.cpp
+           src/common/render_affinity.h
            src/common/types.h
            src/common/uint128.h
            src/common/unique_function.h
@@ -871,6 +943,8 @@ set(NET_CORE  src/core/net/guest_net.cpp
 
 set(NET_LIB   src/core/libraries/net/net.cpp
               src/core/libraries/net/net.h
+              src/core/libraries/net/net_discovery.cpp
+              src/core/libraries/net/net_discovery.h
               src/core/libraries/net/net_error.h
               src/core/libraries/net/net_kernel.cpp
               src/core/libraries/net/net_kernel.h
@@ -972,6 +1046,7 @@ set(CORE src/core/aerolib/stubs.cpp
          ${PLAYGO_LIB}
          ${RANDOM_LIB}
          ${USBD_LIB}
+         ${MUSIC_LIB}
          ${ZLIB_LIB}
          ${MISC_LIBS}
          ${IME_LIB}
@@ -1077,6 +1152,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/ir/passes/dead_code_elimination_pass.cpp
                       src/shader_recompiler/ir/passes/expression_elimination.h
                       src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
+                      src/shader_recompiler/ir/passes/hardware_interpolation_pass.cpp
                       src/shader_recompiler/ir/passes/hull_shader_transform.cpp
                       src/shader_recompiler/ir/passes/inject_clip_distance_attributes.cpp
                       src/shader_recompiler/ir/passes/inverse_ballot_elimination_pass.cpp
@@ -1169,13 +1245,26 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
                src/video_core/renderer_vulkan/vk_bb_frame_gen.cpp
+               src/video_core/renderer_vulkan/vk_bb_library.cpp
+               src/video_core/renderer_vulkan/vk_bb_library.h
                src/video_core/renderer_vulkan/vk_bb_frame_gen.h
                src/video_core/renderer_vulkan/vk_bb_fsr_frame_gen.cpp
                src/video_core/renderer_vulkan/vk_bb_fsr_frame_gen.h
                src/video_core/renderer_vulkan/vk_bb_temporal_dlss.cpp
                src/video_core/renderer_vulkan/vk_bb_temporal_dlss.h
+               src/video_core/renderer_vulkan/vk_bb_motion_history.h
+               src/video_core/renderer_vulkan/vk_bb_object_motion.cpp
+               src/video_core/renderer_vulkan/vk_bb_object_motion.h
                src/video_core/renderer_vulkan/vk_bb_velocity_mirror.cpp
                src/video_core/renderer_vulkan/vk_bb_velocity_mirror.h
+               src/video_core/renderer_vulkan/vk_bb_ssr.cpp
+               src/video_core/renderer_vulkan/vk_bb_ssr.h
+               src/video_core/renderer_vulkan/vk_bb_perf_meter.cpp
+               src/video_core/renderer_vulkan/vk_bb_perf_meter.h
+               src/video_core/renderer_vulkan/vk_bb_stage_census.cpp
+               src/video_core/renderer_vulkan/vk_bb_stage_census.h
+               src/video_core/renderer_vulkan/vk_bb_vbao.cpp
+               src/video_core/renderer_vulkan/vk_bb_vbao.h
                src/video_core/renderer_vulkan/vk_dlss_ngx.cpp
                src/video_core/renderer_vulkan/vk_dlss_ngx.h
                src/video_core/renderer_vulkan/vk_hdr_mod.cpp
@@ -1203,6 +1292,9 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.cpp
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
+               src/video_core/renderer_vulkan/vk_draw_pipe.h
+               src/video_core/renderer_vulkan/vk_gpu_profiler.cpp
+               src/video_core/renderer_vulkan/vk_gpu_profiler.h
                src/video_core/renderer_vulkan/vk_rasterizer.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
@@ -1259,6 +1351,7 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/friends_layer.h
           src/imgui/dlss_layer.cpp
           src/imgui/dlss_layer.h
+          src/imgui/bb_settings_file.h
           src/imgui/invitation_prompt_layer.cpp
           src/imgui/invitation_prompt_layer.h
           src/imgui/shadnet_notifications_layer.cpp
@@ -1296,8 +1389,19 @@ set(INPUT src/input/controller.cpp
           src/input/input_handler.h
           src/core/bb_mouse_camera.cpp
           src/core/bb_mouse_camera.h
+          src/core/bb_frame_rate.cpp
+          src/core/bb_frame_rate.h
+          src/core/bb_guest_code.h
+          src/core/bb_gx_draws.cpp
+          src/core/bb_gx_draws.h
+          src/core/bb_game_fixes.cpp
+          src/core/bb_game_fixes.h
+          src/core/bb_resolution.cpp
+          src/core/bb_resolution.h
           src/input/bb_kbm.cpp
           src/input/bb_kbm.h
+          src/input/bb_route.cpp
+          src/input/bb_route.h
           src/input/input_mouse.cpp
           src/input/input_mouse.h
 )
@@ -1357,7 +1461,7 @@ add_executable(shadps4
 create_target_directory_groups(shadps4)
 
 target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
-target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
+target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3 dr_flac)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis SDL3::SDL3 pugixml::pugixml)
 target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
 target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
@@ -1385,6 +1489,10 @@ if (BB_STREAMLINE_DIR AND WIN32)
     target_compile_definitions(shadps4 PRIVATE SHADPS4_BB_FRAME_GEN)
     target_include_directories(shadps4 PRIVATE "${BB_STREAMLINE_DIR}/include")
     target_link_libraries(shadps4 PRIVATE wintrust crypt32 dxgi)
+endif()
+if (WIN32)
+    # Guest mutexes wait with WaitOnAddress (src/core/libraries/kernel/sync/mutex.cpp).
+    target_link_libraries(shadps4 PRIVATE synchronization)
 endif()
 target_link_libraries(shadps4 PRIVATE zstd::libzstd)
 target_include_directories(shadps4 PRIVATE "${SHADNET_PROTO_OUT}")
@@ -1519,6 +1627,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CMakeRC.cmake")
 cmrc_add_resource_library(embedded-resources
         ALIAS res::embedded
         NAMESPACE res
+        src/resources/big_picture/bloodborne.png
         src/resources/big_picture/controller.png
         src/resources/big_picture/experimental.png
         src/resources/big_picture/folder.png

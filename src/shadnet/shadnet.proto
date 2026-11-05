@@ -128,6 +128,7 @@ message RecordScoreRequest {
     int64  score    = 3;
     string comment  = 4;
     bytes  data     = 5;   // optional inline game-info blob
+    uint64 compareDate = 6;
 }
 
 message RecordScoreGameDataRequest {
@@ -168,6 +169,7 @@ message GetScoreFriendsRequest {
     uint32 max          = 3;
     bool   withComment  = 4;
     bool   withGameInfo = 5;
+    uint32 startRank    = 6;
 }
 
 message ScoreAccountIdPcId {
@@ -198,6 +200,7 @@ message ScoreRankData {
     bool   hasGameData = 5;
     uint64 recordDate  = 6;
     int64  accountId   = 7;
+    uint32 sharedRank  = 8;
 }
 
 message ScoreInfo {
@@ -572,6 +575,18 @@ message LookupOnlineIdReply {
     string npid        = 2; // canonical online ID as registered on the server
 }
 
+// Single-use authorization code issued to the signed-in account for a game's backend, which
+// exchanges it at POST /2.0/oauth/token.
+message GetAuthorizationCodeRequest {
+    string client_id = 1;
+    string scope     = 2;
+}
+
+message GetAuthorizationCodeReply {
+    string code       = 1;
+    uint32 expires_in = 2; // seconds
+}
+
 // Notification payloads
 
 // NotificationType::RoomEvent (10) — every room event maps onto
@@ -606,7 +621,7 @@ message NotifyRoomMessage {
     bytes msg = 10;
 }
 
-// Title User Storage (TUS) 
+// Title User Storage (TUS)
 
 message TusVariable {
     string ownerNpId                  = 1;
@@ -778,7 +793,7 @@ message TssGetDataRequest {
 }
 
 message TssGetDataResponse {
-    
+
     int32  statusCodeType = 1; // OrbisNpTssStatusCodeType: 0 = OK, 1 = PARTIAL, 2 = NOT_MODIFIED.
     uint64 lastModified   = 2; // seconds since epoch, 0 when the file is absent
     uint64 contentLength  = 3; // size the client should expect for this status
@@ -808,5 +823,5 @@ message SyncTrophiesReply {
 }
 
 message SetClientVersionRequest {
-    string version = 1; 
+    string version = 1;
 }

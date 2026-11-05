@@ -1,18 +1,46 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <numeric>
+#include <string>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vram_owners.h"
 
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+
+MemoryType DrawDataMemoryType(const Vulkan::Instance& instance) {
+    static const MemoryType type = [&] {
+        // Resizable BAR (AMD: Smart Access Memory): the CPU-visible part of graphics card memory
+        // covers (nearly) all of it, not the classic 256 MiB window.
+        const auto props = instance.GetPhysicalDevice().getMemoryProperties();
+        constexpr auto bar_flags =
+            vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible;
+        u64 bar_heap = 0;
+        for (u32 i = 0; i < props.memoryTypeCount; ++i)
+            if ((props.memoryTypes[i].propertyFlags & bar_flags) == bar_flags)
+                bar_heap =
+                    std::max<u64>(bar_heap, props.memoryHeaps[props.memoryTypes[i].heapIndex].size);
+        const bool rebar = bar_heap > 1024_MB;
+        const int setting = EmulatorSettings.GetBbDrawDataMemory(); // 0 auto, 1 card, 2 system
+        const bool card = setting == 1 || (setting == 0 && rebar);
+        LOG_INFO(Render_Vulkan, "Draw data memory: {} ({}, Resizable BAR {}: {} MiB visible)",
+                 card ? "graphics card" : "system RAM", setting == 0 ? "auto" : "setting",
+                 rebar ? "on" : "off", bar_heap >> 20);
+        return card ? MemoryType::Stream : MemoryType::HostCached;
+    }();
+    return type;
+}
 
 std::string_view BufferTypeName(MemoryType type) {
     switch (type) {
@@ -72,6 +100,8 @@ UniqueBuffer::~UniqueBuffer() {
 
 void UniqueBuffer::Destroy() {
     if (allocation) {
+        VramOwners::Track(vram_owner, allocator, allocation, false);
+        vram_owner = VramOwners::NoOwner;
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {
         device.destroyBuffer(buffer);
@@ -82,12 +112,12 @@ void UniqueBuffer::Destroy() {
 }
 
 void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
-                          VmaAllocationInfo* out_alloc_info) {
+                          VmaAllocationInfo* out_alloc_info, std::string_view owner_name) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     if (mem_type != MemoryType::Sparse) {
         const VmaAllocationCreateFlags bda_flag =
             with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
-        const VmaAllocationCreateInfo alloc_ci = {
+        VmaAllocationCreateInfo alloc_ci = {
             .flags =
                 VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
             .usage = MemoryUsageVma(mem_type),
@@ -101,9 +131,21 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            LOG_WARNING(Render_Vulkan, "Allocating buffer of size {} bytes over budget.",
+                        buffer_ci.size);
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
+        const std::string name = owner_name.empty()
+                                     ? fmt::format("{} buffers", BufferTypeName(mem_type))
+                                     : fmt::format("{} ({})", owner_name, BufferTypeName(mem_type));
+        vram_owner = VramOwners::Register(name);
+        VramOwners::Track(vram_owner, allocator, allocation, true);
     } else {
         buffer_ci.flags |=
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
@@ -120,18 +162,30 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
     }
 }
 
+vk::BufferUsageFlags SupportedUsage(const Vulkan::Instance& instance, vk::BufferUsageFlags usage) {
+    if (!instance.IsBufferDeviceAddressSupported()) {
+        usage &= ~vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    return usage;
+}
+
 Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
                MemoryType mem_type_, std::string_view debug_name)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
 
+    // Shared with the readback queue's family when it has one of its own (GPU readbacks).
+    const auto families = instance.GetBufferQueueFamilies();
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
-        .usage = AllFlags,
-        .sharingMode = vk::SharingMode::eExclusive,
+        .usage = SupportedUsage(instance, AllFlags),
+        .sharingMode =
+            families.size() > 1 ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = families.size() > 1 ? static_cast<u32>(families.size()) : 0u,
+        .pQueueFamilyIndices = families.size() > 1 ? families.data() : nullptr,
     };
     VmaAllocationInfo alloc_info{};
-    buffer.Create(buffer_ci, mem_type, &alloc_info);
+    buffer.Create(buffer_ci, mem_type, &alloc_info, debug_name);
 
     const auto device = instance.GetDevice();
     if (!debug_name.empty()) {

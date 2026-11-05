@@ -16,46 +16,39 @@
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 #include "../../../dlss_bridge/shadps4_dlss_bridge.h"
-#endif
+#include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_bb_library.h"
 
 namespace Vulkan {
 
 namespace {
-constexpr wchar_t BridgeName[] = L"shadps4_dlss.dll";
-constexpr wchar_t NgxName[] = L"nvngx_dlss.dll";
+constexpr char BridgeName[] = BB_LIBRARY_NAME("shadps4_dlss.dll", "shadps4_dlss.so");
 
-std::filesystem::path ExecutableDirectory() {
+// The DLSS SDK names its Linux library after its version (libnvidia-ngx-dlss.so.310.9.16).
+bool HasNgxLibrary(const std::filesystem::path& directory) {
 #ifdef _WIN32
-    std::wstring path(MAX_PATH, L'\0');
-    const DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
-    path.resize(length);
-    return std::filesystem::path{path}.parent_path();
+    return std::filesystem::is_regular_file(directory / "nvngx_dlss.dll");
 #else
-    return std::filesystem::current_path();
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator{directory, error})
+        if (entry.path().filename().string().starts_with("libnvidia-ngx-dlss.so.") &&
+            entry.is_regular_file(error))
+            return true;
+    return false;
 #endif
 }
 } // namespace
 
 bool DlssNgx::Present() {
-#ifdef _WIN32
     static const bool present = [] {
         const char* setting = std::getenv("SHADPS4_DLSS");
         if (setting && std::string_view{setting} == "0")
             return false;
-        const auto directory = ExecutableDirectory();
-        return std::filesystem::is_regular_file(directory / BridgeName) &&
-               std::filesystem::is_regular_file(directory / NgxName);
+        const auto directory = BbLibrary::ExecutableDirectory();
+        return std::filesystem::is_regular_file(directory / BridgeName) && HasNgxLibrary(directory);
     }();
     return present;
-#else
-    return false;
-#endif
 }
 
 int DlssNgx::QualityForScale(float scale) {
@@ -63,7 +56,7 @@ int DlssNgx::QualityForScale(float scale) {
     return scale >= 2.9f ? 4 : scale >= 1.95f ? 3 : scale >= 1.65f ? 2 : scale > 1.01f ? 1 : 0;
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 
 namespace {
 // quick_exit skips Instance destructors; release NGX before the process ends.
@@ -108,7 +101,7 @@ bool CollectExtensions(const VkExtensionProperties* required, u32 count,
 } // namespace
 
 struct DlssNgx::Impl {
-    HMODULE module{};
+    void* module{};
     const ShadDlssApi* api{};
     std::vector<std::string> instance_extensions, device_extensions;
     std::optional<FeatureDesc> feature;
@@ -122,21 +115,18 @@ struct DlssNgx::Impl {
 };
 
 DlssNgx::DlssNgx() : impl{std::make_unique<Impl>()} {
-    const auto directory = ExecutableDirectory();
-    impl->module = LoadLibraryW((directory / BridgeName).c_str());
-    const auto get_api =
-        impl->module
-            ? reinterpret_cast<ShadDlssGetApiFn>(GetProcAddress(impl->module, "ShadDlssGetApi"))
-            : nullptr;
+    const auto directory = BbLibrary::ExecutableDirectory();
+    impl->module = BbLibrary::Load(directory / BridgeName);
+    const auto get_api = BbLibrary::Find<ShadDlssGetApiFn>(impl->module, "ShadDlssGetApi");
     impl->api = get_api ? get_api() : nullptr;
     if (!impl->api || impl->api->abi != SHADPS4_DLSS_BRIDGE_ABI) {
-        impl->Disable("shadps4_dlss.dll is missing or from a different version");
+        impl->Disable(fmt::format("{} is missing or from a different version", BridgeName));
         return;
     }
     const auto data = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "dlss";
     std::error_code error;
     std::filesystem::create_directories(data, error);
-    if (!impl->api->Configure(directory.c_str(), data.c_str(), BridgeLog))
+    if (!impl->api->Configure(directory.wstring().c_str(), data.wstring().c_str(), BridgeLog))
         impl->Disable("bridge configuration failed");
 }
 
@@ -252,6 +242,74 @@ void DlssNgx::ReleaseFeatureAfterGpuDrain() {
         impl->api->ReleaseFeature();
 }
 
+namespace {
+ShadDlssImage Image(const DlssNgx::Resource& r) {
+    return ShadDlssImage{r.image,
+                         r.view,
+                         static_cast<VkImageSubresourceRange>(r.range),
+                         static_cast<VkFormat>(r.format),
+                         r.extent.width,
+                         r.extent.height};
+}
+} // namespace
+
+u32 DlssNgx::FrameGenMaxCount() const {
+    return impl->available ? u32(std::max(impl->api->FrameGenMaxCount(), 0)) : 0;
+}
+
+bool DlssNgx::FrameGenCreate(vk::CommandBuffer command, const FrameGenDesc& desc) {
+    if (!impl->available)
+        return false;
+    const ShadDlssgFeature feature{desc.display.width, desc.display.height,
+                                   static_cast<VkFormat>(desc.format), desc.render.width,
+                                   desc.render.height};
+    return impl->api->FrameGenCreate(command, &feature) != 0;
+}
+
+bool DlssNgx::FrameGenEvaluate(vk::CommandBuffer command, const Resource& backbuffer,
+                               const Resource& depth, const Resource& motion,
+                               const Resource& output, const Resource* hudless,
+                               const FrameGen::FrameInputs& inputs, std::array<float, 2> mvec_scale,
+                               bool reset, u32 count, u32 index) {
+    if (!impl->available)
+        return false;
+    ShadDlssgEvaluate evaluate{};
+    evaluate.backbuffer = Image(backbuffer);
+    evaluate.depth = Image(depth);
+    evaluate.motion = Image(motion);
+    evaluate.output = Image(output);
+    if (hudless)
+        evaluate.hudless = Image(*hudless);
+    evaluate.jitter_x = inputs.jitter[0];
+    evaluate.jitter_y = inputs.jitter[1];
+    evaluate.mvec_scale_x = mvec_scale[0];
+    evaluate.mvec_scale_y = mvec_scale[1];
+    evaluate.camera_near = inputs.near_plane;
+    evaluate.camera_far = inputs.far_plane;
+    evaluate.camera_fov = inputs.fov_y;
+    evaluate.camera_aspect = inputs.aspect;
+    std::ranges::copy(inputs.position, evaluate.camera_position);
+    std::ranges::copy(inputs.up, evaluate.camera_up);
+    std::ranges::copy(inputs.right, evaluate.camera_right);
+    std::ranges::copy(inputs.forward, evaluate.camera_forward);
+    std::memcpy(evaluate.view_to_clip, inputs.view_to_clip.data(), sizeof(evaluate.view_to_clip));
+    std::memcpy(evaluate.clip_to_view, inputs.clip_to_view.data(), sizeof(evaluate.clip_to_view));
+    std::memcpy(evaluate.clip_to_prev_clip, inputs.clip_to_prev_clip.data(),
+                sizeof(evaluate.clip_to_prev_clip));
+    std::memcpy(evaluate.prev_clip_to_clip, inputs.prev_clip_to_clip.data(),
+                sizeof(evaluate.prev_clip_to_clip));
+    evaluate.depth_inverted = inputs.depth_inverted;
+    evaluate.reset = reset;
+    evaluate.multi_frame_count = count;
+    evaluate.multi_frame_index = index;
+    return impl->api->FrameGenEvaluate(command, &evaluate) != 0;
+}
+
+void DlssNgx::FrameGenReleaseAfterGpuDrain() {
+    if (impl->api)
+        impl->api->FrameGenRelease();
+}
+
 void DlssNgx::Shutdown() {
     impl->available = false;
     impl->feature.reset();
@@ -287,6 +345,18 @@ bool DlssNgx::Evaluate(vk::CommandBuffer, const Resource&, const Resource&, cons
     return false;
 }
 void DlssNgx::ReleaseFeatureAfterGpuDrain() {}
+u32 DlssNgx::FrameGenMaxCount() const {
+    return 0;
+}
+bool DlssNgx::FrameGenCreate(vk::CommandBuffer, const FrameGenDesc&) {
+    return false;
+}
+bool DlssNgx::FrameGenEvaluate(vk::CommandBuffer, const Resource&, const Resource&, const Resource&,
+                               const Resource&, const Resource*, const FrameGen::FrameInputs&,
+                               std::array<float, 2>, bool, u32, u32) {
+    return false;
+}
+void DlssNgx::FrameGenReleaseAfterGpuDrain() {}
 
 #endif
 

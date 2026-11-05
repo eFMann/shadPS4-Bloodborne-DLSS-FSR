@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <array>
+#include <cstdlib>
 #include <memory>
-
+#include <mutex>
 #include <span>
 #include <unordered_map>
 
@@ -18,6 +20,7 @@ class WindowSDL;
 }
 
 VK_DEFINE_HANDLE(VmaAllocator)
+VK_DEFINE_HANDLE(VmaPool)
 
 namespace Vulkan {
 
@@ -86,6 +89,28 @@ public:
         return present_queue != graphics_queue;
     }
 
+    /// A queue for GPU readbacks that runs beside rendering (a copy engine when there is one):
+    /// a readback then waits only for the work that wrote its data, not all queued work.
+    /// Sample counts an image with these properties supports (vkGetPhysicalDeviceImageFormat-
+    /// Properties2, remembered: a traversal burst creates ~200 textures in a frame, mostly of a few
+    /// kinds). 1 when the format is not supported.
+    vk::SampleCountFlags GetImageSampleCounts(const vk::PhysicalDeviceImageFormatInfo2& info) const;
+
+    bool HasReadbackQueue() const {
+        return bool(readback_queue);
+    }
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+    u32 GetReadbackQueueFamily() const {
+        return readback_family;
+    }
+    /// Queue families buffers are shared between (graphics, and the readback queue's family
+    /// when it differs). One entry: exclusive to the graphics family.
+    std::span<const u32> GetBufferQueueFamilies() const {
+        return {buffer_queue_families.data(), buffer_queue_family_count};
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -135,6 +160,11 @@ public:
 
     bool IsMaintenance5Supported() const {
         return maintenance_5;
+    }
+
+    /// Occlusion queries can count exact samples (enabled when supported).
+    bool IsOcclusionQueryPrecise() const {
+        return features.occlusionQueryPrecise;
     }
 
     bool IsMaintenance6Supported() const {
@@ -253,6 +283,12 @@ public:
     /// Returns true if 64-bit integer atomic operations can be used on shared memory
     bool IsSharedInt64AtomicsSupported() const {
         return vk12_features.shaderSharedInt64Atomics;
+    }
+
+    /// Returns true when buffer device address can be used. RenderDoc hides it on drivers that
+    /// lack bufferDeviceAddressCaptureReplay.
+    bool IsBufferDeviceAddressSupported() const {
+        return vk12_features.bufferDeviceAddress;
     }
 
     /// Returns true if the subgroup size can be set to match guest subgroup size
@@ -485,10 +521,44 @@ public:
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
-    /// Returns the total memory budget available to the device.
-    [[nodiscard]] u64 GetTotalMemoryBudget() const {
-        return total_memory_budget;
+    /// Memory use per heap kind right now (VK_EXT_memory_budget), for the VRAM report.
+    struct MemoryHeapReport {
+        u64 local_usage{};  ///< device-local heaps: what this process uses
+        u64 local_budget{}; ///< device-local heaps: what the driver lets it use now
+        u64 host_usage{};   ///< system-memory heaps the GPU can reach (spill-over shows here)
+    };
+    [[nodiscard]] MemoryHeapReport GetMemoryHeapReport() const;
+
+    /// The allocator's memory in device-local heaps: taken from the driver, and of it in use.
+    /// The difference is free space inside its blocks, still counted by the driver as used.
+    struct AllocatorUsage {
+        u64 held{};
+        u64 in_use{};
+    };
+    [[nodiscard]] AllocatorUsage GetAllocatorUsage() const;
+
+    /// "Use more VRAM": the cleanup's marks from the driver's budget now (it moves as other
+    /// programs use the card), a small margin below it instead of an eighth of it.
+    struct VramLimits {
+        u64 budget{};   ///< the driver's budget for this process
+        u64 limit{};    ///< past it, the driver starts moving memory to system RAM
+        u64 pressure{}; ///< textures unused for a few seconds go
+        u64 critical{}; ///< textures unused for a second go
+    };
+    [[nodiscard]] VramLimits GetLiveVramLimits() const;
+
+    /// Memory priorities are on: allocations can say how much they matter if Windows must move
+    /// some of the emulator's memory to system RAM.
+    [[nodiscard]] bool HasMemoryPriority() const noexcept {
+        return memory_priority;
     }
+    static constexpr float LowTexturePriority = 0.25f;
+    static constexpr float HighBufferPriority = 1.0f;
+
+    /// Returns the total memory budget available to the device.
+    /// Testing: SHADPS4_VRAM_BUDGET_MB or the "VRAM budget for testing" setting simulate a
+    /// smaller GPU's memory budget.
+    [[nodiscard]] u64 GetTotalMemoryBudget() const;
 
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
@@ -499,6 +569,7 @@ private:
 
     /// Creates the VMA allocator handle
     void CreateAllocator();
+    void CreateLowPriorityTexturePool();
 
     /// Collects various information from the device.
     void CollectDeviceParameters();
@@ -513,6 +584,9 @@ private:
     // Constructed before the Vulkan instance (it adds extensions); reset before device teardown.
     std::unique_ptr<DlssNgx> dlss_ngx;
     vk::UniqueInstance instance;
+    // A surface for the window while the device is created, so FSR frame generation can pick
+    // queues that present to it (Linux; Windows asks Win32 directly).
+    vk::SurfaceKHR presentation_probe;
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;
     vk::PhysicalDeviceProperties properties;
@@ -538,6 +612,10 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue readback_queue;
+    u32 readback_family{~0u};
+    std::array<u32, 2> buffer_queue_families{};
+    u32 buffer_queue_family_count{1};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
@@ -553,6 +631,8 @@ private:
     bool vertex_input_dynamic_state{};
     bool list_restart{};
     bool provoking_vertex{};
+    mutable std::mutex image_sample_counts_mutex;
+    mutable std::unordered_map<u64, vk::SampleCountFlags> image_sample_counts;
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};
@@ -572,6 +652,9 @@ private:
     bool shader_clock{};
     bool compute_shader_derivatives{};
     bool supports_memory_budget{};
+    bool memory_priority{};          ///< VK_EXT_memory_priority on ("Go past the budget")
+    u64 device_local_heap_bytes{};   ///< the card's own memory
+    VmaPool low_priority_textures{}; ///< pool for block-compressed textures (memory_priority)
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

@@ -60,6 +60,8 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const vk::SharingMode sharing_mode =
         exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
     const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
+    LOG_INFO(Render_Vulkan, "Swapchain: {}x{}, present mode {} (setting {}), {} images", width,
+             height, vk::to_string(present_mode), EmulatorSettings.GetPresentMode(), image_count);
     const vk::SwapchainCreateInfoKHR swapchain_info = {
         .surface = surface,
         .minImageCount = image_count,
@@ -171,10 +173,12 @@ bool Swapchain::AcquireNextImage() {
     switch (result) {
     case vk::Result::eSuccess:
         break;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
     case vk::Result::eErrorFullScreenExclusiveModeLostEXT:
         exclusive_held = false;
         needs_recreation = true;
         break;
+#endif
     case vk::Result::eSuboptimalKHR:
     case vk::Result::eErrorSurfaceLostKHR:
     case vk::Result::eErrorOutOfDateKHR:
@@ -211,9 +215,11 @@ bool Swapchain::Present() {
                       : instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
     } else if (result == vk::Result::eErrorFullScreenExclusiveModeLostEXT) {
         exclusive_held = false;
         needs_recreation = true;
+#endif
     } else if (result != vk::Result::eSuccess && FrameGen::Active()) {
         // Streamline presents asynchronously and reports a failed present on a later one.
         LOG_WARNING(Render_Vulkan, "Swapchain presentation returned {}", vk::to_string(result));

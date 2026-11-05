@@ -6,6 +6,7 @@
 #include "core/emulator_settings.h"
 #include "video_core/renderdoc.h"
 
+#include <algorithm>
 #include <atomic>
 #include <renderdoc_app.h>
 
@@ -25,6 +26,8 @@ enum class CaptureState {
     InProgress,
 };
 static CaptureState capture_state{CaptureState::Idle};
+/// Frames the capture in progress still takes (several frames go into one file).
+static u32 capture_frames_left{};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 
@@ -64,22 +67,36 @@ void LoadRenderDoc() {
         ASSERT(ret == 1);
     }
 #else
-#ifdef ANDROID
+#if defined(__APPLE__)
+    static constexpr const char* RENDERDOC_LIB = "librenderdoc.dylib";
+    static constexpr std::array RENDERDOC_LIB_PATHS = {RENDERDOC_LIB,
+                                                       "/usr/local/lib/librenderdoc.dylib"};
+#else
+#if defined(ANDROID)
     static constexpr const char RENDERDOC_LIB[] = "libVkLayer_GLES_RenderDoc.so";
 #else
     static constexpr const char RENDERDOC_LIB[] = "librenderdoc.so";
+#endif
+    static constexpr std::array RENDERDOC_LIB_PATHS = {RENDERDOC_LIB};
 #endif
     // Check if we are running by RDoc GUI
     void* mod = dlopen(RENDERDOC_LIB, RTLD_NOW | RTLD_NOLOAD);
     if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
         // If enabled in config, try to load RDoc runtime in offline mode
-        if ((mod = dlopen(RENDERDOC_LIB, RTLD_NOW))) {
-            const auto RENDERDOC_GetAPI =
-                reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(mod, "RENDERDOC_GetAPI"));
-            const s32 ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, (void**)&rdoc_api);
-            ASSERT(ret == 1);
-        } else {
-            LOG_ERROR(Render, "Cannot load RenderDoc: {}", dlerror());
+        for (const auto& path : RENDERDOC_LIB_PATHS) {
+            if ((mod = dlopen(path, RTLD_NOW))) {
+                const auto RENDERDOC_GetAPI =
+                    reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(mod, "RENDERDOC_GetAPI"));
+                const s32 ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, (void**)&rdoc_api);
+                ASSERT(ret == 1);
+
+                LOG_INFO(Render, "Loaded RenderDoc lib from '{}'", path);
+                break;
+            }
+            LOG_WARNING(Render, "Could not load RenderDoc lib from '{}': {}", path, dlerror());
+        }
+        if (!mod) {
+            LOG_ERROR(Render, "Could not load RenderDoc lib from any known path.");
         }
     }
 #endif
@@ -110,22 +127,34 @@ void EndCapture() {
     }
 
     if (capture_state == CaptureState::InProgress) {
+        if (capture_frames_left > 1) {
+            --capture_frames_left;
+            return;
+        }
         rdoc_api->EndFrameCapture(nullptr, nullptr);
         capture_state = CaptureState::Idle;
+        LOG_INFO(Render, "RenderDoc capture written");
     }
 }
 
 void TriggerCapture() {
     if (capture_state == CaptureState::Idle) {
+        capture_frames_left =
+            static_cast<u32>(std::clamp(EmulatorSettings.GetBbRdocCaptureFrames(), 1, 120));
         capture_state = CaptureState::Triggered;
+        LOG_INFO(Render, "RenderDoc capture of the next {} frame(s)", capture_frames_left);
     }
+}
+
+bool IsCapturing() {
+    return capture_state == CaptureState::InProgress;
 }
 
 void SetOutputDir(const std::filesystem::path& path, const std::string& prefix) {
     if (!rdoc_api) {
         return;
     }
-    LOG_WARNING(Common, "RenderDoc capture path: {}", (path / prefix).string());
+    LOG_WARNING(Render, "RenderDoc capture path: {}", (path / prefix).string());
     rdoc_api->SetCaptureFilePathTemplate(fmt::UTF((path / prefix).u8string()).data.data());
 }
 

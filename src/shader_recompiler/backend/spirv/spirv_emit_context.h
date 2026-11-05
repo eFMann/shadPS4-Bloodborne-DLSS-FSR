@@ -195,6 +195,8 @@ public:
     const Profile& profile;
     HwStage hw_stage;
     SwStage sw_stage{};
+    /// Float arithmetic without NoContraction (Profile::fragment_fp_contraction).
+    bool fp_contraction{};
 
     Id last_label{};
 
@@ -265,6 +267,25 @@ public:
     Id sample_index{};
     Id clip_distances{};
     Id cull_distances{};
+
+    // Character motion vectors (runtime_info.h, MotionVectors).
+    Id motion_out_cur{};
+    Id motion_out_prev{};
+    Id motion_in_cur{};
+    Id motion_in_prev{};
+    Id motion_frag_out{};
+    [[nodiscard]] bool VertexMotion() const {
+        return sw_stage == SwStage::Vertex && hw_stage == HwStage::Vertex &&
+               runtime_info.hw.vs.motion_vectors != 0;
+    }
+    /// The push data member holding motion_param (it moves in clip jitter shaders).
+    u32 motion_param_member{PushData::MotionParamIndex};
+    [[nodiscard]] bool VertexClipJitter() const {
+        return hw_stage == HwStage::Vertex && runtime_info.hw.vs.clip_jitter != 0;
+    }
+    [[nodiscard]] bool FragmentMotion() const {
+        return sw_stage == SwStage::Fragment && runtime_info.hw.fs.motion_vectors;
+    }
 
     Id patch_vertices{};
     Id output_tess_level_outer{};

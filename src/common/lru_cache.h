@@ -60,7 +60,7 @@ public:
     template <typename Func>
     void ForEachItemBelow(TickType tick, Func&& func) {
         static constexpr bool RETURNS_BOOL =
-            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
+            std::is_same_v<std::invoke_result_t<Func, ObjectType&>, bool>;
         Node* it = first;
         while (it) {
             if (static_cast<s64>(tick) - static_cast<s64>(it->tick) < 0) {
@@ -79,6 +79,24 @@ public:
         }
     }
 
+    // Resume bounded scans without changing resource-use ages. Skipped entries
+    // cannot permanently hide later eligible entries.
+    template <typename Func>
+    void ForEachItemBelow(TickType tick, size_t max_items, Func&& func) {
+        Node* it = scan ? scan : first;
+        while (it && max_items-- > 0) {
+            if (static_cast<s64>(tick) - static_cast<s64>(it->tick) < 0) {
+                scan = nullptr;
+                return;
+            }
+            scan = it->next;
+            if (func(ToObject(*it))) {
+                return;
+            }
+            it = scan;
+        }
+    }
+
 private:
     void Attach(Node& node) {
         node.prev = last;
@@ -93,6 +111,9 @@ private:
     }
 
     void Detach(Node& node) {
+        if (scan == &node) {
+            scan = node.next;
+        }
         if (node.prev) {
             node.prev->next = node.next;
         } else {
@@ -109,6 +130,7 @@ private:
 
     Node* first{};
     Node* last{};
+    Node* scan{}; ///< where the next bounded scan resumes
 };
 
 } // namespace Common

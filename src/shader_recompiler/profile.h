@@ -52,6 +52,15 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// Pixel shaders that don't write depth: float adds, multiplies and fmas left to the driver
+    /// to fuse (FFMA instead of FMUL and FADD on NVIDIA, less code). Off: every one unfused, as
+    /// GCN's v_mad_f32. Results differ in the last bit at most.
+    bool fragment_fp_contraction{};
+    /// With needs_manual_interpolation: a pixel shader input goes back to the hardware's
+    /// interpolation when no use of it needs GCN's exact formula. Off: every input by the formula.
+    bool hardware_interpolation{};
+    bool fast_shader_math{};
+    bool support_bda{};
 
     bool operator==(const Profile&) const = default;
 };

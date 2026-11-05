@@ -3,15 +3,29 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
+#include "common/enum.h"
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/texture_cache/image.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -26,6 +40,7 @@ class GraphicsPipeline;
 struct SubmitInfo;
 class Runtime;
 class StagingBufferPool;
+struct StagingBufferRef;
 } // namespace Vulkan
 
 namespace VideoCore {
@@ -33,6 +48,15 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+
+enum class ObtainBufferFlags {
+    None = 0,
+    IsWritten = 1 << 0,
+    IsTexelBuffer = 1 << 1,
+    IgnoreStreamBuffer = 1 << 2,
+    InvalidateTextureCache = 1 << 3,
+};
+DECLARE_ENUM_FLAG_OPERATORS(ObtainBufferFlags)
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
@@ -43,6 +67,11 @@ class BufferCache {
     static constexpr u64 STREAM_THRESHOLD = 16_KB;
 
 public:
+    /// Read-only buffers up to this size are copied into the stream buffer on every binding.
+    static constexpr u64 StreamThreshold() {
+        return STREAM_THRESHOLD;
+    }
+
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);
@@ -69,6 +98,7 @@ public:
 
     /// Retrieves the stream buffer.
     [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
+        BB_STAGE_CENSUS("BufferCache::GetStreamBuffer", Caches);
         return stream_buffer;
     }
 
@@ -79,19 +109,94 @@ public:
 
     void TickFrame();
 
+    /// Loading screen: frees buffer memory idle since before it. False: try again next frame.
+    bool EvictIdleBuffersAtLoadScreen() {
+        return GarbageCollectResidentMemory(true);
+    }
+
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
+    /// After a guest write fault at device_addr: also unprotects the rest of the aligned
+    /// window around it (see RegionManager::ExtendWriteFault).
+    void ExtendWriteFault(VAddr device_addr);
+
+    /// Unmark a region as modified from the GPU.
+    void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
+    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool async = false,
+                    bool assume_locks = false);
+
+    /// Flushes GPU modified ranges of the uncovered part of the edge pages of an image.
+    void ReadEdgeImagePages(const Image& image);
+
+    /// Diagnostics: GPU readbacks since the last call (where, who, how long, and whether the
+    /// GPU work that wrote the data had been submitted or had finished), logged every 10 s.
+    void LogReadbackReport();
+
+    /// Diagnostics (issue #25): a sample of the copy shader's sources read from a snapshot of
+    /// game memory in the stream buffer (`stream_offset`) is compared, once the GPU has run, with
+    /// what the buffer cache held for the same memory at that point. Only pages without CPU
+    /// changes the buffer hadn't had yet: there both ways should give the same bytes. Also
+    /// whether the GPU read from the stream buffer the bytes the snapshot wrote there.
+    void CheckSnapshotSource(VAddr device_addr, u64 size, u64 stream_offset);
+
+    /// Early write-back (threaded renderer): memory a game thread had to wait for a readback of
+    /// is "hot" for a while. GPU work writing hot memory asks for its batch to be sent at once,
+    /// and once the GPU has finished it the data is copied back to guest memory, so the game's
+    /// next write finds it there instead of waiting for the GPU.
+    void SetEarlyWriteback(bool enabled) noexcept {
+        early_writeback.store(enabled, std::memory_order_relaxed);
+    }
+    /// Diagnostics: the shader whose written buffers are bound next (0 for anything else).
+    static void SetWriterShader(u64 hash) noexcept;
+    [[nodiscard]] bool EarlyWriteback() const noexcept {
+        return early_writeback.load(std::memory_order_relaxed);
+    }
+    /// The batch being recorded writes hot memory (cleared by the call).
+    [[nodiscard]] bool TakeWritebackFlush() noexcept {
+        const bool wanted = writeback_flush.exchange(false, std::memory_order_acq_rel);
+        writeback_flushes.fetch_add(wanted ? 1 : 0, std::memory_order_relaxed);
+        return wanted;
+    }
+    struct PendingWriteback {
+        VAddr address;
+        u64 size;
+        u64 tick;
+    };
+    /// Hot writes whose GPU work has finished (removed from the pending list).
+    [[nodiscard]] std::vector<PendingWriteback> TakeFinishedWritebacks();
+    /// Copies a finished hot write back to guest memory (GPU command thread, draw pipe idle).
+    void WriteBack(const PendingWriteback& writeback);
+    /// Finishes the copy-backs whose second-queue copy is done (all of them, waiting, with
+    /// `wait`): the data reaches guest memory where the GPU hasn't written it again since.
+    /// Called where the draw recorder is idle, like WriteBack.
+    void PollCopyBacks(bool wait = false);
 
     /// Finds a buffer for the specified region.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
-                                                             bool is_written,
-                                                             bool is_texel_buffer = false);
+    /// IgnoreStreamBuffer: a small read-only region still comes from the buffer itself, not a
+    /// snapshot of guest memory in the stream buffer.
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(
+        VAddr device_addr, u32 size, ObtainBufferFlags flags = ObtainBufferFlags::None);
+
+    /// Vertex and index data: like ObtainBuffer(read-only), but with the threaded renderer a
+    /// clean range of 1 KiB or more is used where it is in the arena instead of being copied
+    /// into the stream buffer for every draw (static meshes keep their geometry).
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainGeometryBuffer(VAddr device_addr, u32 size);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+    /// The first `skip` bytes are not needed (levels the image leaves out): not copied. Of them
+    /// the first `trim` (<= skip) get no staging memory either. The offset returned is where
+    /// guest byte 0 would be: only bytes from `trim` on may be read there.
+    /// `protect`: page ranges to protect before reading them (protection on a helper thread):
+    /// the copies wait for the helper thread to protect them (or they are protected here).
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size,
+                                                                     u32 skip = 0, u32 trim = 0,
+                                                                     ProtectRanges protect = {});
+
+    /// Writes a GPU-produced buffer range back to emulated memory.
+    bool DownloadMemoryFromBuffer(const Buffer* arena, VAddr device_addr, u64 size);
 
     /// Return true when a region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
@@ -99,8 +204,31 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Mark region as modified from the GPU
+    void MarkRegionAsGpuModified(VAddr addr, size_t size);
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
+
+    /// VRAM made resident for guest buffers so far (it's never released).
+    [[nodiscard]] u64 ResidentBytes() const noexcept {
+        return resident_bytes.load(std::memory_order_relaxed);
+    }
+
+    /// Buffer eviction's memory slabs: allocated, and of it free for reuse (the driver counts all
+    /// of it as used). Call on the thread running the collectors.
+    struct PoolUsage {
+        u64 allocated{};
+        u64 free{};
+    };
+    [[nodiscard]] PoolUsage GetPoolUsage() const {
+        PoolUsage usage{};
+        for (const auto& [raw, slab] : resident_slabs) {
+            usage.allocated += slab.size_blocks << block_shift;
+            usage.free += (slab.size_blocks - slab.live_blocks) << block_shift;
+        }
+        return usage;
+    }
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
@@ -120,10 +248,25 @@ private:
     }
 
     const Buffer* GetArena(u64 first_block, u64 last_block);
+    /// Uploads guest ranges (BufferCopy: srcOffset = offset in the upload, dstOffset = guest
+    /// address, size) into the arena; copies on the copy threads when large.
+    /// protect_ticket: protection on a helper thread (PageManager::QueueProtection) the copies
+    /// wait for before they read guest memory; 0 when the pages are protected already.
+    void UploadRanges(const Buffer* arena,
+                      boost::container::small_vector<vk::BufferCopy, 4>& copies,
+                      size_t total_size_bytes, u64 protect_ticket = 0);
+    /// GetArena, timed for stutter reports.
+    const Buffer* TimedArena(u64 first_block, u64 last_block);
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    /// load_screen: at a loading screen, every buffer range idle for a couple of seconds goes,
+    /// whatever the VRAM use. False when it couldn't run yet (binds still pending).
+    bool GarbageCollectResidentMemory(bool load_screen = false);
+
+    /// async: the copy reaches guest memory once the GPU has run it, without waiting. False when
+    /// a synchronous download could not be written back (the GPU-modified state is kept).
+    bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -137,12 +280,16 @@ private:
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
+    PageManager& page_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+    /// Cheaper buffer refill: evicted ranges still protected (unchanged since, as far as the
+    /// memory tracker knows), uploaded from guest memory when made resident again.
+    RangeSet evicted_ranges;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
@@ -163,7 +310,161 @@ private:
             return {{a, b}, memory, offset + (a - start)};
         }
     };
-    IntervalList<Backing> resident_ranges;
+    class ResidentRangeList : public IntervalList<Backing> {
+    public:
+        void Remove(u64 start, u64 end) {
+            auto [first, last] = OverlapRun(start, end);
+            if (first == last) {
+                return;
+            }
+            Backing remaining[2];
+            size_t count = 0;
+            if (first->start < start) {
+                remaining[count++] = first->SubRange(first->start, start);
+            }
+            const auto previous = std::prev(last);
+            if (previous->end > end) {
+                remaining[count++] = previous->SubRange(end, previous->end);
+            }
+            const auto index = std::distance(intervals.begin(), first);
+            Splice(first, last, remaining, count);
+            Coalesce(index, count);
+        }
+    };
+    ResidentRangeList resident_ranges;
+    std::unordered_map<u64, u64> resident_chunk_use; ///< 2 MiB chunk -> second of last use
+    /// Buffer eviction: 2 MiB chunks evicted (-> second of the eviction), and chunks that were
+    /// made resident again after one (-> second they came back; keep returning buffers).
+    std::unordered_map<u64, u64> evicted_chunks;
+    std::unordered_map<u64, u64> returned_chunks;
+    void NoteResidentAgain(VAddr address, u64 size);
+    /// Chunks already marked used this second (MarkResidentUse skips the map write).
+    struct ChunkUseMemo {
+        u64 chunk{~0ull};
+        u64 second{};
+    };
+    std::array<ChunkUseMemo, 1024> chunk_use_memo{};
+    /// Block ranges known to be fully resident (EnsureResident skips the gap search). Valid
+    /// while resident_generation is unchanged: it changes whenever residency is taken away.
+    struct ResidentMemo {
+        u64 first_block{~0ull};
+        u64 last_block{};
+        u64 generation{};
+    };
+    std::array<ResidentMemo, 1024> resident_memo{};
+    u64 resident_generation{1};
+    /// Buffer eviction: resident memory slabs, handed out and taken back block by block.
+    struct ResidentSlab {
+        u64 size_blocks{};
+        u64 live_blocks{};
+        std::map<u64, u64> free; ///< free runs: first block -> count
+    };
+    std::unordered_map<VkDeviceMemory, ResidentSlab> resident_slabs;
+    struct ResidentBlocks {
+        vk::DeviceMemory memory;
+        u64 start;
+        u64 count;
+    };
+    void MakeResidentPooled(const Buffer* arena, const IntervalList<>& bind_ranges,
+                            u64 resident_blocks);
+    ResidentBlocks TakeResidentBlocks(u64 wanted);
+    /// Allocates resident memory; when the driver refuses, the VRAM state goes to the log.
+    vk::DeviceMemory AllocateResidentMemory(const vk::MemoryAllocateInfo& alloc_info,
+                                            const char* pool);
+    /// Returns the slab's size in blocks when nothing of it is bound any more (to be freed).
+    u64 ReturnResidentBlocks(vk::DeviceMemory memory, u64 start, u64 count);
+    void MarkResidentUse(VAddr device_addr, u64 size);
+    u64 cache_second{};
+    struct RetiredMemory {
+        vk::DeviceMemory memory;
+        u64 second;
+        u64 unbind_tick; ///< memory_semaphore tick of its last unbind
+    };
+    u64 last_unbind_tick{}; ///< memory_semaphore tick of the last unbind (buffer eviction)
+    std::chrono::steady_clock::time_point last_slow_bind_report{};
+    std::vector<RetiredMemory> retired_memory; ///< evicted, freed a few seconds later
+    bool vram_reclaim{};                       ///< VRAM cleanup setting, read at start
+    u64 cache_tick{};
+    u64 last_resident_gc_tick{};
+    u64 last_resident_diag_tick{};
+
+    /// Readback diagnostics (diagnostics setting only).
+    struct ReadbackRegion {
+        u64 count{}, bytes{}, gpu_wait_ns{}, guest_blocked_ns{};
+        std::array<u64, 4> writer{}; ///< current batch, in flight, finished, unknown
+        std::map<std::string, u64> threads;
+    };
+    std::mutex readback_mutex;
+    std::unordered_map<u64, ReadbackRegion> readback_regions; ///< by 1 MiB region
+    std::array<u64, 4> readback_writer_ns{};                  ///< GPU wait time by writer state
+    u64 readback_max_wait_ns{};
+    std::mutex gpu_write_mutex;
+    std::unordered_map<u64, u64> gpu_write_ticks; ///< 64 KiB block -> tick of the last GPU write
+    /// Diagnostics: the last GPU write of each 64 KiB block (shader, the range it was bound
+    /// over), for the log of game writes that waited for unfinished GPU work.
+    struct GpuWriter {
+        u64 shader{};
+        VAddr base{};
+        u64 size{};
+    };
+    std::unordered_map<u64, GpuWriter> gpu_writers; ///< under gpu_write_mutex
+    /// Snapshot checks (CheckSnapshotSource) since the last report.
+    std::atomic<u64> snapshot_seen{}, snapshot_checks{}, snapshot_bytes{}, snapshot_mismatches{},
+        snapshot_mismatch_bytes{}, snapshot_all_cpu_dirty{}, snapshot_not_resident{},
+        snapshot_now_buffer{}, snapshot_now_snapshot{}, snapshot_now_other{};
+    /// The same samples: did the GPU read from the stream buffer the bytes written there?
+    std::atomic<u64> stream_checks{}, stream_mismatches{}, stream_mismatch_bytes{};
+    std::atomic<u32> snapshot_logs{}, stream_logs{};
+    u32 slow_write_logs{};
+    u64 readback_queue_count{}, readback_queue_ns{}; ///< readbacks on the second queue (report)
+
+    /// Early write-back state (see SetEarlyWriteback), under writeback_mutex.
+    std::atomic<bool> early_writeback{false};
+    std::atomic<bool> writeback_flush{false};
+    std::mutex writeback_mutex;
+    std::unordered_map<u64, std::chrono::steady_clock::time_point> hot_blocks; ///< 64 KiB blocks
+    std::vector<PendingWriteback> pending_writebacks;
+    u64 writebacks_done{}, writeback_bytes{}; ///< since the last report (writeback_mutex)
+    std::atomic<u64> writeback_flushes{};
+    void MarkHot(VAddr device_addr, u64 size);
+    void NoteHotWrite(VAddr device_addr, u64 size);
+
+    /// Notes that GPU work recorded now writes [device_addr, device_addr + size).
+    void NoteGpuWrite(VAddr device_addr, u64 size);
+    /// Tick of the last recorded GPU write into the range (0: none known).
+    u64 LastGpuWriteTick(VAddr device_addr, u64 size);
+    /// Copies `copies` from the arena into the download buffer on the readback queue once the
+    /// work signalled with `tick` is done, and waits for the copy alone.
+    void ReadbackOnSecondQueue(const Buffer* arena, const Buffer* destination,
+                               std::span<const vk::BufferCopy> copies, u64 tick);
+    /// Records and submits that copy on the readback queue, signalling `fence` (under
+    /// readback_queue_mutex).
+    void SubmitReadback(vk::CommandBuffer cmdbuf, vk::Fence fence, const Buffer* arena,
+                        const Buffer* destination, std::span<const vk::BufferCopy> copies,
+                        u64 tick);
+    /// The GPU-modified ranges of [device_addr, device_addr + size) as copies from the arena
+    /// into a packed download buffer; returns the download size.
+    u64 GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
+                        boost::container::small_vector<vk::BufferCopy, 1>& copies);
+    /// Early write-back copies in flight on the readback queue (not waited for).
+    struct CopyBack;
+    void FinishCopyBack(CopyBack& copy_back);
+    static constexpr size_t CopyBackSlots = 32;
+    std::vector<std::unique_ptr<CopyBack>> copy_backs;
+    std::deque<CopyBack*> copy_backs_in_flight; ///< in submission order
+    std::vector<CopyBack*> copy_backs_free;
+    u64 copy_backs_stale{}, copy_backs_full{}; ///< since the last report (writeback_mutex)
+    vk::UniqueCommandPool readback_pool;
+    vk::UniqueCommandBuffer readback_cmdbuf;
+    vk::UniqueFence readback_fence;
+    std::mutex readback_queue_mutex;
+    std::chrono::steady_clock::time_point readback_report_time{};
+    std::atomic<u64> resident_bytes{};
+    static constexpr u64 ResidentSlabSize = 64ULL << 20;
+    static constexpr u64 EvictionSlabSize = 16ULL << 20;
+    vk::DeviceMemory resident_slab{};
+    u64 resident_slab_size{};
+    u64 resident_slab_used{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};

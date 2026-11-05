@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -13,6 +15,7 @@
 #include <fmt/xchar.h>
 #include <hwinfo/hwinfo.h>
 
+#include "common/bb_tuning.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
@@ -29,6 +32,7 @@
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
+#include "core/bb_resolution.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/debugger.h"
 #include "core/devtools/widget/module_list.h"
@@ -40,9 +44,11 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/net/net_discovery.h"
 #include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
+#include "core/libraries/usbd/usbstorage.h"
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/user_settings.h"
@@ -50,6 +56,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_bb_perf_meter.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -102,6 +109,60 @@ void ShutdownDlss() {
 } // namespace
 
 std::mutex exit_mutex{};
+// The window was closed: everything is saved by the time the quick_exit handler has run.
+static bool closing_normally = false;
+
+// Closing the window: each step is logged, and if one hangs (closing with frame generation on once
+// left the game running without input), the process is ended after a while anyway.
+static std::atomic<const char*> exit_step{"starting"};
+// When the exit (or a restart) began: each step is logged with the time since.
+static std::chrono::steady_clock::time_point exit_start{};
+static void ExitStep(const char* step) {
+    exit_step = step;
+    if (closing_normally || Core::BbResolution::restarting) {
+        if (exit_start == std::chrono::steady_clock::time_point{}) {
+            exit_start = std::chrono::steady_clock::now();
+        }
+        LOG_INFO(Loader, "Exit: {} ({} ms in)", step,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - exit_start)
+                     .count());
+    }
+}
+static void StartExitWatchdog(std::chrono::seconds limit = std::chrono::seconds{30}) {
+#ifdef _WIN32
+    static std::atomic_flag started = ATOMIC_FLAG_INIT;
+    if (started.test_and_set()) {
+        return;
+    }
+    std::thread([limit] {
+        std::this_thread::sleep_for(limit);
+        LOG_CRITICAL(Loader, "Exit stuck for {} s at: {}; ending the process", limit.count(),
+                     exit_step.load());
+        Common::Log::Flush();
+        TerminateProcess(GetCurrentProcess(), 0);
+    }).detach();
+#else
+    static std::atomic_flag started = ATOMIC_FLAG_INIT;
+    if (started.test_and_set()) {
+        return;
+    }
+    std::thread([limit] {
+        std::this_thread::sleep_for(limit);
+        LOG_CRITICAL(Loader, "Exit stuck for {} s at: {}; ending the process", limit.count(),
+                     exit_step.load());
+        Common::Log::Flush();
+        _exit(0);
+    }).detach();
+#endif
+}
+
+#ifdef BB_PGO_GENERATE
+// PGO training build: the profile runtime writes its counters at exit, but the emulator ends
+// with quick_exit (no atexit), so they are written from the quick_exit handler.
+extern "C" int __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_set_filename(const char*);
+#endif
 
 Emulator::Emulator() {
     // Initialize NT API functions, set high priority and disable WER
@@ -114,9 +175,43 @@ Emulator::Emulator() {
     WSADATA wsaData;
     WSAStartup(versionWanted, &wsaData);
 #endif
+#ifdef BB_PGO_GENERATE
+    {
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "pgo";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        static const std::string profile_file = (dir / "shadps4-%p.profraw").string();
+        __llvm_profile_set_filename(profile_file.c_str());
+    }
+#endif
     std::at_quick_exit([]() {
-        ShutdownDlss();
+#ifdef BB_PGO_GENERATE
+        __llvm_profile_write_file();
+#endif
+        const bool restarting = Core::BbResolution::restarting;
+        if (restarting) {
+            // A restart: the new process waits for this one to end, so a step that hangs here
+            // (the game's threads still run) kept the game from coming back at all.
+            StartExitWatchdog(std::chrono::seconds{15});
+            ExitStep("saving before the restart");
+        }
+        // A restart ends the process below without the DLLs' own shutdown, so NGX needs no
+        // release first (it waits for the GPU thread, which once took 12 s and stuttered sound).
+        if (!restarting) {
+            ExitStep("releasing DLSS (again)");
+            ShutdownDlss();
+        }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+#ifdef _WIN32
+        // A restart from F1 or closing the window: end at once. Otherwise the process spends
+        // seconds in every loaded DLL's shutdown (driver, NGX, Streamline), and frame generation's
+        // DLL crashed in its own, being unloaded without Streamline shut down.
+        if (restarting || closing_normally) {
+            ExitStep("ending the process");
+            Common::Log::Flush();
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+#endif
     });
 }
 
@@ -124,18 +219,33 @@ Emulator::~Emulator() {}
 
 void Emulator::Shutdown() {
     static bool exit_done = false;
+    static thread_local bool in_shutdown = false;
+    if (in_shutdown) {
+        return;
+    }
+    in_shutdown = true;
     std::scoped_lock l{exit_mutex};
     if (exit_done) {
         return;
     }
+    // The performance meter's last summary (what it gathered since its last one).
+    Vulkan::PerfMeter::Flush();
     Common::Log::Flush();
+    ExitStep("stopping the save backup thread");
     Libraries::SaveData::Backup::StopThread();
+    ExitStep("writing the pipeline cache");
     Storage::DataBase::Instance().Close();
+    ExitStep("stopping the play time thread");
     play_time_thread.request_stop();
     if (play_time_thread.joinable()) {
         play_time_thread.join();
     }
-    UpdatePlayTime(Common::Singleton<Common::ElfInfo>::Instance()->GameSerial());
+    ExitStep("saving the play time");
+    const auto* elf_info = Common::Singleton<Common::ElfInfo>::Instance();
+    if (elf_info->initialized) {
+        UpdatePlayTime(elf_info->GameSerial());
+    }
+    ExitStep("resetting controller lights");
     if (controllers) {
         controllers->ResetLightbarColors();
         // need to give SDL time to do this before the runtime exits
@@ -535,6 +645,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU userfaultfdTracking: {}", EmulatorSettings.IsUserfaultfdTracking());
 #endif
     LOG_INFO(Config, "GPU inlineFetchShader: {}", EmulatorSettings.IsInlineFetchShader());
+    LOG_INFO(Config, "GPU fastShaderMath: {}", EmulatorSettings.IsFastShaderMath());
     LOG_INFO(Config, "Vulkan gpuId: {}", EmulatorSettings.GetGpuId());
     LOG_INFO(Config, "Vulkan vkValidation: {}", EmulatorSettings.IsVkValidationEnabled());
     LOG_INFO(Config, "Vulkan vkValidationCore: {}", EmulatorSettings.IsVkValidationCoreEnabled());
@@ -545,6 +656,28 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "Vulkan guestMarkers: {}", EmulatorSettings.IsVkGuestMarkersEnabled());
     LOG_INFO(Config, "Vulkan rdocEnable: {}", EmulatorSettings.IsRenderdocEnabled());
     LOG_INFO(Config, "Vulkan PipelineCacheEnabled: {}", EmulatorSettings.IsPipelineCacheEnabled());
+    // Bloodborne experimental settings: which of the added code paths this session runs.
+    LOG_INFO(Config,
+             "Bloodborne threadedRenderer: {} streaming: {} readbackQueue: {} mergedCopies: {} "
+             "fastLocks: {} flipWhenReady: {} geometryInPlace: {} backgroundCopies: {} "
+             "skipEmptyDraws: {} backgroundShaderCompiles: {} textureSetMemo: {} "
+             "ringGeometry: {} submitOverlap: {} mergedNoStreamSources: {} "
+             "mergedLargeBatches: {} occlusionInOrder: {} constantsNoWait: {}",
+             EmulatorSettings.IsThreadedRenderer(), EmulatorSettings.IsBbStreaming(),
+             EmulatorSettings.IsBbReadbackQueue(), EmulatorSettings.IsBbMergedCopies(),
+             EmulatorSettings.IsBbFastLocks(), EmulatorSettings.IsBbFlipWhenReady(),
+             EmulatorSettings.IsBbGeometryInPlace(), EmulatorSettings.IsBbBackgroundTextureCopies(),
+             EmulatorSettings.IsBbSkipEmptyDraws(), EmulatorSettings.IsBbBackgroundPipelines(),
+             EmulatorSettings.IsBbTextureSetMemo(), EmulatorSettings.IsBbRingGeometry(),
+             EmulatorSettings.IsBbSubmitOverlap(), EmulatorSettings.IsBbMergedNoStreamSources(),
+             EmulatorSettings.IsBbMergedLargeBatches(), EmulatorSettings.IsBbOcclusionInOrder(),
+             EmulatorSettings.IsBbConstantsNoWait());
+    LOG_INFO(Config,
+             "Bloodborne anisotropy: {} resizableBar: {} exactProtection: {} batchedUploads: {} "
+             "vramCleanup: {} bufferEviction: {}",
+             EmulatorSettings.GetBbAnisotropy(), EmulatorSettings.GetBbDrawDataMemory(),
+             EmulatorSettings.IsBbExactProtection(), EmulatorSettings.IsBbBatchedUploads(),
+             EmulatorSettings.IsBbVramReclaim(), EmulatorSettings.IsBbBufferEviction());
     LOG_INFO(Config, "Vulkan PipelineCacheArchived: {}",
              EmulatorSettings.IsPipelineCacheArchived());
 
@@ -579,10 +712,43 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         args.insert(args.begin(), guest_eboot_path);
     }
 
+    // Faster Windows locks and sleeps (threaded renderer toggle): decided before the game's
+    // threads start, as a lock can't change implementation while in use.
+    // Windows only: the locks and sleeps it replaces are Windows' own.
+#ifdef _WIN32
+    Common::BbTuning::fast_locks.store(Common::BbTuning::IsBloodborne(id) &&
+                                       EmulatorSettings.IsThreadedRenderer() &&
+                                       EmulatorSettings.IsBbFastLocks());
+#else
+    Common::BbTuning::fast_locks.store(false);
+#endif
+    LOG_INFO(Loader, "Faster Windows locks and sleeps: {}",
+             Common::BbTuning::FastLocks() ? "on" : "off");
+
     const auto mods_folder = FileSys::OverlayPath(game_folder, "-mods");
 
+    Common::BbTuning::mods_bytes.store(0);
+    Common::BbTuning::bigger_map_textures.store(0);
     if (std::filesystem::exists(mods_folder) && !std::filesystem::is_empty(mods_folder)) {
-        LOG_INFO(Loader, "Files found in game mods folder");
+        // Its size: texture mods (BB PC Remaster and the like) need a bigger graphics heap,
+        // whichever version they are (BbResolution::Install).
+        u64 bytes = 0;
+        u64 files = 0;
+        std::error_code error;
+        for (auto it = std::filesystem::recursive_directory_iterator(
+                 mods_folder, std::filesystem::directory_options::skip_permission_denied, error);
+             !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+            std::error_code file_error;
+            if (it->is_regular_file(file_error)) {
+                const auto size = it->file_size(file_error);
+                if (!file_error) {
+                    bytes += size;
+                    ++files;
+                }
+            }
+        }
+        Common::BbTuning::mods_bytes.store(bytes);
+        LOG_INFO(Loader, "Files found in game mods folder ({} files, {} MiB)", files, bytes >> 20);
     }
 
 #ifdef _WIN32
@@ -668,12 +834,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Mounting temp folders
     const auto& mount_temp_dir = Common::FS::GetUserPath(Common::FS::PathType::TempDataDir) / id;
-    if (std::filesystem::exists(mount_temp_dir)) {
-        // Temp folder should be cleared on each boot.
-        std::filesystem::remove_all(mount_temp_dir);
-    }
     std::filesystem::create_directory(mount_temp_dir);
-    mnt->Mount(mount_temp_dir, "/temp0");
     mnt->Mount(mount_temp_dir, "/temp");
 
     const auto& mount_download_dir =
@@ -682,6 +843,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         std::filesystem::create_directory(mount_download_dir);
     }
     mnt->Mount(mount_download_dir, "/download0");
+
+    const auto mount_usb_dir = Libraries::UsbStorage::GetUsbMountPath();
+    std::error_code ec_usb;
+    std::filesystem::create_directories(mount_usb_dir, ec_usb);
+    mnt->Mount(mount_usb_dir, "/mnt/usb0");
 
     const auto& mount_captures_dir = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
     if (!std::filesystem::exists(mount_captures_dir)) {
@@ -735,6 +901,44 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     FileSys::BbHdrCompat::Initialize(IsBloodborne(id) && app_version == "01.09" &&
                                          EmulatorSettings.IsHdrAllowed(),
                                      Vulkan::BbDlssSettingsPath());
+    // The graphics heap is raised for the remaster's bigger assets (BbResolution::Install).
+    if (IsBloodborne(id) && app_version == "01.09") {
+        FileSys::BbHdrCompat::ProbeRemaster(
+            mnt->Open("/app0/dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx", false),
+            "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx");
+        // Texture packs replace the map textures with bigger ones, also when merged into the
+        // game folder (any version): a few of the biggest, at least a quarter bigger than the
+        // game's own 1.09 files.
+        struct MapTexture {
+            std::string_view path;
+            u64 size;
+        };
+        static constexpr MapTexture MapTextures[] = {
+            {"/app0/dvdroot_ps4/map/m24/m24_0000.tpfbdt", 184005548},
+            {"/app0/dvdroot_ps4/map/m24/m24_0001.tpfbdt", 191139900},
+            {"/app0/dvdroot_ps4/map/m34/m34_0000.tpfbdt", 127588925},
+            {"/app0/dvdroot_ps4/map/m23/m23_0000.tpfbdt", 132185799},
+            {"/app0/dvdroot_ps4/map/m36/m36_0003.tpfbdt", 64461105},
+            {"/app0/dvdroot_ps4/map/m25/m25_0001.tpfbdt", 52182314},
+        };
+        u32 bigger = 0;
+        for (const auto& texture : MapTextures) {
+            const auto file = mnt->Open(texture.path, false);
+            if (file && file->IsOpen() && file->Size() >= texture.size + texture.size / 4)
+                ++bigger;
+        }
+        Common::BbTuning::bigger_map_textures.store(bigger);
+        if (bigger >= 2)
+            LOG_INFO(Loader,
+                     "BB PC Remaster mod detected (or another texture pack): {} of {} map "
+                     "textures bigger than the game's own",
+                     bigger, std::size(MapTextures));
+        else
+            LOG_INFO(Loader,
+                     "No texture pack found ({} of {} map textures bigger than the "
+                     "game's own)",
+                     bigger, std::size(MapTextures));
+    }
     if (FileSys::BbHdrCompat::IsCandidate(
             "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx")) {
         // Recognize the remaster before executable patches can disable RenoDX's shader passes.
@@ -758,6 +962,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 #endif
 
+    if (EmulatorSettings.IsConnectedToNetwork() && EmulatorSettings.IsDeviceDiscoveryEnabled()) {
+        Libraries::Net::DiscoveryResponder::Instance().Start();
+    }
+
     if (!id.empty()) {
         start_time = std::chrono::steady_clock::now();
 
@@ -775,12 +983,16 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         window->WaitEvent();
     }
 
+    closing_normally = true;
+    StartExitWatchdog();
+    ExitStep("releasing DLSS");
     ShutdownDlss();
+    ExitStep("running the exit handler");
     std::quick_exit(0);
 }
 
-void Emulator::Restart(std::filesystem::path eboot_path,
-                       const std::vector<std::string>& guest_args) {
+void Emulator::Restart(std::filesystem::path eboot_path, const std::vector<std::string>& guest_args,
+                       bool standalone) {
     std::vector<std::string> args;
 
     auto& game_info = Common::ElfInfo::Instance();
@@ -838,20 +1050,35 @@ void Emulator::Restart(std::filesystem::path eboot_path,
         }
     }
 
-    Relaunch(std::move(args));
+    Relaunch(std::move(args), standalone);
 }
 
-[[noreturn]] void Emulator::Relaunch(std::vector<std::string> args) {
+[[noreturn]] void Emulator::Relaunch(std::vector<std::string> args, bool standalone) {
     const auto guest_args = std::find(args.begin(), args.end(), "--");
     args.insert(guest_args, {"--wait-for-pid", std::to_string(Debugger::GetCurrentPid())});
 
     LOG_INFO(Common, "Relaunching the emulator with args: {}", fmt::join(args, " "));
     Libraries::Np::NpHandler::GetInstance().Shutdown();
-    Common::Log::Shutdown();
+    if (Core::BbResolution::restarting) {
+        // F1 / F3 restart: the new process waits for this one to end before it opens the log
+        // (--wait-for-pid), so the exit steps after this still reach it.
+        ExitStep("starting the new process");
+        Common::Log::Flush();
+    } else {
+        Common::Log::Shutdown();
+    }
 
     auto& ipc = IPC::Instance();
 
-    if (ipc.IsEnabled()) {
+    if (ipc.IsEnabled() && standalone) {
+        // The new process starts without the launcher: it loads the patch folder itself, as
+        // the launcher would have sent it.
+#ifdef _WIN32
+        SetEnvironmentVariableW(L"SHADPS4_ENABLE_IPC", nullptr);
+#else
+        unsetenv("SHADPS4_ENABLE_IPC");
+#endif
+    } else if (ipc.IsEnabled()) {
         ipc.SendRestart(args);
         while (true) {
             std::this_thread::sleep_for(std::chrono::minutes(1));

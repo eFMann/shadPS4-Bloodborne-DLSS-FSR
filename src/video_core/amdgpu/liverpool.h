@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <coroutine>
+#include <deque>
 #include <exception>
 #include <mutex>
 #include <semaphore>
@@ -18,6 +21,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/regs.h"
 
 namespace Vulkan {
@@ -29,6 +33,43 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+/// Diagnostics: the graphics packet the GPU command thread is running (its opcode; ~0 between
+/// packets).
+inline thread_local u32 current_packet_opcode = ~0u;
+
+struct PM4CmdWaitRegMem;
+
+/// Threaded renderer: which 32-word blocks of the register file were written since the draw
+/// recording thread's copy was last updated (see vk_draw_pipe.h).
+struct RegDirty {
+    static constexpr u32 BlockWords = 32;
+    static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
+    static_assert(Regs::NumRegs % BlockWords == 0);
+
+    std::array<u64, (NumBlocks + 63) / 64> bits{};
+    /// The whole file was reset to its defaults (ClearState) before the marked writes.
+    bool reset{};
+
+    void Mark(u32 word, u32 count) noexcept {
+        if (count == 0) {
+            return;
+        }
+        const u32 first = word / BlockWords;
+        const u32 last = std::min((word + count - 1) / BlockWords, NumBlocks - 1);
+        for (u32 block = first; block <= last; ++block) {
+            bits[block / 64] |= 1ULL << (block % 64);
+        }
+    }
+    void Reset() noexcept {
+        bits = {};
+        reset = true;
+    }
+    void Clear() noexcept {
+        bits = {};
+        reset = false;
+    }
+};
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -63,6 +104,20 @@ struct Liverpool {
     u32 index_buffer_num_indices{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    RegDirty pipe_dirty{};
+
+    /// Marks a register field written outside the Set*Reg packets.
+    template <typename T>
+    void MarkRegWritten(const T& field) noexcept {
+        const auto word =
+            static_cast<u32>(reinterpret_cast<const u32*>(&field) - regs.reg_array.data());
+        pipe_dirty.Mark(word, static_cast<u32>((sizeof(T) + 3) / 4));
+    }
+
+    /// The submission queue the GPU command thread is processing (graphics or compute).
+    [[nodiscard]] s32 CurrentQueue() const noexcept {
+        return curr_qid;
+    }
 
 public:
     explicit Liverpool();
@@ -79,13 +134,30 @@ public:
         submit_cv.notify_one();
     }
 
-    void WaitGpuIdle() noexcept {
-        std::unique_lock lk{submit_mutex};
-        submit_cv.wait(lk, [this] { return num_submits == 0; });
+    /// Overlapped frames: the game's frame `frame` ended after everything submitted so far, on
+    /// every queue. Reported to `on_frame_retired` once that work is decoded and recorded (what
+    /// GPU idle reported before), whatever is submitted after it.
+    void SubmitDone(u64 frame) noexcept {
+        std::scoped_lock lk{submit_mutex};
+        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
+        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
+        frame_ends.emplace_back(submissions_total, frame);
+        submit_cv.notify_one();
     }
 
+    void SetFrameRetiredCallback(void (*callback)(u64 frame)) noexcept {
+        on_frame_retired = callback;
+    }
+
+    void WaitGpuIdle() noexcept {
+        std::unique_lock lk{submit_mutex};
+        submit_cv.wait(lk, [this] { return num_submits == 0 && work_retired; });
+    }
+
+    /// Also the draw recorder has finished (work_retired): sceGnmSubmitDone does not block the
+    /// guest when this is true.
     bool IsGpuIdle() const {
-        return num_submits == 0;
+        return num_submits == 0 && work_retired;
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
@@ -186,13 +258,21 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessCeUpdate(std::span<const u32> ccb);
+    /// A submission's own copy of a command buffer, kept by the task that reads it.
+    struct CmdCopy {
+        std::vector<u32> words;
+        const u32* guest; ///< where it was copied from (null: no copy)
+    };
+    Task ProcessGraphics(std::span<const u32> dcb, CmdCopy copy = {});
+    Task ProcessCeUpdate(std::span<const u32> ccb, CmdCopy copy = {});
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    void ProcessCeQueue();
     void Process(std::stop_token stoken);
+    void RetireFrames();
+    void HandleGetLodStats(const PM4CmdGetLodStats* get_lod);
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -201,28 +281,45 @@ private:
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        std::queue<u64> submit_seqs{}; ///< each submission's number (overlapped frames)
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
-    u32 num_mapped_queues{1u}; // GFX is always available
+    std::queue<Task::Handle> ce_submits; ///< guarded by the graphics queue's m_access
+    std::queue<u64> ce_submit_seqs;      ///< each one's submission number (overlapped frames)
+    /// Raised by SubmitAsc (under submit_mutex), read by the command thread without it.
+    std::atomic<u32> num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
+
+    /// Threaded renderer: memory writes (fence labels, WriteData) handed to the draw recording
+    /// thread and not yet run. A WaitRegMem that one of them satisfies counts as met: that
+    /// thread runs everything in stream order anyway (after bbport).
+    struct PendingFence {
+        u64 packet;
+        VAddr address;
+        u32 value;
+    };
+    std::deque<PendingFence> pending_fences;
+    void NotePendingFence(u64 packet, VAddr address, u32 value);
+    bool MetByPendingFence(const PM4CmdWaitRegMem& wait);
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+    // Real occlusion tests: the last size hint each recent depth buffer was set up with.
+    struct DbHint {
+        u64 address;
+        CbDbExtent extent;
+    };
+    std::array<DbHint, 8> db_hints{};
+    u32 db_hint_next{};
+    u32 vgt_strmout_buffer_filled_size[4]{};
 
     struct ConstantEngine {
-        void Reset() {
-            ce_count = 0;
-            de_count = 0;
-            ce_compare_count = 0;
-        }
-
         [[nodiscard]] u32 Diff() const {
             ASSERT_MSG(ce_count >= de_count, "DE counter is ahead of CE");
             return ce_count - de_count;
         }
 
-        u32 ce_compare_count{};
         u32 ce_count{};
         u32 de_count{};
         static std::array<u8, 48_KB> constants_heap;
@@ -233,8 +330,16 @@ private:
     const bool guest_markers_enabled;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
+    /// Every decoded submission's queued draws and fences are done (set after the drain that
+    /// precedes GPU idle, cleared by a new submission). Under submit_mutex with num_submits.
+    std::atomic<bool> work_retired{true};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
+    /// Overlapped frames: submissions made so far, and the game's frame ends (the last
+    /// submission's number at each, its frame number). Under submit_mutex.
+    u64 submissions_total{};
+    std::deque<std::pair<u64, u64>> frame_ends;
+    void (*on_frame_retired)(u64 frame){};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};

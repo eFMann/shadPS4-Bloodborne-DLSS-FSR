@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <boost/container/small_vector.hpp>
+#include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -120,8 +123,12 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyBuffer(src->Handle(), dst->Handle(), copies);
+    // In order through the recording thread (uploads run a few thousand times a second; a
+    // direct command buffer here made the draw recorder wait for the recording thread).
+    scheduler.Record(
+        [src_handle = src->Handle(), dst_handle = dst->Handle(),
+         regions = boost::container::small_vector<vk::BufferCopy, 4>(copies.begin(), copies.end())](
+            vk::CommandBuffer cmdbuf) { cmdbuf.copyBuffer(src_handle, dst_handle, regions); });
 
     for (const auto& copy : copies) {
         AccessBuffer(src, copy.srcOffset, copy.size, vk::PipelineStageFlagBits2::eCopy,
@@ -138,8 +145,11 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.fillBuffer(dst->Handle(), offset, size, value);
+    // Through the recording thread: a direct command buffer made the draw recorder wait for it.
+    scheduler.RecordUncaptured(
+        [handle = dst->Handle(), offset, size, value](vk::CommandBuffer cmdbuf) {
+            cmdbuf.fillBuffer(handle, offset, size, value);
+        });
 
     AccessBuffer(dst, offset, size, vk::PipelineStageFlagBits2::eClear,
                  vk::AccessFlagBits2::eTransferWrite);
@@ -152,8 +162,9 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.updateBuffer(dst->Handle(), offset, sizeof(value), &value);
+    scheduler.RecordUncaptured([handle = dst->Handle(), offset, value](vk::CommandBuffer cmdbuf) {
+        cmdbuf.updateBuffer(handle, offset, sizeof(value), &value);
+    });
 
     AccessBuffer(dst, offset, sizeof(value), vk::PipelineStageFlagBits2::eCopy,
                  vk::AccessFlagBits2::eTransferWrite);
@@ -162,9 +173,23 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
+    BB_STAGE_CENSUS("Runtime::Transit (image layouts)", Caches);
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
     return image_barriers.size() != prev_num_barriers;
+}
+
+void Runtime::RecordUploadCopies(VideoCore::Image* dst, const VideoCore::Buffer* src,
+                                 std::span<const vk::BufferImageCopy> upload_copies) {
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.copyBufferToImage(src->Handle(), dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,
+                             upload_copies);
+    for (const auto& copy : upload_copies) {
+        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+        AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                     vk::AccessFlagBits2::eTransferRead);
+    }
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
@@ -212,9 +237,14 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->Handle(),
-                             download_copies);
+    // Through the recording thread (a few a frame): a direct command buffer made the draw
+    // recorder wait for it.
+    scheduler.RecordUncaptured(
+        [image = src->GetImage(), buffer = dst->Handle(),
+         copies = boost::container::small_vector<vk::BufferImageCopy, 4>(
+             download_copies.begin(), download_copies.end())](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer, copies);
+        });
 
     for (const auto& copy : download_copies) {
         const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
@@ -259,6 +289,11 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const bool is_same_type = !is_2d_to_3d && !is_3d_to_2d;
 
     for (u32 mip = 0; mip < num_mips; ++mip) {
+        // Levels left out by texture quality on either side are not copied (the destination
+        // keeps what its upload gave it).
+        if (mip < src->dropped_levels || mip < dst->dropped_levels) {
+            continue;
+        }
         const u32 mip_w = std::max(base_width >> mip, 1u);
         const u32 mip_h = std::max(base_height >> mip, 1u);
         const u32 mip_d = std::max(base_depth >> mip, 1u);
@@ -267,10 +302,10 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
         vk::ImageCopy region{};
         region.srcSubresource.aspectMask = src_aspect;
-        region.srcSubresource.mipLevel = mip;
+        region.srcSubresource.mipLevel = mip - src->dropped_levels;
         region.srcSubresource.baseArrayLayer = 0;
         region.dstSubresource.aspectMask = dst_aspect;
-        region.dstSubresource.mipLevel = mip;
+        region.dstSubresource.mipLevel = mip - dst->dropped_levels;
         region.dstSubresource.baseArrayLayer = 0;
 
         if (is_same_type) {
@@ -301,6 +336,9 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
         regions.push_back(region);
     }
+    if (regions.empty()) {
+        return;
+    }
 
     scheduler.EndRendering();
 
@@ -313,9 +351,12 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
-                     vk::ImageLayout::eTransferDstOptimal, regions);
+    // Through the recording thread: a direct command buffer made the draw recorder wait for it.
+    scheduler.RecordUncaptured([src_image = src->GetImage(), dst_image = dst->GetImage(),
+                                regions = std::move(regions)](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
+                         vk::ImageLayout::eTransferDstOptimal, regions);
+    });
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -323,14 +364,17 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
-    const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+    // Every level (upstream shadPS4 b3d46e96), one after another in the buffer. With texture
+    // quality leaving out a largest level, only the first level, as before.
+    const u32 num_mips = src->dropped_levels != 0 || dst->dropped_levels != 0
+                             ? 1u
+                             : std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(num_mips == 1);
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
 
-    vk::BufferImageCopy buffer_copy = {
+    const vk::BufferImageCopy buffer_copy = {
         .bufferOffset = offset,
         .bufferRowLength = 0,
         .bufferImageHeight = 0,
@@ -343,7 +387,19 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         .imageOffset = {0, 0, 0},
         .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
     };
-    const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
+    u64 copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
+    boost::container::small_vector<vk::BufferImageCopy, 8> download_copies{buffer_copy};
+    for (u32 mip = 1; mip < num_mips; ++mip) {
+        auto mip_copy = buffer_copy;
+        mip_copy.bufferOffset = Common::AlignUp(offset + copy_size, 16);
+        mip_copy.imageSubresource.mipLevel = mip;
+        mip_copy.imageExtent = vk::Extent3D{std::max(src->info.size.width >> mip, 1u),
+                                            std::max(src->info.size.height >> mip, 1u),
+                                            std::max(src->info.size.depth >> mip, 1u)};
+        copy_size =
+            mip_copy.bufferOffset - offset + BufferImageCopySize(mip_copy, src->info.pixel_format);
+        download_copies.push_back(mip_copy);
+    }
 
     scheduler.EndRendering();
 
@@ -357,31 +413,43 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         FlushBarriers();
     }
 
-    auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
-                             buffer->Handle(), buffer_copy);
-
-    const vk::MemoryBarrier2 post_copy_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .memoryBarrierCount = 1u,
-        .pMemoryBarriers = &post_copy_barrier,
-    });
-
-    buffer_copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
-    cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
-                             vk::ImageLayout::eTransferDstOptimal, buffer_copy);
+    auto upload_copies = download_copies;
+    for (auto& copy : upload_copies) {
+        copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+    }
+    // Through the recording thread (a few a frame): a direct command buffer made the draw
+    // recorder wait for it.
+    scheduler.RecordUncaptured(
+        [src_image = src->GetImage(), dst_image = dst->GetImage(), handle = buffer->Handle(),
+         download_copies = std::move(download_copies),
+         upload_copies = std::move(upload_copies)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImageToBuffer(src_image, vk::ImageLayout::eTransferSrcOptimal, handle,
+                                     download_copies);
+            const vk::MemoryBarrier2 post_copy_barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .memoryBarrierCount = 1u,
+                .pMemoryBarriers = &post_copy_barrier,
+            });
+            cmdbuf.copyBufferToImage(handle, dst_image, vk::ImageLayout::eTransferDstOptimal,
+                                     upload_copies);
+        });
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    // Texture quality: a level the destination left out, or a source without its own level 0,
+    // is not copied (the destination's upload gives it the guest's contents).
+    if (src->dropped_levels != 0 || mip < dst->dropped_levels) {
+        return;
+    }
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
@@ -404,7 +472,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
         },
         .dstSubresource{
             .aspectMask = src->aspect_mask,
-            .mipLevel = mip,
+            .mipLevel = mip - dst->dropped_levels,
             .baseArrayLayer = slice,
             .layerCount = dst_layers,
         },
@@ -586,16 +654,20 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         FlushBarriers();
     }
 
+    const auto host_range = dst->HostRange(range);
     const vk::ImageSubresourceRange vk_range = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .baseMipLevel = range.base.level,
-        .levelCount = range.extent.levels,
-        .baseArrayLayer = range.base.layer,
-        .layerCount = range.extent.layers,
+        .baseMipLevel = host_range.base.level,
+        .levelCount = host_range.extent.levels,
+        .baseArrayLayer = host_range.base.layer,
+        .layerCount = host_range.extent.layers,
     };
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
-                           vk_range);
+    // Through the recording thread (a few thousand clears a second): a direct command buffer
+    // made the draw recorder wait for it.
+    scheduler.RecordUncaptured(
+        [image = dst->GetImage(), color = clear_value.color, vk_range](vk::CommandBuffer cmdbuf) {
+            cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
+        });
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -613,6 +685,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     auto it = std::ranges::find(backing_images, num_samples,
                                 &VideoCore::Image::BackingImage::num_samples);
     if (it == backing_images.end()) {
+        const auto previous_size = Common::AlignUp(image->SizeBytes(), 1024);
         auto new_image_ci = backing->image.image_ci;
         new_image_ci.samples = LiverpoolToVK::NumSamples(num_samples, image->supported_samples);
 
@@ -620,6 +693,10 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->num_samples = num_samples;
         new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
         new_backing->image.Create(new_image_ci);
+        // Read once: UnregisterImage clears it.
+        if (auto* counter = image->memory_usage_counter) {
+            *counter += Common::AlignUp(image->SizeBytes(), 1024) - previous_size;
+        }
 
         Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
                               "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",
@@ -680,6 +757,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
+    BB_STAGE_CENSUS("Runtime::IsBufferAccessed", Caches);
     MakeCurrent(handle);
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
@@ -690,6 +768,7 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    BB_STAGE_CENSUS("Runtime::AccessBuffer (buffer tracking)", Caches);
     MakeCurrent(handle);
 
     const Interval range = {
@@ -720,7 +799,43 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
 
+void Runtime::TakeBarriers(TakenBarriers& taken) {
+    taken.has_memory = static_cast<bool>(memory_barrier.srcStageMask);
+    taken.memory = memory_barrier;
+    taken.images = image_barriers;
+    memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
+    memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+    image_barriers.clear();
+    for (auto& tracked : resources) {
+        tracked.read_ranges.Clear();
+        tracked.write_ranges.Clear();
+    }
+    resources.clear();
+    resource = nullptr;
+}
+
+void Runtime::RecordBarriers(const TakenBarriers& barriers) {
+    BB_STAGE_CENSUS("Runtime::RecordBarriers", Commands);
+    if (barriers.Empty()) {
+        return;
+    }
+    scheduler.EndRendering();
+    scheduler.Record(
+        [memory = barriers.memory, has_memory = barriers.has_memory,
+         images = boost::container::small_vector<vk::ImageMemoryBarrier2, 8>(
+             barriers.images.begin(), barriers.images.end())](vk::CommandBuffer cmdbuf) {
+            const vk::DependencyInfo dep{
+                .memoryBarrierCount = has_memory ? 1U : 0U,
+                .pMemoryBarriers = has_memory ? &memory : nullptr,
+                .imageMemoryBarrierCount = static_cast<u32>(images.size()),
+                .pImageMemoryBarriers = images.empty() ? nullptr : images.data(),
+            };
+            cmdbuf.pipelineBarrier2(dep);
+        });
+}
+
 void Runtime::FlushBarriers() {
+    BB_STAGE_CENSUS("Runtime::FlushBarriers", Commands);
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {
@@ -737,8 +852,18 @@ void Runtime::FlushBarriers() {
     }
 
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.pipelineBarrier2(dep_info);
+    scheduler.Record([memory_barrier = memory_barrier,
+                      has_memory = dep_info.memoryBarrierCount != 0,
+                      barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 8>(
+                          image_barriers.begin(), image_barriers.end())](vk::CommandBuffer cmdbuf) {
+        const vk::DependencyInfo dep{
+            .memoryBarrierCount = has_memory ? 1U : 0U,
+            .pMemoryBarriers = has_memory ? &memory_barrier : nullptr,
+            .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+            .pImageMemoryBarriers = barriers.empty() ? nullptr : barriers.data(),
+        };
+        cmdbuf.pipelineBarrier2(dep);
+    });
 
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;

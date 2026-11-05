@@ -49,8 +49,14 @@ public:
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                    const VideoCore::Buffer* out_buffer, u64 out_offset);
 
+    /// `flush_barriers` false: the caller has flushed the barriers its inputs need (batched
+    /// uploads record several detiles after one barrier), and the output gets memory no other
+    /// detile of the batch uses. `trim`: the bytes in front not needed (whole levels, a multiple
+    /// of 64 texels and of 256 bytes) are not detiled and get no output memory; offsets (in and
+    /// out) are where guest byte 0 would be.
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
-                                              const ImageInfo& info);
+                                              const ImageInfo& info, bool flush_barriers = true,
+                                              u32 trim = 0);
 
 private:
     vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);

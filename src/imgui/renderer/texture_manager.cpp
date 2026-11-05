@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <deque>
 #include <utility>
 
@@ -108,8 +109,19 @@ struct Job {
 struct UploadJob {
     Inner* core = nullptr;
     Vulkan::UploadTextureData data;
-    int tick = 0; // Used to skip the first frame when destroying to await the current frame to draw
+    // A texture to destroy: not before this ImGui frame (see FrameRendered). It was counted in
+    // queue submissions before, and the GPU threads submit several times a frame, so in game a
+    // released texture (the settings window's game icons, closed on Save) was destroyed while
+    // the ImGui frame drawing it had not been submitted yet: the GPU read a freed image (device
+    // lost on saving in F3, in game only: the menus outside it draw icons without Vulkan).
+    u64 destroy_frame = 0;
 };
+
+// ImGui frames rendered (ImGui::Core::Render, once a presented frame).
+static std::atomic<u64> g_frames_rendered{0};
+// Frames a released texture stays: the frames in flight, frame generation's repeats of the
+// last ImGui frame and the queue of frames waiting to be presented, with room to spare.
+static constexpr u64 DestroyDelayFrames = 8;
 
 static bool g_is_worker_running = false;
 static std::jthread g_worker_thread;
@@ -128,7 +140,7 @@ Inner::~Inner() {
         std::unique_lock lk{g_upload_mtx};
         g_upload_list.emplace_back(UploadJob{
             .data = this->upload_data,
-            .tick = 2,
+            .destroy_frame = g_frames_rendered.load(std::memory_order_relaxed) + DestroyDelayFrames,
         });
     }
 }
@@ -223,6 +235,10 @@ void DecodePngFile(std::filesystem::path path, Inner* core) {
     g_worker_cv.notify_one();
 }
 
+void FrameRendered() {
+    g_frames_rendered.fetch_add(1, std::memory_order_relaxed);
+}
+
 void Submit() {
     UploadJob upload;
     {
@@ -233,8 +249,8 @@ void Submit() {
         // Upload one texture at a time to avoid slow down
         upload = g_upload_list.front();
         g_upload_list.pop_front();
-        if (upload.tick > 0) {
-            --upload.tick;
+        if (upload.core == nullptr &&
+            g_frames_rendered.load(std::memory_order_relaxed) < upload.destroy_frame) {
             g_upload_list.emplace_back(upload);
             return;
         }

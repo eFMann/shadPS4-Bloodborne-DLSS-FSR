@@ -162,6 +162,30 @@ public:
         }
     }
 
+    /// After a guest write fault: unprotects the other write-protected pages in
+    /// [offset, offset + size) that hold no GPU-modified data, so the game's next writes there
+    /// don't fault one 4 KiB page at a time. Those pages count as CPU modified (uploaded on
+    /// their next use). From bbport.
+    void ExtendWriteFault(u64 offset, u64 size) {
+        const auto bounds = GetBounds(offset, size);
+        RegionBits write_prot;
+        RegionBits read_prot;
+        Bounds watcher_bounds = MIN_BOUNDS;
+        bool update_watchers{};
+        std::scoped_lock lk{mutex};
+        IterateWords(bounds, [&](u64 index, u64 mask) {
+            update_watchers |= UpdateProtection<StateOp::Set, StateOp::None>(
+                write_prot, read_prot, watcher_bounds, index, mask & ~gpu[index]);
+        });
+        if (update_watchers) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
+                                                 PageOp::Untrack, PageOp::None);
+        }
+        IterateWords(bounds, [&](u64 index, u64 mask) {
+            UpdateState<StateOp::Set, StateOp::None>(index, mask & ~gpu[index]);
+        });
+    }
+
     template <Type type>
     bool IsRegionModified(u64 offset, u64 size) noexcept {
         const auto& state = GetRegionBits<type>();

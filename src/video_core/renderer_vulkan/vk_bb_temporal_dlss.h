@@ -23,6 +23,7 @@ class Instance;
 class Runtime;
 class Scheduler;
 class BbVelocityMirror;
+class BbObjectMotion;
 
 // Temporal upscaling for Bloodborne with DLSS (shadps4_dlss.dll + nvngx_dlss.dll) or FSR 3.1
 // (amd_fidelityfx_vk.dll), active when either is present next to the executable. Scene
@@ -39,6 +40,7 @@ struct BbDlssStatus {
     bool active{};
     std::string reason;       // why upscaling is not active, in plain words
     std::string backend;      // upscaler of the latest evaluation: DLSS, FSR 4 or FSR 3.1
+    u32 preset{};             // DLSS's preset (1 A ... 13 M), 0 the default or another upscaler
     std::string dlss_problem; // why DLSS cannot run on this system, if it cannot
     std::string gpu;
     bool fsr4_installed{};
@@ -57,15 +59,25 @@ public:
     BbTemporalDlss();
     ~BbTemporalDlss();
     bool Requested() const;
+    // dlss.ini character_motion at startup: G-buffer pipelines get the motion attachment.
+    bool CharacterMotionRequested() const;
+    // F1's Object motion vectors (dlss.ini object_motion) with an upscaler requested.
+    bool ObjectMotionRequested() const;
+    void SetObjectMotion(BbObjectMotion* object_motion);
+    // The motion blur watch's view of this frame (blur matrix, camera change, passes).
+    std::string DescribeBlur() const;
 
     struct DrawInfo {
         u64 vs_hash;
         u64 ps_hash;
         VideoCore::ImageId color;
+        vk::Format color_view_format; // the format the draw writes its color target as
         VideoCore::ImageId depth;
         u32 num_indices;
         u32 num_instances;
         bool indirect;
+        bool depth_test, depth_write;
+        bool stencil;
     };
     // Called after resources are bound and before the guest render pass begins. Returns the
     // viewport offset (render pixels) for this draw.
@@ -102,6 +114,8 @@ public:
     void ObserveConstants(Runtime& runtime, const Instance& instance,
                           const VideoCore::Buffer* source, u64 offset, u64 size, u64 shader_hash,
                           u32 binding);
+    // The same bytes CPU-side: the game's motion blur inputs, for the motion blur watch.
+    void ObserveBlurInputs(const void* data, u64 size, u64 shader_hash, u32 binding);
 
     struct Presentation {
         vk::ImageView view;

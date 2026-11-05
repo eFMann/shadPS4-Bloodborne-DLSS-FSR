@@ -15,7 +15,9 @@
 #include "common/logging/log.h"
 #include "common/types.h"
 
-#define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())
+// The settings, without the singleton's lock and reference count (read many times a draw on the
+// GPU threads: the lock and the shared count's cache line were a few percent of all CPU time).
+#define EmulatorSettings (*EmulatorSettingsImpl::Instance())
 
 enum HideCursorState : int {
     Never,
@@ -198,7 +200,7 @@ struct GeneralSettings {
     Setting<int> console_language{1};
     Setting<int> big_picture_scale{1000};
     Setting<int> big_picture_folder_depth{2};
-    Setting<bool> redzone_patches{false};
+    Setting<bool> redzone_patches{true};
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -241,6 +243,7 @@ struct NetworkSettings {
     Setting<int> p2p_port{3658}; // 0 is any free port, 3658 is the default PS4 port. With UPnP
                                  // enabled it is forwarded on the router.
     Setting<bool> disable_https{false};
+    Setting<bool> enable_device_discovery{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -252,13 +255,15 @@ struct NetworkSettings {
                                            &NetworkSettings::shadnet_webapi_server),
             make_override<NetworkSettings>("enable_upnp", &NetworkSettings::enable_upnp),
             make_override<NetworkSettings>("p2p_port", &NetworkSettings::p2p_port),
-            make_override<NetworkSettings>("disable_https", &NetworkSettings::disable_https)};
+            make_override<NetworkSettings>("disable_https", &NetworkSettings::disable_https),
+            make_override<NetworkSettings>("enable_device_discovery",
+                                           &NetworkSettings::enable_device_discovery)};
     }
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NetworkSettings, connected_to_network, shad_net_enabled,
                                    shadnet_server, shadnet_webapi_server, enable_upnp, p2p_port,
-                                   disable_https)
+                                   disable_https, enable_device_discovery)
 
 // -------------------------------
 // Log settings
@@ -408,6 +413,18 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // -------------------------------
 // GPU settings
 // -------------------------------
+// Bloodborne settings whose default changed to on are switched on once in configs saved before
+// (each saved config holds every value, so a new default never reached them). 1: "Also free idle
+// buffers" and "Background texture copies". 2: "Real occlusion tests". 3: "Use more VRAM",
+// "Overlap game and GPU frames", "Early GPU data write-back", "Keep rendering while presenting",
+// "Copy only kept texture levels" and "Direct texture copies". 4: the threaded renderer's settings
+// that F3 lists only as advanced on, "Real occlusion tests" off (white flicker), the
+// screen-space reflections back to the game's (hidden from F1 for now), "Windows Guest Red Zone
+// Protection" on (crashes without it) and "Enable Shader Cache" on. 5: "Draw recorder on two
+// threads", "Submit on the recording thread", "Faster pipeline lookup (1.09)" and "Early GPU data
+// write-back" on (on for everyone, so problems with them get reported).
+constexpr int BbDefaultsVersion = 6;
+
 struct GPUSettings {
     Setting<u32> window_width{1280};
     Setting<u32> window_height{720};
@@ -430,6 +447,138 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
+    // Bloodborne: records draws on a second thread (vk_draw_pipe.h).
+    Setting<bool> threaded_renderer{true};
+    // Bloodborne threaded renderer: statistics, time breakdown and hitch reports in the log.
+    Setting<bool> threaded_renderer_diagnostics{false};
+    // Bloodborne threaded renderer: GPU time per pass in the log (vk_gpu_profiler.h).
+    Setting<bool> threaded_renderer_gpu_profile{false};
+    // No longer used: F1's Object motion vectors (dlss.ini object_motion) switches the velocity
+    // mirror. Kept so saved configs still load.
+    Setting<bool> bb_object_motion{true};
+    // Under the threaded renderer (each off: the emulator's original behaviour for that part).
+    // GPU readbacks on a second queue (copy engine), waiting only for the GPU work that wrote
+    // the data instead of all queued work.
+    Setting<bool> bb_readback_queue{true};
+    // Streaming: parallel copies, resident buffer memory in 64 MiB slabs, staging memory kept.
+    Setting<bool> bb_streaming{true};
+    // Copy shader batches in one compute dispatch, merged within 64 KiB.
+    Setting<bool> bb_merged_copies{true};
+    // Faster Windows locks and sleeps (applies at game start).
+    Setting<bool> bb_fast_locks{true};
+    // Flip a frame as soon as it's ready (between vblanks), evenly paced, instead of on the
+    // next vblank tick.
+    Setting<bool> bb_flip_when_ready{true};
+    // VRAM cleanup (applies at game start): frees idle textures when VRAM runs low.
+    // Off: the emulator's original cache behaviour.
+    Setting<bool> bb_vram_reclaim{true};
+    // With VRAM cleanup: also free guest buffer memory unused for 30 s (applies at start).
+    Setting<bool> bb_buffer_eviction{true};
+    // With VRAM cleanup: at each loading screen, free the textures and buffers not used since it
+    // started, so play continues with more free VRAM (the next area uploads what it needs).
+    Setting<bool> bb_load_screen_cleanup{true};
+    // With VRAM cleanup (testing): marks from the driver's current VRAM budget, a small margin
+    // below it, instead of an eighth of the card kept free. Off: the usual marks.
+    Setting<bool> bb_more_vram{true};
+    // With "Use more VRAM" (testing, applies at start): up to the card's size less a reserve for
+    // Windows, past the driver's budget (Windows then makes room by moving other programs' memory
+    // to system RAM), with memory priorities so texture copies are the first to go if it moves any
+    // of the emulator's.
+    Setting<bool> bb_vram_past_budget{false};
+    // Texture quality: 0 = full, 1 = High (textures over 2048 stored at half size), 2 = Medium
+    // (over 1024). Only block-compressed textures with mip levels that the GPU never writes: their
+    // largest level is left out. Applies to textures loaded after a change.
+    Setting<int> bb_texture_quality{0};
+    // shadPS4's in-game windows (F3, F1, pop-ups) sized by screen pixels, as games size their
+    // menus, instead of also by Windows' display scaling (150% made them half as big again).
+    Setting<bool> bb_ignore_display_scale{true};
+    // Testing: the VRAM budget the caches assume, in MiB (0 = the GPU's real budget; at start).
+    Setting<int> bb_vram_budget_test_mb{0};
+    // Threaded renderer: textures and large buffer uploads copied from guest memory on background
+    // threads; the copies are waited for before the GPU submission that reads them and before the
+    // guest sees a fence.
+    Setting<bool> bb_background_texture_copies{true};
+    // Threaded renderer: clean vertex/index data of 1-16 KiB read where it is in GPU memory
+    // instead of copied for every draw. Off: copied as before.
+    Setting<bool> bb_geometry_in_place{true};
+    // Threaded renderer: draws that cannot write anything (no pixel shader, colour, depth or
+    // stencil target, no memory writes; occlusion query geometry) skipped. Off: drawn.
+    Setting<bool> bb_skip_empty_draws{true};
+    // Threaded renderer: new scene pipelines compiled on background threads, their draws skipped
+    // until ready (a frame or two) instead of the game waiting. Off: compiled at once.
+    Setting<bool> bb_background_pipelines{true};
+    // Anisotropic filtering for the game's mipmapped textures (surfaces at an angle stay sharp
+    // without shimmering): 2, 4, 8 or 16 samples. 0: the game's own filtering.
+    Setting<int> bb_anisotropy{16};
+    // Where the per-draw data the CPU writes every frame lives: 0 auto (graphics card memory
+    // with Resizable BAR / Smart Access Memory, system RAM without), 1 graphics card, 2 system.
+    Setting<int> bb_draw_data_memory{0};
+    // Page protection: only the pages whose protection changes, not the already protected pages
+    // between them (Windows' cost is per page). Off: one call over the whole stretch.
+    Setting<bool> bb_exact_protection{true};
+    // New textures a draw needs are unshuffled and copied together: one barrier and one render
+    // pass break for the group instead of per texture. Off: one texture at a time.
+    Setting<bool> bb_batched_uploads{true};
+    // Threaded renderer: a draw's textures reused as found for the same textures last time
+    // (texture set memo). Off: looked up for every draw.
+    Setting<bool> bb_texture_set_memo{true};
+    // Threaded renderer: small or changed vertex/index data copied ahead into the draw data ring
+    // by the decoding thread. Off: copied by the draw recorder as before.
+    Setting<bool> bb_ring_geometry{true};
+    // Threaded renderer: the next GPU submission is decoded while the draw recorder still
+    // records the last one. Off: waits for the recorder after each submission.
+    Setting<bool> bb_submit_overlap{true};
+    // Threaded renderer (applies at start): the game's next frame is handed to the GPU side before
+    // the game waits for the last one, and its first two submissions do not wait at all (after
+    // Lantern Engine). Off: every submission after the end of a frame waits for the GPU side to be
+    // idle, as before.
+    Setting<bool> bb_overlap_frames{true};
+    // Threaded renderer: memory a game thread had to wait for a GPU readback of is sent to the GPU
+    // as soon as GPU work writes it again, and copied back once the GPU has finished, so the
+    // game's next write does not wait. Off: read back only when the game touches it, as before.
+    Setting<bool> bb_early_writeback{true};
+    // Threaded renderer: occlusion query results written in order with the queued draws. Off:
+    // the decoding thread waits for every queued draw first, as before.
+    Setting<bool> bb_occlusion_in_order{true};
+    // Pixel shader float math the driver may fuse (less shader code); applies after a restart
+    // and rebuilds the shader cache when changed. Off: unfused, as the PS4.
+    Setting<bool> bb_fast_pixel_math{true};
+    // Threaded renderer: the game's constant copies (constant RAM dumps) written at once when no
+    // queued draw reads that memory later. Off: every one waits for the queued draws first.
+    Setting<bool> bb_constants_no_wait{true};
+    // NVIDIA: pixel shader inputs interpolated by the GPU where the shader can't tell the
+    // difference (less shader code); applies after a restart and rebuilds the shader cache when
+    // changed. Off: every input by GCN's exact formula.
+    Setting<bool> bb_hardware_interpolation{true};
+    // Threaded renderer: the game's occlusion tests (one box per area behind walls) counted by
+    // the GPU, so the game skips areas that are hidden. Off: every test reads "visible".
+    Setting<bool> bb_real_occlusion{false};
+    // Threaded renderer: stage A's copies of game memory (constants, small vertex and index
+    // data) made on a thread of their own; applies after a restart. Off: made by stage A.
+    Setting<bool> bb_copy_thread{true};
+    // Threaded renderer: while a frame is presented (a frame limiter such as RTSS may sleep in
+    // the present), the GPU threads' submissions queue up and go to the GPU right after it
+    // returns, instead of the threads waiting for the queue. Off: they wait for the present.
+    Setting<bool> bb_render_during_present{true};
+    // Texture quality High/Medium: the guest data of a texture's left-out largest level is not
+    // copied for its uploads (only the levels kept), which is most of a traversal burst's bytes
+    // for the textures it reduces. Off: the whole texture is copied and the level dropped after.
+    Setting<bool> bb_skip_left_out_levels{true};
+    // Threaded renderer: texture data is copied from the game's own addresses when the whole
+    // texture is mapped and readable, not through the view of the backing memory (whose pages
+    // the process has not touched yet: the first read of each 4 KiB page costs a fault, which
+    // made traversal copies run at ~5 GB/s). Off: always through the backing view.
+    Setting<bool> bb_direct_texture_copies{true};
+    // Threaded renderer: when an area loads (hundreds of textures in a second), texture uploads
+    // past 64 MiB a frame wait for the next frames (new ones show black meanwhile), so the load
+    // is spread over several frames. Off: everything uploaded at once.
+    Setting<bool> bb_spread_loads{true};
+    // Diagnostics: every draw timed, and where the draw recorder's time went shown for each
+    // stutter (slower: for finding stutter causes).
+    Setting<bool> bb_stutter_detail{false};
+    // Saved with the settings: the Bloodborne defaults they were saved with (BbDefaultsVersion).
+    Setting<int> bb_defaults{BbDefaultsVersion};
+    Setting<bool> fast_shader_math{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -454,16 +603,80 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
+            make_override<GPUSettings>("threaded_renderer", &GPUSettings::threaded_renderer),
+            make_override<GPUSettings>("threaded_renderer_diagnostics",
+                                       &GPUSettings::threaded_renderer_diagnostics),
+            make_override<GPUSettings>("threaded_renderer_gpu_profile",
+                                       &GPUSettings::threaded_renderer_gpu_profile),
+            make_override<GPUSettings>("bb_object_motion", &GPUSettings::bb_object_motion),
+            make_override<GPUSettings>("bb_readback_queue", &GPUSettings::bb_readback_queue),
+            make_override<GPUSettings>("bb_streaming", &GPUSettings::bb_streaming),
+            make_override<GPUSettings>("bb_merged_copies", &GPUSettings::bb_merged_copies),
+            make_override<GPUSettings>("bb_fast_locks", &GPUSettings::bb_fast_locks),
+            make_override<GPUSettings>("bb_flip_when_ready", &GPUSettings::bb_flip_when_ready),
+            make_override<GPUSettings>("bb_vram_reclaim", &GPUSettings::bb_vram_reclaim),
+            make_override<GPUSettings>("bb_buffer_eviction", &GPUSettings::bb_buffer_eviction),
+            make_override<GPUSettings>("bb_load_screen_cleanup",
+                                       &GPUSettings::bb_load_screen_cleanup),
+            make_override<GPUSettings>("bb_more_vram", &GPUSettings::bb_more_vram),
+            make_override<GPUSettings>("bb_vram_past_budget", &GPUSettings::bb_vram_past_budget),
+            make_override<GPUSettings>("bb_texture_quality", &GPUSettings::bb_texture_quality),
+            make_override<GPUSettings>("bb_ignore_display_scale",
+                                       &GPUSettings::bb_ignore_display_scale),
+            make_override<GPUSettings>("bb_background_texture_copies",
+                                       &GPUSettings::bb_background_texture_copies),
+            make_override<GPUSettings>("bb_vram_budget_test_mb",
+                                       &GPUSettings::bb_vram_budget_test_mb),
+            make_override<GPUSettings>("bb_geometry_in_place", &GPUSettings::bb_geometry_in_place),
+            make_override<GPUSettings>("bb_skip_empty_draws", &GPUSettings::bb_skip_empty_draws),
+            make_override<GPUSettings>("bb_background_pipelines",
+                                       &GPUSettings::bb_background_pipelines),
+            make_override<GPUSettings>("bb_anisotropy", &GPUSettings::bb_anisotropy),
+            make_override<GPUSettings>("bb_draw_data_memory", &GPUSettings::bb_draw_data_memory),
+            make_override<GPUSettings>("bb_exact_protection", &GPUSettings::bb_exact_protection),
+            make_override<GPUSettings>("bb_batched_uploads", &GPUSettings::bb_batched_uploads),
+            make_override<GPUSettings>("bb_texture_set_memo", &GPUSettings::bb_texture_set_memo),
+            make_override<GPUSettings>("bb_ring_geometry", &GPUSettings::bb_ring_geometry),
+            make_override<GPUSettings>("bb_submit_overlap", &GPUSettings::bb_submit_overlap),
+            make_override<GPUSettings>("bb_overlap_frames", &GPUSettings::bb_overlap_frames),
+            make_override<GPUSettings>("bb_early_writeback", &GPUSettings::bb_early_writeback),
+            make_override<GPUSettings>("bb_occlusion_in_order",
+                                       &GPUSettings::bb_occlusion_in_order),
+            make_override<GPUSettings>("bb_fast_pixel_math", &GPUSettings::bb_fast_pixel_math),
+            make_override<GPUSettings>("bb_constants_no_wait", &GPUSettings::bb_constants_no_wait),
+            make_override<GPUSettings>("bb_hardware_interpolation",
+                                       &GPUSettings::bb_hardware_interpolation),
+            make_override<GPUSettings>("bb_real_occlusion", &GPUSettings::bb_real_occlusion),
+            make_override<GPUSettings>("bb_copy_thread", &GPUSettings::bb_copy_thread),
+            make_override<GPUSettings>("bb_render_during_present",
+                                       &GPUSettings::bb_render_during_present),
+            make_override<GPUSettings>("bb_skip_left_out_levels",
+                                       &GPUSettings::bb_skip_left_out_levels),
+            make_override<GPUSettings>("bb_direct_texture_copies",
+                                       &GPUSettings::bb_direct_texture_copies),
+            make_override<GPUSettings>("bb_spread_loads", &GPUSettings::bb_spread_loads),
+            make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
+            make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
+            make_override<GPUSettings>("fast_shader_math", &GPUSettings::fast_shader_math),
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
-                                   internal_screen_height, null_gpu, copy_gpu_buffers,
-                                   readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   userfaultfd, inline_fetch_shader)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
+    GPUSettings, window_width, window_height, internal_screen_width, internal_screen_height,
+    null_gpu, copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,
+    direct_memory_access_enabled, dump_shaders, patch_shaders, vblank_frequency, full_screen,
+    full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
+    userfaultfd, inline_fetch_shader, threaded_renderer, threaded_renderer_diagnostics,
+    threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
+    bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
+    bb_load_screen_cleanup, bb_more_vram, bb_vram_past_budget, bb_texture_quality,
+    bb_ignore_display_scale, bb_vram_budget_test_mb, bb_background_texture_copies,
+    bb_geometry_in_place, bb_skip_empty_draws, bb_background_pipelines, bb_anisotropy,
+    bb_exact_protection, bb_batched_uploads, bb_texture_set_memo, bb_ring_geometry,
+    bb_submit_overlap, bb_overlap_frames, bb_early_writeback, bb_stutter_detail, bb_defaults,
+    bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait, bb_hardware_interpolation,
+    bb_real_occlusion, bb_copy_thread, bb_spread_loads, bb_render_during_present,
+    bb_skip_left_out_levels, bb_direct_texture_copies, fast_shader_math)
 
 // -------------------------------
 // Vulkan settings
@@ -478,8 +691,158 @@ struct VulkanSettings {
     Setting<bool> vkcrash_diagnostic_enabled{false};
     Setting<bool> vkhost_markers{false};
     Setting<bool> vkguest_markers{false};
-    Setting<bool> pipeline_cache_enabled{false};
+    Setting<bool> pipeline_cache_enabled{true};
     Setting<bool> pipeline_cache_archived{false};
+    // Bloodborne threaded renderer (here: GPUSettings' JSON field list is at its 64 limit).
+    // Copy threads for texture and buffer data (0 = auto: half the logical cores, 2 to 8;
+    // otherwise this many, leaving two cores); applies after a restart. Traversal bursts of new
+    // textures copy 200-440 MiB in one frame: ~7 GB/s on 4 threads, ~10 GB/s on 8.
+    Setting<int> bb_copy_threads{0};
+    // RenderDoc (diagnostics): frames one F12 capture takes, one after another in one file.
+    Setting<int> bb_rdoc_capture_frames{1};
+    // Texture uploads staged in cached system memory instead of write-combined (uncached)
+    // memory: faster for the CPU's copy, possibly slower for the GPU's read. Off: uncached.
+    Setting<bool> bb_cached_texture_staging{true};
+    // Lower detail first: in a burst of new textures (a traversal load) their largest level
+    // waits and arrives over the next frames within a per-frame budget; meanwhile shaders
+    // sample the next level down (softer for a few frames). Needs VK_EXT_image_view_min_lod.
+    Setting<bool> bb_lower_detail_first{true};
+    // Clear new shader-written images: a new image a compute shader only writes, bound whole
+    // with a thread for every texel, is cleared on the GPU instead of uploaded from guest memory
+    // first (the shader overwrites it). Traversal bursts uploaded 180-410 MiB of them.
+    Setting<bool> bb_clear_shader_written{true};
+    // Constant dumps past huge shader writes: a queued shader's storage write declared over
+    // 256 MiB (a descriptor over all of memory, ~3.7 GiB in Bloodborne) does not hold up a
+    // constant dump to memory inside it; the dump is written at once, as with nothing queued
+    // (the command thread waited 20-40 ms for the draw recorder in traversal bursts).
+    Setting<bool> bb_ce_skip_huge_writes{true};
+    // Cheaper buffer refill (buffer eviction): evicted buffers keep their page protection and
+    // are uploaded straight from guest memory when made resident again, instead of being marked
+    // changed (unprotected) at eviction and protected again, page run by page run, at their next
+    // use (~12-15 ms per traversal burst).
+    Setting<bool> bb_evict_keep_protection{true};
+    // Keep returning buffers (buffer eviction): a loading screen evicts only what VRAM needs
+    // (down to 1 GiB below the pressure limit) instead of every buffer idle for 2 s (~700 MiB
+    // per respawn, ~170 MiB of it uploaded again in the next area's first frames), and buffers
+    // that came back after an eviction are evicted last.
+    Setting<bool> bb_evict_keep_returning{true};
+    // Protection on a helper thread: a new texture's memory protection (noticing the game's
+    // writes) is done by one helper thread instead of the draw recorder (~6-9 ms of a traversal
+    // burst); the texture's background copies wait for it. Needs background texture copies.
+    // New geometry's (buffer uploads') protection too (2.5-5 ms of a traversal stutter).
+    Setting<bool> bb_protect_helper_thread{true};
+    // Copy shader on the CPU: the game's GPU copy shader (thousands of small copies a second)
+    // is done in game memory when neither side holds data only the GPU has. Its destination
+    // was marked GPU-written, and the game's next write near it waited for the GPU to finish
+    // (3-16 ms each, the slow in-play frames when running into new parts of an area).
+    Setting<bool> bb_cpu_copy_shader{true};
+    // With "Copy shader on the CPU": a copy whose destination already holds the source's bytes is
+    // left out. Writing them again still marked the memory changed, so the buffers over it were
+    // uploaded again.
+    Setting<bool> bb_copy_skip_same{true};
+    // Clear one face of a cube or one layer of an array: the game clears its point lights'
+    // shadow cube a face at a time with a compute shader. Only whole images were cleared as
+    // images; a face was left to the shader, which wrote memory only, and the face kept its
+    // older shadows (wedges of light in lamp shadows).
+    Setting<bool> bb_clear_one_layer{true};
+    // Better ambient occlusion: the game's screen-space AO replaced with GT-VBAO (ground-truth
+    // AO with a visibility bitmask) from the scene's depth and normals: contact shadows in
+    // corners, under objects and in carvings, without the game's halos.
+    Setting<bool> bb_vbao{false};
+    // Its strength (exponent on the visibility, x100) and reach (metres, x100). Set in the F1
+    // window, global only: a game's own settings file kept an old value that the F1 window's
+    // change did not replace.
+    Setting<int> bb_vbao_strength{150};
+    Setting<int> bb_vbao_radius{150};
+    // The AO computed at half the scene's size and upscaled guided by the depth (about a
+    // quarter of the cost; slightly softer fine detail). Off: at the full scene size.
+    Setting<bool> bb_vbao_half_res{true};
+    // Screen-space reflections (with the game's "Enable Screen Space Reflections" patch):
+    // 0 the game's, 1 better (traced through a depth pyramid with the game's own inputs, and
+    // denoised), 2 off (none at all). The patch is built in (installed at a start when this
+    // isn't Off), so Off to on or back needs a restart. Global only.
+    Setting<int> bb_ssr_mode{2};
+    // Once, at the first game start with built-in reflections: a patch file that already has the
+    // reflection patch on keeps the game's reflections (Off becomes "Game's"). Global only.
+    Setting<bool> bb_ssr_check_patch_file{true};
+    // Better reflections at the scene's full size (not the game's half size), from a full-size
+    // copy of the last frame, read by the lighting directly: a little sharper, at more GPU time.
+    Setting<bool> bb_ssr_full_res{false};
+    // Better reflections, test ("Sharp reflections"): no fade by screen position or camera
+    // angle, no spatial filtering, a short history. Off: as before.
+    Setting<bool> bb_ssr_rough_rays{true};
+    // Sharp reflections at full resolution: only surfaces at least this glossy (hundredths of the
+    // G-buffer's gloss) reflect; rougher ones aren't traced at all.
+    Setting<int> bb_ssr_min_gloss{50};
+    // Sharp reflections: frames of history (more: steadier, but more smearing in motion).
+    Setting<int> bb_ssr_sharp_frames{8};
+    // Better reflections, debug view (not saved): 1 paints every pixel's reflection magenta, 2
+    // only where a ray hit something; the lighting then shows where and how strongly it uses them.
+    Setting<int> bb_ssr_debug{0};
+    // Settings window: the threaded renderer's individual settings are listed (remembered).
+    Setting<bool> bb_show_threaded_settings{false};
+    // Bloodborne's frame rate set free by hooks in the game's code instead of the
+    // frame rate patches, which must be off then. Applies at the next start. Global only.
+    Setting<bool> bb_frame_hooks{true};
+    // Tests (issue #25, white dots), with merged copy shaders: the copies' sources never
+    // snapshotted from game memory into the stream buffer (read from the buffer cache, as with
+    // merged copies off), and the old 64 MiB batches instead of 64 KiB ones.
+    Setting<bool> bb_merged_no_stream_sources{false};
+    Setting<bool> bb_merged_large_batches{false};
+    // The frame rate limit with the frame rate hooks (30..480; 0: none), changed while the game
+    // runs. Global only.
+    Setting<int> bb_fps_limit{0};
+    // The F1 panel's size in percent (its text, spacing and default window size). Global only.
+    Setting<int> bb_f1_scale{100};
+    // Where the F1 panel was last left, in thousandths of the free room across and down (500:
+    // centred), so it stays on screen at any resolution. Global only.
+    Setting<int> bb_f1_pos_x{500};
+    Setting<int> bb_f1_pos_y{500};
+    // The FPS counter's parts (F1, Other): the frame rate, the frame time, the upscaler, DLSS's
+    // preset, the mode (Quality, Balanced...), the output resolution, and its corner (0 top left, 1
+    // top right, 2 bottom left, 3 bottom right). Global only.
+    Setting<bool> bb_counter_fps{true};
+    Setting<bool> bb_counter_ms{true};
+    Setting<bool> bb_counter_upscaler{true};
+    Setting<bool> bb_counter_preset{true};
+    Setting<bool> bb_counter_mode{false};
+    Setting<bool> bb_counter_resolution{false};
+    Setting<bool> bb_counter_graph{false}; // a frame time graph under the counter
+    // Performance meter (F3, Diagnostics): which stage holds the frame rate, under the counter and
+    // in the log every 20 seconds. Global only.
+    Setting<bool> bb_perf_meter{false};
+    // GX draw capture check (F3, Diagnostics; Bloodborne 1.09, applies at a start): the engine's
+    // draw calls are hooked and what they bind is checked against what the command thread decodes
+    // from the packets. Changes nothing drawn. Global only.
+    Setting<bool> bb_gx_observe{false};
+    // Pipelines from the engine's objects (F3, Performance; Bloodborne 1.09, applies at a start):
+    // a draw whose GX objects were seen before takes the pipeline they gave then, instead of
+    // working it out from the registers. Global only.
+    Setting<bool> bb_gx_pipelines{true};
+    // Recorder split census (F3, Diagnostics): which of the recorder's calls each half of a
+    // split recorder would make, in the log every 20 s. Global only.
+    Setting<bool> bb_recorder_census{false};
+    // Draw recorder on two threads (F3, Performance; with the threaded renderer, applies at
+    // once): the recorder's command recording on a thread of its own. Global only.
+    Setting<bool> bb_draw_finisher{true};
+    // Submit on the recording thread (F3, Performance; with the threaded renderer, applies at
+    // once): the frame's and the guest submissions' command buffers are ended and submitted by
+    // the recording thread, so the GPU threads don't wait for it to catch up. Global only.
+    Setting<bool> bb_async_submit{true};
+    // Stage uploads in VRAM (F3, Performance; Resizable BAR / Smart Access Memory on a
+    // dedicated graphics card, applies at once): streaming uploads are copied by the copy threads
+    // straight into a fixed 128 MiB area of graphics card memory instead of system RAM, so the GPU
+    // doesn't pull them across PCIe afterwards (10-25 ms in the frame after a traversal stutter).
+    // Global only.
+    Setting<bool> bb_vram_upload_staging{false};
+    // Keep render threads off core 0 (F3, Performance; Windows, applies at once): the command
+    // thread, draw recorder and finisher and the recording thread avoid the first physical core,
+    // where Windows serves most interrupts. Global only.
+    Setting<bool> bb_render_threads_off_core0{false};
+    Setting<int> bb_counter_corner{0};
+    // With an FPS cap ("Show frames when ready"): frames are shown one cap period apart, an early
+    // one held until its turn, instead of each as soon as it is ready. Global only.
+    Setting<bool> bb_even_capped_flips{true};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -501,14 +864,50 @@ struct VulkanSettings {
                                           &VulkanSettings::pipeline_cache_enabled),
             make_override<VulkanSettings>("pipeline_cache_archived",
                                           &VulkanSettings::pipeline_cache_archived),
+            make_override<VulkanSettings>("bb_copy_threads", &VulkanSettings::bb_copy_threads),
+            make_override<VulkanSettings>("bb_rdoc_capture_frames",
+                                          &VulkanSettings::bb_rdoc_capture_frames),
+            make_override<VulkanSettings>("bb_cached_texture_staging",
+                                          &VulkanSettings::bb_cached_texture_staging),
+            make_override<VulkanSettings>("bb_lower_detail_first",
+                                          &VulkanSettings::bb_lower_detail_first),
+            make_override<VulkanSettings>("bb_clear_shader_written",
+                                          &VulkanSettings::bb_clear_shader_written),
+            make_override<VulkanSettings>("bb_ce_skip_huge_writes",
+                                          &VulkanSettings::bb_ce_skip_huge_writes),
+            make_override<VulkanSettings>("bb_evict_keep_protection",
+                                          &VulkanSettings::bb_evict_keep_protection),
+            make_override<VulkanSettings>("bb_evict_keep_returning",
+                                          &VulkanSettings::bb_evict_keep_returning),
+            make_override<VulkanSettings>("bb_protect_helper_thread",
+                                          &VulkanSettings::bb_protect_helper_thread),
+            make_override<VulkanSettings>("bb_cpu_copy_shader",
+                                          &VulkanSettings::bb_cpu_copy_shader),
+            make_override<VulkanSettings>("bb_copy_skip_same", &VulkanSettings::bb_copy_skip_same),
+            make_override<VulkanSettings>("bb_clear_one_layer",
+                                          &VulkanSettings::bb_clear_one_layer),
+            make_override<VulkanSettings>("bb_merged_no_stream_sources",
+                                          &VulkanSettings::bb_merged_no_stream_sources),
+            make_override<VulkanSettings>("bb_merged_large_batches",
+                                          &VulkanSettings::bb_merged_large_batches),
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(VulkanSettings, gpu_id, renderdoc_enabled, vkvalidation_enabled,
-                                   vkvalidation_core_enabled, vkvalidation_sync_enabled,
-                                   vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled,
-                                   vkhost_markers, vkguest_markers, pipeline_cache_enabled,
-                                   pipeline_cache_archived)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
+    VulkanSettings, gpu_id, renderdoc_enabled, vkvalidation_enabled, vkvalidation_core_enabled,
+    vkvalidation_sync_enabled, vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled, vkhost_markers,
+    vkguest_markers, pipeline_cache_enabled, pipeline_cache_archived, bb_copy_threads,
+    bb_cached_texture_staging, bb_lower_detail_first, bb_clear_shader_written,
+    bb_ce_skip_huge_writes, bb_evict_keep_protection, bb_evict_keep_returning,
+    bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same, bb_clear_one_layer,
+    bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius, bb_vbao_half_res,
+    bb_ssr_mode, bb_ssr_full_res, bb_ssr_rough_rays, bb_ssr_min_gloss, bb_ssr_sharp_frames,
+    bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_f1_scale, bb_f1_pos_x, bb_f1_pos_y,
+    bb_counter_fps, bb_counter_ms, bb_counter_upscaler, bb_counter_preset, bb_counter_mode,
+    bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_perf_meter, bb_gx_observe,
+    bb_gx_pipelines, bb_recorder_census, bb_draw_finisher, bb_async_submit, bb_vram_upload_staging,
+    bb_render_threads_off_core0, bb_even_capped_flips, bb_merged_no_stream_sources,
+    bb_merged_large_batches, bb_ssr_check_patch_file)
 
 // -------------------------------
 // Main manager
@@ -519,9 +918,43 @@ public:
     ~EmulatorSettingsImpl();
 
     static std::shared_ptr<EmulatorSettingsImpl> GetInstance();
+    /// The current instance without locking (instances replaced by SetInstance are kept alive).
+    static EmulatorSettingsImpl* Instance() {
+        if (s_private_users.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            if (auto* const own = t_private) {
+                return own;
+            }
+        }
+        if (auto* const instance = s_current.load(std::memory_order_acquire)) [[likely]] {
+            return instance;
+        }
+        return GetInstance().get();
+    }
     static void SetInstance(std::shared_ptr<EmulatorSettingsImpl> instance);
 
+    /// While a game runs, the settings window reloads the settings from the files (on opening,
+    /// on saving, on closing, switching profiles): in place, that cleared the running game's
+    /// profile and rewrote every setting while the GPU threads read them, so they recorded a
+    /// frame with other settings mid-way (the device was lost on Save in F3). Within this scope
+    /// this thread works on a copy; at its end the copy replaces the settings in one step (the
+    /// replaced ones kept alive) when it holds the running game's profile, and is dropped when
+    /// it holds another one (that profile is only saved, for that game's next start). No game
+    /// running: no copy, as before.
+    class ReloadScope {
+    public:
+        ReloadScope();
+        ~ReloadScope();
+        ReloadScope(const ReloadScope&) = delete;
+        ReloadScope& operator=(const ReloadScope&) = delete;
+
+    private:
+        std::shared_ptr<EmulatorSettingsImpl> copy;
+    };
+
     bool Save(const std::string& serial = "");
+    /// Every setting's global value and game-specific override, by section (to log what a save
+    /// changed).
+    nlohmann::json Snapshot() const;
     bool Load(const std::string& serial = "");
     void SetDefaultValues();
     bool TransferSettings();
@@ -560,6 +993,9 @@ public:
     void SetAddonInstallDir(const std::filesystem::path& dir);
 
 private:
+    /// Switches on Bloodborne settings whose default changed, in a config saved before
+    /// (BbDefaultsVersion). Returns whether it changed anything.
+    bool UpdateBbDefaults(const nlohmann::json& file, bool game_specific);
     GeneralSettings m_general{};
     NetworkSettings m_network{};
     LogSettings m_log{};
@@ -573,9 +1009,14 @@ private:
     // Runtime-only override: when true, IsShadNetEnabled() reports false for the
     // rest of this run regardless of the persisted setting
     std::atomic<bool> m_shadnet_session_disabled{false};
+    // ReloadScope: the profile the last Load loaded ("" for the global one).
+    std::string m_loaded_profile;
+    static inline std::atomic<int> s_private_users{0};
+    static inline thread_local EmulatorSettingsImpl* t_private = nullptr;
 
     static std::shared_ptr<EmulatorSettingsImpl> s_instance;
     static std::mutex s_mutex;
+    static inline std::atomic<EmulatorSettingsImpl*> s_current{nullptr};
 
     /// Apply overrideable fields from groupJson into group.game_specific_value.
     template <typename Group>
@@ -619,6 +1060,7 @@ public:
             m_gpu = other.m_gpu;
             m_vulkan = other.m_vulkan;
             m_configMode = other.m_configMode;
+            m_loaded_profile = other.m_loaded_profile;
         }
         return *this;
     }
@@ -702,10 +1144,22 @@ public:
     // Network settings
     SETTING_FORWARD_BOOL(m_network, ConnectedToNetwork, connected_to_network)
     SETTING_FORWARD(m_network, ShadNetServer, shadnet_server)
-    SETTING_FORWARD(m_network, ShadNetWebApiServer, shadnet_webapi_server)
+    std::string GetShadNetWebApiServer() const {
+        // Strip trailing slashes if exists
+        std::string url = m_network.shadnet_webapi_server.get(m_configMode);
+        while (!url.empty() && url.back() == '/') {
+            url.pop_back();
+        }
+        return url;
+    }
+    void SetShadNetWebApiServer(const std::string& v, bool is_specific = false) {
+        m_network.shadnet_webapi_server.set(v, is_specific);
+    }
+
     SETTING_FORWARD_BOOL(m_network, UPnPEnabled, enable_upnp)
     SETTING_FORWARD(m_network, P2PPort, p2p_port)
     SETTING_FORWARD_BOOL(m_network, ForcedHttpsDisabled, disable_https)
+    SETTING_FORWARD_BOOL(m_network, DeviceDiscoveryEnabled, enable_device_discovery)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)
@@ -757,7 +1211,97 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
+    SETTING_FORWARD_BOOL(m_gpu, ThreadedRenderer, threaded_renderer)
+    SETTING_FORWARD_BOOL(m_gpu, ThreadedRendererDiagnostics, threaded_renderer_diagnostics)
+    SETTING_FORWARD_BOOL(m_gpu, ThreadedRendererGpuProfile, threaded_renderer_gpu_profile)
+    SETTING_FORWARD_BOOL(m_gpu, BbObjectMotion, bb_object_motion)
+    SETTING_FORWARD_BOOL(m_gpu, BbReadbackQueue, bb_readback_queue)
+    SETTING_FORWARD_BOOL(m_gpu, BbStreaming, bb_streaming)
+    SETTING_FORWARD_BOOL(m_gpu, BbMergedCopies, bb_merged_copies)
+    SETTING_FORWARD_BOOL(m_gpu, BbFastLocks, bb_fast_locks)
+    SETTING_FORWARD_BOOL(m_gpu, BbFlipWhenReady, bb_flip_when_ready)
+    SETTING_FORWARD_BOOL(m_gpu, BbVramReclaim, bb_vram_reclaim)
+    SETTING_FORWARD_BOOL(m_gpu, BbBufferEviction, bb_buffer_eviction)
+    SETTING_FORWARD_BOOL(m_gpu, BbLoadScreenCleanup, bb_load_screen_cleanup)
+    SETTING_FORWARD_BOOL(m_gpu, BbMoreVram, bb_more_vram)
+    SETTING_FORWARD_BOOL(m_gpu, BbVramPastBudget, bb_vram_past_budget)
+    SETTING_FORWARD_BOOL(m_gpu, BbBackgroundTextureCopies, bb_background_texture_copies)
+    SETTING_FORWARD_BOOL(m_gpu, BbGeometryInPlace, bb_geometry_in_place)
+    SETTING_FORWARD_BOOL(m_gpu, BbSkipEmptyDraws, bb_skip_empty_draws)
+    SETTING_FORWARD_BOOL(m_gpu, BbBackgroundPipelines, bb_background_pipelines)
+    SETTING_FORWARD_BOOL(m_gpu, BbExactProtection, bb_exact_protection)
+    SETTING_FORWARD_BOOL(m_gpu, BbBatchedUploads, bb_batched_uploads)
+    SETTING_FORWARD_BOOL(m_gpu, BbTextureSetMemo, bb_texture_set_memo)
+    SETTING_FORWARD_BOOL(m_gpu, BbRingGeometry, bb_ring_geometry)
+    SETTING_FORWARD_BOOL(m_gpu, BbSubmitOverlap, bb_submit_overlap)
+    SETTING_FORWARD_BOOL(m_gpu, BbOverlapFrames, bb_overlap_frames)
+    SETTING_FORWARD_BOOL(m_gpu, BbEarlyWriteback, bb_early_writeback)
+    SETTING_FORWARD_BOOL(m_gpu, BbOcclusionInOrder, bb_occlusion_in_order)
+    SETTING_FORWARD_BOOL(m_gpu, BbFastPixelMath, bb_fast_pixel_math)
+    SETTING_FORWARD_BOOL(m_gpu, BbConstantsNoWait, bb_constants_no_wait)
+    SETTING_FORWARD_BOOL(m_gpu, BbHardwareInterpolation, bb_hardware_interpolation)
+    SETTING_FORWARD_BOOL(m_gpu, BbRealOcclusion, bb_real_occlusion)
+    SETTING_FORWARD_BOOL(m_gpu, BbCopyThread, bb_copy_thread)
+    SETTING_FORWARD_BOOL(m_gpu, BbRenderDuringPresent, bb_render_during_present)
+    SETTING_FORWARD_BOOL(m_gpu, BbSkipLeftOutLevels, bb_skip_left_out_levels)
+    SETTING_FORWARD_BOOL(m_gpu, BbDirectTextureCopies, bb_direct_texture_copies)
+    SETTING_FORWARD(m_vulkan, BbCopyThreads, bb_copy_threads)
+    SETTING_FORWARD(m_vulkan, BbRdocCaptureFrames, bb_rdoc_capture_frames)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCachedTextureStaging, bb_cached_texture_staging)
+    SETTING_FORWARD_BOOL(m_vulkan, BbLowerDetailFirst, bb_lower_detail_first)
+    SETTING_FORWARD_BOOL(m_vulkan, BbClearShaderWritten, bb_clear_shader_written)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCeSkipHugeWrites, bb_ce_skip_huge_writes)
+    SETTING_FORWARD_BOOL(m_vulkan, BbEvictKeepProtection, bb_evict_keep_protection)
+    SETTING_FORWARD_BOOL(m_vulkan, BbEvictKeepReturning, bb_evict_keep_returning)
+    SETTING_FORWARD_BOOL(m_vulkan, BbProtectHelperThread, bb_protect_helper_thread)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCpuCopyShader, bb_cpu_copy_shader)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCopySkipSame, bb_copy_skip_same)
+    SETTING_FORWARD_BOOL(m_vulkan, BbClearOneLayer, bb_clear_one_layer)
+    SETTING_FORWARD_BOOL(m_vulkan, BbVbao, bb_vbao)
+    SETTING_FORWARD(m_vulkan, BbVbaoStrength, bb_vbao_strength)
+    SETTING_FORWARD(m_vulkan, BbVbaoRadius, bb_vbao_radius)
+    SETTING_FORWARD_BOOL(m_vulkan, BbVbaoHalfRes, bb_vbao_half_res)
+    SETTING_FORWARD(m_vulkan, BbSsrMode, bb_ssr_mode)
+    SETTING_FORWARD_BOOL(m_vulkan, BbSsrCheckPatchFile, bb_ssr_check_patch_file)
+    SETTING_FORWARD_BOOL(m_vulkan, BbSsrFullRes, bb_ssr_full_res)
+    SETTING_FORWARD_BOOL(m_vulkan, BbSsrRoughRays, bb_ssr_rough_rays)
+    SETTING_FORWARD(m_vulkan, BbSsrMinGloss, bb_ssr_min_gloss)
+    SETTING_FORWARD(m_vulkan, BbSsrSharpFrames, bb_ssr_sharp_frames)
+    SETTING_FORWARD(m_vulkan, BbSsrDebug, bb_ssr_debug)
+    SETTING_FORWARD_BOOL(m_vulkan, BbShowThreadedSettings, bb_show_threaded_settings)
+    SETTING_FORWARD_BOOL(m_vulkan, BbFrameHooks, bb_frame_hooks)
+    SETTING_FORWARD(m_vulkan, BbFpsLimit, bb_fps_limit)
+    SETTING_FORWARD(m_vulkan, BbF1Scale, bb_f1_scale)
+    SETTING_FORWARD(m_vulkan, BbF1PosX, bb_f1_pos_x)
+    SETTING_FORWARD(m_vulkan, BbF1PosY, bb_f1_pos_y)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterFps, bb_counter_fps)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterMs, bb_counter_ms)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterUpscaler, bb_counter_upscaler)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterPreset, bb_counter_preset)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterMode, bb_counter_mode)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterResolution, bb_counter_resolution)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCounterGraph, bb_counter_graph)
+    SETTING_FORWARD_BOOL(m_vulkan, BbPerfMeter, bb_perf_meter)
+    SETTING_FORWARD_BOOL(m_vulkan, BbGxObserve, bb_gx_observe)
+    SETTING_FORWARD_BOOL(m_vulkan, BbGxPipelines, bb_gx_pipelines)
+    SETTING_FORWARD_BOOL(m_vulkan, BbRecorderCensus, bb_recorder_census)
+    SETTING_FORWARD_BOOL(m_vulkan, BbDrawFinisher, bb_draw_finisher)
+    SETTING_FORWARD_BOOL(m_vulkan, BbAsyncSubmit, bb_async_submit)
+    SETTING_FORWARD_BOOL(m_vulkan, BbVramUploadStaging, bb_vram_upload_staging)
+    SETTING_FORWARD_BOOL(m_vulkan, BbRenderThreadsOffCore0, bb_render_threads_off_core0)
+    SETTING_FORWARD(m_vulkan, BbCounterCorner, bb_counter_corner)
+    SETTING_FORWARD_BOOL(m_vulkan, BbEvenCappedFlips, bb_even_capped_flips)
+    SETTING_FORWARD_BOOL(m_vulkan, BbMergedNoStreamSources, bb_merged_no_stream_sources)
+    SETTING_FORWARD_BOOL(m_vulkan, BbMergedLargeBatches, bb_merged_large_batches)
+    SETTING_FORWARD_BOOL(m_gpu, BbSpreadLoads, bb_spread_loads)
+    SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
+    SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
+    SETTING_FORWARD(m_gpu, BbTextureQuality, bb_texture_quality)
+    SETTING_FORWARD_BOOL(m_gpu, BbIgnoreDisplayScale, bb_ignore_display_scale)
+    SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)
+    SETTING_FORWARD(m_gpu, BbDrawDataMemory, bb_draw_data_memory)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, FastShaderMath, fast_shader_math)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

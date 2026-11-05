@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <source_location>
 #include <fmt/format.h>
 
 #include "common/assert.h"
@@ -29,6 +30,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance);
 
+/// Debug names on textures and their views are only read by debugging tools (RenderDoc,
+/// validation, crash diagnostics, markers): naming each one (a formatted string and a driver call)
+/// is skipped otherwise. A traversal burst creates ~200 textures in one frame.
+bool ImageDebugNamesWanted();
+
 template <typename T>
 concept VulkanHandleType = vk::isVulkanHandleType<T>::value;
 
@@ -53,22 +59,29 @@ void SetObjectName(vk::Device device, const HandleType& handle, const char* form
 }
 
 template <StringLiteral msg = "">
-static void Check(vk::Result r) {
+static void Check(vk::Result r, std::source_location caller = std::source_location::current()) {
     if constexpr (msg.len <= 1) {
-        ASSERT_MSG(r == vk::Result::eSuccess, "vk::Result={}", vk::to_string(r));
+        ASSERT_MSG(r == vk::Result::eSuccess, "vk::Result={} (checked at {}:{} in {})",
+                   vk::to_string(r), caller.file_name(), caller.line(), caller.function_name());
     } else {
-        ASSERT_MSG(r == vk::Result::eSuccess, "Failed to {}: vk::Result={}", msg.value,
-                   vk::to_string(r));
+        ASSERT_MSG(r == vk::Result::eSuccess,
+                   "Failed to {}: vk::Result={} (checked at {}:{} in {})", msg.value,
+                   vk::to_string(r), caller.file_name(), caller.line(), caller.function_name());
     }
 }
 
 template <StringLiteral msg = "", typename T>
-static T Check(vk::ResultValue<T> r) {
+static T Check(vk::ResultValue<T> r,
+               std::source_location caller = std::source_location::current()) {
     if constexpr (msg.len <= 1) {
-        ASSERT_MSG(r.result == vk::Result::eSuccess, "vk::Result={}", vk::to_string(r.result));
+        ASSERT_MSG(r.result == vk::Result::eSuccess, "vk::Result={} (checked at {}:{} in {})",
+                   vk::to_string(r.result), caller.file_name(), caller.line(),
+                   caller.function_name());
     } else {
-        ASSERT_MSG(r.result == vk::Result::eSuccess, "Failed to {}: vk::Result={}", msg.value,
-                   vk::to_string(r.result));
+        ASSERT_MSG(r.result == vk::Result::eSuccess,
+                   "Failed to {}: vk::Result={} (checked at {}:{} in {})", msg.value,
+                   vk::to_string(r.result), caller.file_name(), caller.line(),
+                   caller.function_name());
     }
     return std::move(r.value);
 }

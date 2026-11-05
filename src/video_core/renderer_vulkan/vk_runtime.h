@@ -28,6 +28,10 @@ public:
         return instance;
     }
 
+    Scheduler& GetScheduler() {
+        return scheduler;
+    }
+
     StagingBufferPool& GetStagingPool() {
         return staging_pool;
     }
@@ -44,6 +48,11 @@ public:
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                  std::optional<VideoCore::SubresourceRange> subres_range = {});
+
+    /// UploadImage's copy alone: the image is already in transfer layout and the barriers its
+    /// source needs are recorded (batched uploads).
+    void RecordUploadCopies(VideoCore::Image* dst, const VideoCore::Buffer* src,
+                            std::span<const vk::BufferImageCopy> upload_copies);
 
     void UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      std::span<const vk::BufferImageCopy> upload_copies);
@@ -75,6 +84,21 @@ public:
                           bool check_read_access = false);
 
     void FlushBarriers();
+
+    /// The barriers collected so far, taken out (the buffer access tracking reset, as by
+    /// FlushBarriers): the draw recorder's resolve half hands them to its finish half, which
+    /// records them (RecordBarriers) - FlushBarriers split in two.
+    struct TakenBarriers {
+        vk::MemoryBarrier2 memory{};
+        bool has_memory = false;
+        VideoCore::Image::Barriers images;
+        [[nodiscard]] bool Empty() const {
+            return !has_memory && images.empty();
+        }
+    };
+    /// Into `out` (its storage reused draw after draw).
+    void TakeBarriers(TakenBarriers& out);
+    void RecordBarriers(const TakenBarriers& barriers);
 
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);

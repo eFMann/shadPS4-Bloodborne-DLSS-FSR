@@ -3,7 +3,9 @@
 
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/game_waits.h"
 #include "common/logging/log.h"
+#include "core/bb_frame_rate.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
@@ -11,6 +13,7 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
+#include "input/bb_route.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -140,7 +143,9 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    // With Bloodborne's frame rate hooks a frame is shown as soon as it comes (the game asks for
+    // every second vblank, 30 FPS).
+    driver->GetPort(handle)->flip_rate = Core::BbFrameRate::Active() ? 0 : rate;
     return ORBIS_OK;
 }
 
@@ -158,6 +163,7 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
         LOG_ERROR(Lib_VideoOut, "Invalid handle = {}", handle);
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
+    Input::BbRoute::OnGameFrame();
 
     if (flipMode != 1) {
         LOG_WARNING(Lib_VideoOut, "flipmode = {}", flipMode);
@@ -176,6 +182,7 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
     LOG_DEBUG(Lib_VideoOut, "bufferIndex = {}, flipMode = {}, flipArg = {}", bufferIndex, flipMode,
               flipArg);
 
+    const Common::GameWaits::Scope wait{"flip submit"};
     if (!driver->SubmitFlip(port, bufferIndex, flipArg)) {
         LOG_ERROR(Lib_VideoOut, "Flip queue is full");
         return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;

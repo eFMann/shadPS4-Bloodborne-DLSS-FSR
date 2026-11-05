@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -35,6 +36,12 @@ enum class MemoryType : u8 {
     Sparse,       ///< Requires an unbacked sparse resident buffer.
 };
 
+/// Where the per-draw data written by the CPU every frame lives (stream buffer, constant ring):
+/// graphics card memory the CPU writes across PCIe when Resizable BAR maps all of it, otherwise
+/// cached system memory the GPU reads (writes into the small 256 MiB BAR window are slow). The
+/// setting can force either. Decided once, logged.
+MemoryType DrawDataMemoryType(const Vulkan::Instance& instance);
+
 constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
@@ -42,6 +49,9 @@ constexpr vk::BufferUsageFlags ReadFlags =
 
 constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
+
+/// Removes the shader device address usage when buffer device address is not available.
+vk::BufferUsageFlags SupportedUsage(const Vulkan::Instance& instance, vk::BufferUsageFlags usage);
 
 struct UniqueBuffer {
     explicit UniqueBuffer(vk::Device device, VmaAllocator allocator);
@@ -54,7 +64,8 @@ struct UniqueBuffer {
         : device{other.device}, buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
           bda_addr{std::exchange(other.bda_addr, 0)},
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {}
+          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
+          vram_owner{std::exchange(other.vram_owner, ~0u)} {}
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -64,12 +75,13 @@ struct UniqueBuffer {
             bda_addr = std::exchange(other.bda_addr, 0);
             allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+            vram_owner = std::exchange(other.vram_owner, ~0u);
         }
         return *this;
     }
 
     void Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
-                VmaAllocationInfo* out_alloc_info);
+                VmaAllocationInfo* out_alloc_info, std::string_view owner_name = {});
 
     void Destroy();
 
@@ -78,6 +90,7 @@ struct UniqueBuffer {
     vk::DeviceAddress bda_addr{};
     VmaAllocator allocator;
     VmaAllocation allocation{};
+    u32 vram_owner{~0u}; ///< VramOwners slot of a device-local allocation
 };
 
 struct Buffer {

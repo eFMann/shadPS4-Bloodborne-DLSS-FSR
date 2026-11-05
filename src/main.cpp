@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -140,13 +141,21 @@ int main(int argc, char* argv[]) {
         bigPicture = true;
     }
 
+    const auto wait_start = std::chrono::steady_clock::now();
     if (waitPid)
         Core::Debugger::WaitForPid(*waitPid);
+    const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - wait_start)
+                               .count();
 
     // Initialize main log with default config
     Common::Log::Setup("shadps4.log");
 
     LOG_INFO(Debug, "Run: {}", fmt::join(std::span(argv, argc), " "));
+    if (waitPid) {
+        // A restart: how long the previous process took to end.
+        LOG_INFO(Debug, "Restart: waited {} ms for the previous process to end", waited_ms);
+    }
 
     IPC::Instance().Init();
 

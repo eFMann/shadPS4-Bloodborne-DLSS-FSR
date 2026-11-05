@@ -6,17 +6,23 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/bb_frame_rate.h"
+#include "core/bb_game_fixes.h"
+#include "core/bb_gx_draws.h"
 #include "core/bb_mouse_camera.h"
+#include "core/bb_resolution.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/bb_hdr_compat.h"
 #include "input/bb_kbm.h"
 #include "memory_patcher.h"
+#include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 
 namespace MemoryPatcher {
 
@@ -132,6 +138,49 @@ std::string convertValueToHex(const std::string type, const std::string valueStr
 
 void ApplyPendingPatches();
 
+// F1's resolution: every enabled patch's plain writes, checked before any applies, so a patch
+// that sets sizes F1 sets is skipped as a whole (Core::BbResolution::CheckPatch).
+static void CheckForResolution(const std::string& name, const std::string& address_str,
+                               const std::string& hex_value, bool little_endian, bool is_offset) {
+    std::vector<u8> bytes;
+    for (size_t i = 0; i + 1 < hex_value.size(); i += 2)
+        bytes.push_back(static_cast<u8>(std::strtoul(hex_value.substr(i, 2).c_str(), nullptr, 16)));
+    if (little_endian)
+        std::reverse(bytes.begin(), bytes.end());
+    u64 address = 0;
+    try {
+        address = std::stoull(address_str, nullptr, 16);
+    } catch (...) {
+        return;
+    }
+    Core::BbResolution::CheckPatch(name, is_offset ? address + 0x400000 : address, bytes);
+    Core::BbFrameRate::CheckPatch(name, is_offset ? address + 0x400000 : address, bytes.size());
+}
+
+static void CheckXmlForResolution(pugi::xml_node patchXML, std::string_view app_version) {
+    for (auto it = patchXML.children().begin(); it != patchXML.children().end(); ++it) {
+        if (std::string(it->name()) != "Metadata" ||
+            std::string(it->attribute("isEnabled").value()) != "true" ||
+            std::string(it->attribute("AppElf").value()) != g_eboot_name ||
+            std::string(it->attribute("AppVer").value()) != app_version)
+            continue;
+        const std::string name = it->attribute("Name").value();
+        for (auto line = it->first_child().children().begin();
+             line != it->first_child().children().end(); ++line) {
+            const std::string type = line->attribute("Type").value();
+            if (type == "mask" || type == "mask_jump32")
+                continue;
+            try {
+                CheckForResolution(name, line->attribute("Address").value(),
+                                   convertValueToHex(type, line->attribute("Value").value()),
+                                   type == "bytes16" || type == "bytes32" || type == "bytes64",
+                                   false);
+            } catch (...) {
+            }
+        }
+    }
+}
+
 void ApplyPatchesFromXML(std::filesystem::path path) {
     pugi::xml_document doc;
     pugi::xml_parse_result result = doc.load_file(path.c_str());
@@ -141,6 +190,7 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 
     if (result) {
         auto patchXML = doc.child("Patch");
+        CheckXmlForResolution(patchXML, app_version);
         for (pugi::xml_node_iterator it = patchXML.children().begin();
              it != patchXML.children().end(); ++it) {
 
@@ -224,6 +274,10 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 }
 
 void OnGameLoaded() {
+    // F1's resolution: decided first, so the patch file's resolution patches can be skipped.
+    Core::BbResolution::Prepare();
+    // The frame rate hooks: decided first too, so the patch file's frame rate patches are skipped.
+    Core::BbFrameRate::Prepare();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 
@@ -276,6 +330,10 @@ void OnGameLoaded() {
         }
     }
     ApplyPendingPatches();
+    Core::BbResolution::Install();
+    Core::BbGameFixes::Install();
+    Core::BbFrameRate::Install();
+    Core::BbGxDraws::Install();
     // Keyboard and mouse controls: the mouse turns Bloodborne's camera directly.
     if (Input::BbKbm::Active())
         Core::BbMouseCamera::Install();
@@ -291,6 +349,12 @@ void AddPatchToQueue(const patchInfo& patchToAdd) {
 
 void ApplyPendingPatches() {
     patches_applied = true;
+    // Patches sent by a launcher (IPC), checked as a whole like the patch file's.
+    for (const auto& patch : pending_patches)
+        if (patch.patchMask == PatchMask::None &&
+            (patch.gameSerial == "*" || patch.gameSerial == g_game_serial))
+            CheckForResolution(patch.modNameStr, patch.offsetStr, patch.valueStr,
+                               patch.littleEndian, patch.isOffset);
     for (size_t i = 0; i < pending_patches.size(); ++i) {
         const patchInfo& currentPatch = pending_patches[i];
 
@@ -306,6 +370,30 @@ void ApplyPendingPatches() {
 void PatchMemory(const patchInfo& patch) {
     if (Core::FileSys::BbHdrCompat::ShouldSkipPatch(patch.modNameStr)) {
         LOG_INFO(Loader, "[HDR-COMPAT] Skipped conflicting patch: {}", patch.modNameStr);
+        return;
+    }
+    // Kyo's Performance Patch bundles about 190 changes, among them lower precision render
+    // formats in place of the game's 16-bit float ones (as its "rgba8f color space" patch) and
+    // fixed 1080p sizes (the 1080p light grid among them), which break DLSS and FSR. Left out
+    // while an upscaler is installed; F1 says so.
+    if (patch.modNameStr.starts_with("Performance Patch") && Vulkan::BbTemporalDlssRequested()) {
+        static bool logged = false;
+        if (!std::exchange(logged, true))
+            LOG_INFO(Loader, "Skipped patch {}: it breaks the upscalers", patch.modNameStr);
+        return;
+    }
+    if (Core::BbFrameRate::ShouldSkipPatch(patch.modNameStr)) {
+        static std::string skipped;
+        if (std::exchange(skipped, patch.modNameStr) != patch.modNameStr)
+            LOG_INFO(Loader, "Frame rate: skipped patch {} (the frame rate hooks are on)",
+                     patch.modNameStr);
+        return;
+    }
+    if (Core::BbResolution::ShouldSkipPatch(patch.modNameStr)) {
+        static std::string skipped;
+        if (std::exchange(skipped, patch.modNameStr) != patch.modNameStr)
+            LOG_INFO(Loader, "Resolution: skipped patch {} (the resolution is set in F1)",
+                     patch.modNameStr);
         return;
     }
     // Send a request to modify the process memory.

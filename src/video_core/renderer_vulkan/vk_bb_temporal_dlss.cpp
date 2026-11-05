@@ -8,28 +8,40 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 #include <fmt/format.h>
+#include "common/bb_tuning.h"
+#include "common/crash_crumbs.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/bb_game_fixes.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/host_shaders/bb_dlss_composite_comp.h"
 #include "video_core/host_shaders/bb_dlss_composite_hdr_comp.h"
 #include "video_core/host_shaders/bb_dlss_linearize_comp.h"
 #include "video_core/host_shaders/bb_dlss_motion_comp.h"
+#include "video_core/host_shaders/bb_dlss_motion_debug_comp.h"
 #include "video_core/host_shaders/bb_dlss_sharpen_hdr_comp.h"
+#include "video_core/host_shaders/bb_hud_layer_comp.h"
 #include "video_core/host_shaders/bb_hudless_dim_comp.h"
+#include "video_core/renderer_vulkan/vk_bb_library.h"
+#include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
+#include "video_core/renderer_vulkan/vk_bb_stage_census.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_fsr4_addon.h"
 #include "video_core/renderer_vulkan/vk_fsr_upscaler.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_hdr_mod.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -88,7 +100,8 @@ BbDlssStatus BbTemporalDlssStatus() {
     copy.dlss_problem = ngx_problem;
     copy.fsr4_installed = Fsr4Addon::Present();
     if (!BbTemporalDlssRequested())
-        copy.reason = "No upscaler files were found next to shadPS4.exe.";
+        copy.reason =
+            "No upscaler files were found next to " BB_LIBRARY_NAME("shadPS4.exe", "shadps4") ".";
     else if (!copy.active && copy.reason.empty())
         copy.reason = "Waiting for gameplay (menus and loading screens use the normal image).";
     return copy;
@@ -138,6 +151,8 @@ constexpr u64 AlphaVelocityB = 0xb25e4fae;
 // Motion blur: two full-screen passes, each blurring the HDR scene (slot 0) along the half-size
 // motion buffer (slot 1) that the DepthProducer pass builds. Skipping them keeps that data.
 constexpr u64 MotionBlur = 0xe0305cef;
+// The same blur in some areas (Forbidden Woods): another pixel shader, same passes and slots.
+constexpr u64 MotionBlurAlt = 0x29e06868;
 // Copies the HDR scene (slot 0) into the target post-processing runs on. With the Decoupled UI
 // patches the scene is smaller than that target and this pass is the game's upscale.
 constexpr u64 HdrSceneCopy = 0xccbf44a6;
@@ -219,6 +234,25 @@ struct OwnedImage {
             bgr_view = make_view({S::eB, S::eG, S::eR, S::eOne});
         }
     }
+    // Decoupled UI HUD-less frames: written as the game writes its frame. The VideoOut buffers
+    // are not all the same format (UNORM and sRGB), and the game writes them all as UNORM: an
+    // sRGB one written as sRGB is encoded twice (washed out, every other frame).
+    vk::UniqueImageView target_view;
+    vk::Format target_view_format{};
+    vk::ImageView TargetView(vk::Format view_format) {
+        if (view_format == format || view_format == vk::Format::eUndefined)
+            return *view;
+        if (!target_view || target_view_format != view_format) {
+            target_view = Make(device.createImageViewUnique(
+                                   vk::ImageViewCreateInfo{.image = image.image,
+                                                           .viewType = vk::ImageViewType::e2D,
+                                                           .format = view_format,
+                                                           .subresourceRange = Range}),
+                               "temporal DLSS target view");
+            target_view_format = view_format;
+        }
+        return *target_view;
+    }
     // Opaque view as `view_format`, like the presenter's view of the game's own frame (the
     // image needs eMutableFormat).
     vk::ImageView FrameView(vk::Format view_format) {
@@ -238,7 +272,9 @@ struct OwnedImage {
     DlssNgx::Resource Resource() const {
         return {image.image, *view, Range, format, extent};
     }
-    void Transit(vk::CommandBuffer command, vk::ImageLayout next, vk::PipelineStageFlags2 stage,
+    /// `command`: a vk::CommandBuffer, or QueuedCommands (recorded by the recording thread).
+    template <typename Command>
+    void Transit(const Command& command, vk::ImageLayout next, vk::PipelineStageFlags2 stage,
                  vk::AccessFlags2 access) {
         const vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -257,6 +293,91 @@ struct OwnedImage {
         command.pipelineBarrier2(
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
         layout = next;
+    }
+};
+
+// Records like a vk::CommandBuffer, in order through the scheduler: the recording thread writes
+// the commands, so the caller doesn't wait for it to catch up first (as a direct command buffer
+// makes it do). Every argument is copied when the command is queued.
+struct QueuedCommands {
+    Scheduler& scheduler;
+
+    void pipelineBarrier2(const vk::DependencyInfo& info) const {
+        std::vector<vk::MemoryBarrier2> memory(info.pMemoryBarriers,
+                                               info.pMemoryBarriers + info.memoryBarrierCount);
+        std::vector<vk::BufferMemoryBarrier2> buffers(
+            info.pBufferMemoryBarriers, info.pBufferMemoryBarriers + info.bufferMemoryBarrierCount);
+        std::vector<vk::ImageMemoryBarrier2> images(
+            info.pImageMemoryBarriers, info.pImageMemoryBarriers + info.imageMemoryBarrierCount);
+        scheduler.Record([flags = info.dependencyFlags, memory = std::move(memory),
+                          buffers = std::move(buffers),
+                          images = std::move(images)](vk::CommandBuffer command) {
+            command.pipelineBarrier2(
+                vk::DependencyInfo{.dependencyFlags = flags,
+                                   .memoryBarrierCount = static_cast<u32>(memory.size()),
+                                   .pMemoryBarriers = memory.data(),
+                                   .bufferMemoryBarrierCount = static_cast<u32>(buffers.size()),
+                                   .pBufferMemoryBarriers = buffers.data(),
+                                   .imageMemoryBarrierCount = static_cast<u32>(images.size()),
+                                   .pImageMemoryBarriers = images.data()});
+        });
+    }
+    void bindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) const {
+        scheduler.Record([point, pipeline](vk::CommandBuffer command) {
+            command.bindPipeline(point, pipeline);
+        });
+    }
+    void pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout, u32 set,
+                              std::span<const vk::WriteDescriptorSet> writes) const {
+        // The writes' image and buffer infos are copied too; the pointers are set again when
+        // the command is recorded.
+        std::vector<vk::WriteDescriptorSet> copied(writes.begin(), writes.end());
+        std::vector<vk::DescriptorImageInfo> images;
+        std::vector<vk::DescriptorBufferInfo> buffers;
+        for (const auto& write : writes) {
+            if (write.pImageInfo) {
+                images.insert(images.end(), write.pImageInfo,
+                              write.pImageInfo + write.descriptorCount);
+            }
+            if (write.pBufferInfo) {
+                buffers.insert(buffers.end(), write.pBufferInfo,
+                               write.pBufferInfo + write.descriptorCount);
+            }
+        }
+        scheduler.Record([point, layout, set, writes = std::move(copied),
+                          images = std::move(images),
+                          buffers = std::move(buffers)](vk::CommandBuffer command) mutable {
+            size_t image = 0, buffer = 0;
+            for (auto& write : writes) {
+                if (write.pImageInfo) {
+                    write.pImageInfo = images.data() + image;
+                    image += write.descriptorCount;
+                }
+                if (write.pBufferInfo) {
+                    write.pBufferInfo = buffers.data() + buffer;
+                    buffer += write.descriptorCount;
+                }
+            }
+            command.pushDescriptorSetKHR(point, layout, set, writes);
+        });
+    }
+    void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, u32 offset, u32 size,
+                       const void* values) const {
+        std::array<u8, 128> data{};
+        ASSERT(size <= data.size());
+        std::memcpy(data.data(), values, size);
+        scheduler.Record([layout, stages, offset, size, data](vk::CommandBuffer command) {
+            command.pushConstants(layout, stages, offset, size, data.data());
+        });
+    }
+    void dispatch(u32 x, u32 y, u32 z) const {
+        scheduler.Record([x, y, z](vk::CommandBuffer command) { command.dispatch(x, y, z); });
+    }
+    void copyImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
+                   vk::ImageLayout dst_layout, const vk::ImageCopy& region) const {
+        scheduler.Record([=](vk::CommandBuffer command) {
+            command.copyImage(src, src_layout, dst, dst_layout, region);
+        });
     }
 };
 
@@ -318,8 +439,12 @@ sharpness=0.6
 # The game's motion blur: 0 = off (sharper in motion), 1 = on
 motion_blur=0
 
-# Full-screen menus (inventory, pause) show the game's own image instead of the upscaled one,
-# so the scene does not shimmer behind them: 1 = on, 0 = off
+# Exact motion for characters, cloth and enemies (less smearing): 1 = on, 0 = off.
+# Turning it on or off completely needs a restart.
+character_motion=1
+
+# The HUD, menus and dialogue drawn as their own layer over the upscaled scene, so the scene
+# does not shimmer through their see-through parts: 1 = on, 0 = off
 menu_fix=1
 
 # -1 = automatic, 0 = DLAA, 1 = Quality, 2 = Balanced, 3 = Performance, 4 = Ultra Performance
@@ -332,6 +457,9 @@ output=
 struct Tune {
     bool enabled = true;
     bool jitter = true;
+    // Test: also jitter single quads drawn with the scene depth that test and write it
+    // (billboards, cards, sprites); full-screen passes do neither.
+    bool jitter_small = false;
     float sign_x = 1.f, sign_y = 1.f;
     bool mirror = true;
     bool hud = true;
@@ -352,6 +480,9 @@ struct Tune {
     int quality = -1;      // -1: from scale
     int upscaler = 0;      // 0 automatic, 1 DLSS, 2 FSR 3.1, 3 FSR 4
     bool motion_blur = false;
+    bool character_motion = true; // skinned meshes' own motion vectors (vk_bb_object_motion)
+    // The HUD as its own layer, as see-through as measured between frames (see
+    // bb_hud_layer.comp), over the upscaled scene.
     bool menu_fix = true;
     bool auto_exposure = true;    // HDR input (decoupled UI): FSR computes the exposure
     bool texture_lod_bias = true; // sharper scene textures while upscaling (BbSceneMipBias)
@@ -366,6 +497,9 @@ const char* BackendName(Backend backend) {
 
 struct BbTemporalDlss::Impl {
     bool requested{}, failed{}, stopped{};
+    // A DLSS evaluation the recording thread found failed (1: failed, 2: decoupled UI mode
+    // unsupported); seen at the next evaluation.
+    std::atomic<int> evaluate_failed{0};
     Tune tune;
     std::filesystem::path tune_path;
     std::filesystem::file_time_type tune_time{};
@@ -379,6 +513,10 @@ struct BbTemporalDlss::Impl {
     u32 jittered_before_copy{};
     bool camera_constants{}, velocity_constants{};
     u32 jittered_draws{};
+    // Scene-depth draws of one quad (4-6 indices) this frame: left unjittered, and those of them
+    // that test and write depth (jittered with jitter_small).
+    u32 small_draws{}, small_depth_draws{};
+    u64 small_report_frame{};
     u64 frame{};
     std::array<float, 2> jitter{};
     std::chrono::steady_clock::time_point last_frame{};
@@ -409,6 +547,9 @@ struct BbTemporalDlss::Impl {
     // and the game's display copy of it per VideoOut buffer (the frame without the HUD).
     std::optional<VideoCore::ImageId> last_copy_source;
     vk::Format last_copy_format{};
+    // The display copy's whole view of its source (format and swizzle: Bloodborne's swaps red
+    // and blue), for the Decoupled UI HUD-less snapshot.
+    std::optional<VideoCore::ImageViewInfo> last_copy_view;
     std::unique_ptr<OwnedImage> hud_snapshot, hud_dimmed;
     bool hud_snapshot_taken{};
     std::unordered_map<VAddr, std::unique_ptr<OwnedImage>> decoupled_hudless;
@@ -440,7 +581,30 @@ struct BbTemporalDlss::Impl {
     };
     std::vector<FrameCamera> frame_cameras;
     u64 scene_camera_frames{};
+    // Motion blur watch (the whole picture but the character blurred after a respawn): the
+    // game's own motion blur matrix from the depth producer's constants, against the camera.
+    struct BlurWatch {
+        bool sampled{};
+        std::array<float, 16> matrix{};
+        float shift_px{};
+        std::array<float, 2> velocity_scale{};
+        u32 blur_draws{};
+        u32 frames{}, sampled_frames{}, still_frames{}, still_blurred{}, blur_frames{};
+        float max_shift{}, sum_shift{};
+        u32 streak{};
+        bool loading{};
+        u64 after_load_frame{};
+        std::chrono::steady_clock::time_point window_start{std::chrono::steady_clock::now()};
+    } blur;
     std::unique_ptr<OwnedImage> snapshot, motion, upscaled;
+    // The HUD as its own layer (render size): this frame's and the last frame's game frame and
+    // scene (with k and its confidence), alternating, and the layer itself.
+    std::array<std::unique_ptr<OwnedImage>, 2> hud_finals, hud_scenes;
+    std::unique_ptr<OwnedImage> hud_layer_image;
+    std::unique_ptr<VideoCore::Buffer> hud_dimming; // its histogram of the even darkening
+    u32 hud_last{};
+    bool hud_history{};
+    bool hud_layer_on{};                      // the last composite drew the HUD layer
     std::unique_ptr<OwnedImage> linear_color; // FSR 4 input
     std::unique_ptr<OwnedImage> sharpened;    // decoupled UI: the upscaled scene, sharpened
     // Frame generation reads depth and motion when the frame is presented, after later frames
@@ -458,17 +622,20 @@ struct BbTemporalDlss::Impl {
     u32 producer_constants{}, producer_depths{}, velocity_draw_constants{};
     std::unordered_map<VAddr, std::unique_ptr<OwnedImage>> outputs;
     std::unique_ptr<ComputePass> motion_pass, composite_pass, composite_hdr_pass, linearize_pass,
-        sharpen_pass, hudless_dim_pass;
+        sharpen_pass, hudless_dim_pass, motion_debug_pass, hud_layer_pass;
     vk::UniqueSampler nearest, linear;
     Backend backend{};
-    // Menus cover most of the screen; while one is open the scene is not jittered and the game's
-    // own frame is shown, so the render-size scene cannot shimmer through the menu panels.
+    // Menus cover much of the screen. Where the HUD layer can't be drawn (RenoDX), the scene is
+    // not jittered while one is open, so the render-size scene seen through the see-through menu
+    // panels cannot shimmer. The scene stays upscaled.
     std::unique_ptr<VideoCore::Buffer> coverage, dimming;
     bool menu{};
     std::unique_ptr<FsrUpscaler> fsr;
     std::unique_ptr<Fsr4Addon> fsr4;
     std::optional<Fsr4Addon::ContextDesc> fsr4_rejected_size;
     bool fsr_tried{}, fsr4_tried{}, camera_logged{};
+    BbObjectMotion* object_motion{};
+    u64 character_motion_frames{};
 
     Impl() {
         requested = BbTemporalDlssRequested();
@@ -502,6 +669,8 @@ struct BbTemporalDlss::Impl {
                 next.enabled = number != 0;
             else if (key == "jitter")
                 next.jitter = number != 0;
+            else if (key == "jitter_small")
+                next.jitter_small = number != 0;
             else if (key == "jitter_sign_x") // multiplier sent to DLSS (sign and scale)
                 next.sign_x = std::clamp(float(std::atof(value.c_str())), -4.f, 4.f);
             else if (key == "jitter_sign_y")
@@ -546,6 +715,8 @@ struct BbTemporalDlss::Impl {
                 next.texture_lod_bias = number != 0;
             else if (key == "motion_blur")
                 next.motion_blur = number != 0;
+            else if (key == "character_motion")
+                next.character_motion = number != 0;
             else if (key == "upscaler")
                 next.upscaler = value.starts_with("dlss")   ? 1
                                 : value.starts_with("fsr4") ? 3
@@ -561,15 +732,19 @@ struct BbTemporalDlss::Impl {
             }
         }
         tune = next;
+        if (object_motion)
+            object_motion->SetActive(tune.character_motion);
         FrameGen::SetEnabled(tune.frame_gen);
         FrameGen::SetCounterVisible(tune.fps_counter);
         FrameGen::SetMultiplier(tune.fg_multiplier);
         FrameGen::SetReflex(tune.fg_reflex, tune.fg_reflex_sleep);
         LOG_INFO(Render_Vulkan,
                  "[DLSS-TEMPORAL] Settings: enabled={} upscaler={} jitter={} sign=({},{}) "
-                 "object_motion={} hud={} debug_motion={} quality={} output={}x{}",
+                 "object_motion={} character_motion={} texture_lod_bias={} hud={} "
+                 "debug_motion={} quality={} output={}x{}",
                  tune.enabled, tune.upscaler, tune.jitter, tune.sign_x, tune.sign_y, tune.mirror,
-                 tune.hud, tune.debug_motion, tune.quality, tune.output.width, tune.output.height);
+                 tune.character_motion, tune.texture_lod_bias, tune.hud, tune.debug_motion,
+                 tune.quality, tune.output.width, tune.output.height);
     }
 
     void EnsurePipelines(const Instance& instance) {
@@ -578,11 +753,12 @@ struct BbTemporalDlss::Impl {
         const auto device = instance.GetDevice();
         using T = vk::DescriptorType;
         static constexpr std::array motion_types{T::eCombinedImageSampler, T::eCombinedImageSampler,
-                                                 T::eStorageImage, T::eStorageBuffer};
+                                                 T::eStorageImage, T::eStorageBuffer,
+                                                 T::eCombinedImageSampler};
         static constexpr std::array composite_types{
             T::eCombinedImageSampler, T::eCombinedImageSampler, T::eCombinedImageSampler,
             T::eCombinedImageSampler, T::eStorageImage,         T::eCombinedImageSampler,
-            T::eStorageBuffer,        T::eStorageBuffer};
+            T::eStorageBuffer,        T::eStorageBuffer,        T::eCombinedImageSampler};
         motion_pass = std::make_unique<ComputePass>(device, motion_types, BB_DLSS_MOTION_COMP, 96);
         composite_pass =
             std::make_unique<ComputePass>(device, composite_types, BB_DLSS_COMPOSITE_COMP, 8);
@@ -593,11 +769,21 @@ struct BbTemporalDlss::Impl {
             std::make_unique<ComputePass>(device, linearize_types, BB_DLSS_LINEARIZE_COMP, 4);
         sharpen_pass =
             std::make_unique<ComputePass>(device, linearize_types, BB_DLSS_SHARPEN_HDR_COMP, 4);
+        static constexpr std::array motion_debug_types{T::eCombinedImageSampler,
+                                                       T::eCombinedImageSampler, T::eStorageImage};
+        motion_debug_pass =
+            std::make_unique<ComputePass>(device, motion_debug_types, BB_DLSS_MOTION_DEBUG_COMP, 4);
         static constexpr std::array hudless_dim_types{T::eCombinedImageSampler,
                                                       T::eCombinedImageSampler, T::eStorageImage,
                                                       T::eStorageBuffer};
         hudless_dim_pass =
             std::make_unique<ComputePass>(device, hudless_dim_types, BB_HUDLESS_DIM_COMP, 4);
+        static constexpr std::array hud_layer_types{
+            T::eCombinedImageSampler, T::eCombinedImageSampler, T::eCombinedImageSampler,
+            T::eCombinedImageSampler, T::eStorageImage,         T::eStorageImage,
+            T::eStorageImage,         T::eStorageBuffer};
+        hud_layer_pass =
+            std::make_unique<ComputePass>(device, hud_layer_types, BB_HUD_LAYER_COMP, 4);
         const auto sampler = [&](vk::Filter filter) {
             return Make(device.createSamplerUnique(vk::SamplerCreateInfo{
                             .magFilter = filter,
@@ -616,6 +802,9 @@ struct BbTemporalDlss::Impl {
     vk::Extent2D OutputFor(vk::Extent2D in) const {
         if (tune.output.width && tune.output.height)
             return BbUpscaleOutput(in, tune.output, true);
+        // F1's Regular resolution mode: its output size.
+        if (const u64 f1 = Common::BbTuning::upscale_output.load(std::memory_order_relaxed))
+            return BbUpscaleOutput(in, {u32(f1 >> 32), u32(f1)}, true);
         const auto window = display.load();
         return BbUpscaleOutput(in, {u32(window >> 32), u32(window)});
     }
@@ -630,13 +819,152 @@ struct BbTemporalDlss::Impl {
     }
 
     // After each evaluation attempt: per-frame guide inputs restart and the jitter advances.
+    // Largest shift, in pixels at 1280x720, that the game's motion blur matrix (previous to
+    // current clip space, rows) gives a grid of points on screen at a near and a far depth.
+    static float BlurShiftPx(const std::array<float, 16>& rows) {
+        float worst = 0.0f;
+        for (const float x : {-0.8f, 0.0f, 0.8f}) {
+            for (const float y : {-0.8f, 0.0f, 0.8f}) {
+                for (const float z : {0.1f, 0.9f}) {
+                    const std::array<float, 4> p{x, y, z, 1.0f};
+                    std::array<float, 4> q{};
+                    for (int i = 0; i < 4; ++i) {
+                        for (int k = 0; k < 4; ++k) {
+                            q[i] += rows[i * 4 + k] * p[k];
+                        }
+                    }
+                    if (!std::isfinite(q[0]) || !std::isfinite(q[1]) || !(std::abs(q[3]) > 1e-6f))
+                        return std::numeric_limits<float>::infinity();
+                    worst = std::max(
+                        worst, std::hypot((q[0] / q[3] - x) * 640.0f, (q[1] / q[3] - y) * 360.0f));
+                }
+            }
+        }
+        return worst;
+    }
+
+    // How far the game's blur matrix (last frame's position of each pixel) is from "nothing
+    // moved": its largest difference from the identity. With the camera still it should be ~0;
+    // BlurShiftPx's test depths (0.1, 0.9) read huge shifts from matrices that are fine near the
+    // depths the game actually uses, so it cannot tell a stuck matrix from a good one.
+    static float MatrixOffIdentity(const std::array<float, 16>& rows) {
+        float worst = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            const float expected = (i % 5 == 0) ? 1.0f : 0.0f;
+            const float diff = std::abs(rows[i] - expected);
+            if (!std::isfinite(diff))
+                return std::numeric_limits<float>::infinity();
+            worst = std::max(worst, diff);
+        }
+        return worst;
+    }
+
+    float CameraChange() const {
+        if (!camera.valid || !previous_camera.valid)
+            return -1.0f;
+        double change = 0.0;
+        for (size_t i = 0; i < camera.view.size(); ++i)
+            change = std::max(change, std::abs(camera.view[i] - previous_camera.view[i]));
+        return float(change);
+    }
+
+    std::string DescribeBlurFrame(float camera_change) const {
+        return fmt::format(
+            "game blur matrix shifts the image up to {:.1f} px, {:.4f} from not moving | camera "
+            "change {} | blur passes "
+            "{} (game motion blur {}) | velocity scale {:.4g} {:.4g} | depth {} at {:#x} | "
+            "matrix rows [{:.5f} {:.5f} {:.5f} {:.5f}] [{:.5f} {:.5f} {:.5f} {:.5f}] [{:.5f} "
+            "{:.5f} {:.5f} {:.5f}] [{:.5f} {:.5f} {:.5f} {:.5f}]",
+            blur.shift_px, MatrixOffIdentity(blur.matrix),
+            camera_change < 0.0f ? std::string{"unknown"} : fmt::format("{:.5f}", camera_change),
+            blur.blur_draws, tune.motion_blur ? "on" : "off", blur.velocity_scale[0],
+            blur.velocity_scale[1], depth_fallback ? "from another pass" : "from the producer",
+            producer_depth_address, blur.matrix[0], blur.matrix[1], blur.matrix[2], blur.matrix[3],
+            blur.matrix[4], blur.matrix[5], blur.matrix[6], blur.matrix[7], blur.matrix[8],
+            blur.matrix[9], blur.matrix[10], blur.matrix[11], blur.matrix[12], blur.matrix[13],
+            blur.matrix[14], blur.matrix[15]);
+    }
+
+    void FinishBlurFrame() {
+        // A still camera whose blur matrix is this far from "nothing moved" blurs the picture.
+        constexpr float MovingMatrix = 0.01f;
+        constexpr float StillCamera = 1e-3f;
+        const float camera_change = CameraChange();
+        ++blur.frames;
+        blur.blur_frames += blur.blur_draws != 0;
+        if (blur.sampled) {
+            ++blur.sampled_frames;
+            blur.max_shift = std::max(blur.max_shift, blur.shift_px);
+            blur.sum_shift += std::isfinite(blur.shift_px) ? blur.shift_px : 0.0f;
+            const bool still = camera_change >= 0.0f && camera_change < StillCamera;
+            blur.still_frames += still;
+            if (still && MatrixOffIdentity(blur.matrix) > MovingMatrix) {
+                ++blur.still_blurred;
+                if (++blur.streak == 30)
+                    LOG_WARNING(Render_Vulkan,
+                                "[BB-BLUR] Camera still for 30 frames but the game's motion "
+                                "blur matrix still moves the image (the picture is blurred): {}",
+                                DescribeBlurFrame(camera_change));
+            } else {
+                if (blur.streak >= 30)
+                    LOG_INFO(Render_Vulkan,
+                             "[BB-BLUR] Game blur matrix back to the camera after {} frames",
+                             blur.streak);
+                blur.streak = 0;
+            }
+        }
+        const bool loading = Core::BbGameFixes::IsLoadingScreen();
+        if (blur.loading && !loading)
+            blur.after_load_frame = frame;
+        blur.loading = loading;
+        if (blur.after_load_frame && frame - blur.after_load_frame <= 300 &&
+            (frame - blur.after_load_frame) % 60 == 0)
+            LOG_INFO(Render_Vulkan, "[BB-BLUR] {} frames after the loading screen: {}{}",
+                     frame - blur.after_load_frame, blur.sampled ? "" : "(no depth producer) ",
+                     DescribeBlurFrame(camera_change));
+        const auto now = std::chrono::steady_clock::now();
+        if (now - blur.window_start >= std::chrono::seconds{10}) {
+            if (blur.frames != 0)
+                LOG_INFO(Render_Vulkan,
+                         "[BB-BLUR] last 10 s: {} frames, {} with the depth producer, {} with "
+                         "motion blur passes | game blur matrix shift avg {:.1f} px, max {:.1f} "
+                         "px | camera still in {} frames, {} of them with a moving blur matrix "
+                         "(over {:.2f} from not moving)",
+                         blur.frames, blur.sampled_frames, blur.blur_frames,
+                         blur.sampled_frames ? blur.sum_shift / blur.sampled_frames : 0.0f,
+                         blur.max_shift, blur.still_frames, blur.still_blurred, MovingMatrix);
+            const auto streak = blur.streak;
+            const auto loading_state = blur.loading;
+            const auto after_load = blur.after_load_frame;
+            blur = {};
+            blur.streak = streak;
+            blur.loading = loading_state;
+            blur.after_load_frame = after_load;
+            blur.window_start = now;
+        }
+        blur.sampled = false;
+        blur.blur_draws = 0;
+    }
+
     void FrameBoundary(Scheduler& scheduler, BbVelocityMirror& mirror) {
+        FinishBlurFrame();
+        if (frame - small_report_frame >= 600) {
+            small_report_frame = frame;
+            LOG_INFO(Render_Vulkan,
+                     "[DLSS-TEMPORAL] Jitter: {} draws jittered this frame; {} single-quad scene "
+                     "draws not jittered by the usual rule, {} of them testing and writing "
+                     "depth (jitter_small={})",
+                     jittered_draws, small_draws, small_depth_draws, tune.jitter_small);
+        }
+        small_draws = small_depth_draws = 0;
         camera_constants = velocity_constants = depth_learned = false;
         jittered_draws = jittered_before_copy = 0;
         producer_constants = producer_depths = velocity_draw_constants = 0;
         r32_depth.reset();
         depth_fallback = false;
-        mirror.ConsumeFrame(scheduler.CommandBuffer()); // start a fresh mirror every frame
+        mirror.ConsumeFrame(scheduler); // start a fresh mirror every frame
+        if (object_motion)
+            object_motion->OnFrameStart();
         ++frame;
         AdvanceJitter();
     }
@@ -709,8 +1037,12 @@ struct BbTemporalDlss::Impl {
         const auto dlss = DlssProblem();
         const std::string no_fsr =
             FsrUpscaler::Present()
-                ? "FSR could not be loaded (amd_fidelityfx_vk.dll is damaged or incompatible)."
-                : "FSR needs amd_fidelityfx_vk.dll next to shadPS4.exe.";
+                ? BB_LIBRARY_NAME(
+                      "FSR could not be loaded (amd_fidelityfx_vk.dll is damaged or incompatible).",
+                      "FSR could not be loaded (libamd_fidelityfx_vk.so is damaged or "
+                      "incompatible).")
+                : BB_LIBRARY_NAME("FSR needs amd_fidelityfx_vk.dll next to shadPS4.exe.",
+                                  "FSR needs libamd_fidelityfx_vk.so next to shadps4.");
         if (tune.upscaler == 1)
             return dlss.empty() ? "DLSS is not available on this system." : dlss;
         if (tune.upscaler == 2)
@@ -721,7 +1053,8 @@ struct BbTemporalDlss::Impl {
             return Fsr4Addon::Present()
                        ? "FSR 4 could not start (see the log; it needs a Radeon RX 6000 / RTX "
                          "or newer GPU and the complete fsr4 folder)."
-                       : "FSR 4 needs the FSR 4 add-on (the fsr4 folder next to shadPS4.exe).";
+                       : "FSR 4 needs the FSR 4 add-on (the fsr4 folder next to " BB_LIBRARY_NAME(
+                             "shadPS4.exe", "shadps4") ").";
         }
         return (dlss.empty() ? std::string{} : dlss + " ") + no_fsr;
     }
@@ -750,7 +1083,7 @@ struct BbTemporalDlss::Impl {
 
     // Copies this frame's depth and motion for frame generation and describes its camera.
     void CaptureFrameGen(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
-                         vk::CommandBuffer command, VideoCore::Image& depth, vk::Extent2D in,
+                         const QueuedCommands& command, VideoCore::Image& depth, vk::Extent2D in,
                          const DlssNgx::EvalDesc& eval) {
         frame_gen_pending.reset();
         if (!FrameGen::Active() || !frame_has_camera || !camera.valid || !previous_camera.valid ||
@@ -921,9 +1254,15 @@ struct BbTemporalDlss::Impl {
                                                       size, U::eSampled | U::eStorage);
         }
         const auto command = scheduler.CommandBuffer(); // after Finish(), see RunDlss
+        // Read as the display copy reads it, swizzle included: the replay feeds this to the
+        // display copy in place of its source, and the dimming pass compares it with that view.
         VideoCore::ImageViewInfo view_info{};
-        view_info.format = last_copy_format != vk::Format::eUndefined ? last_copy_format
-                                                                      : target.info.pixel_format;
+        if (last_copy_view)
+            view_info = *last_copy_view;
+        else
+            view_info.format = last_copy_format != vk::Format::eUndefined
+                                   ? last_copy_format
+                                   : target.info.pixel_format;
         const auto& view = target.FindView(view_info);
         runtime.Transit(&target, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -961,7 +1300,8 @@ struct BbTemporalDlss::Impl {
 
     // At a Decoupled UI display copy: draw it again from the HUD-less snapshot.
     void ReplayHudless(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
-                       VideoCore::TextureCache& cache, VideoCore::Image& target) {
+                       VideoCore::TextureCache& cache, VideoCore::Image& target,
+                       vk::Format target_view_format) {
         auto& slot = decoupled_hudless[target.info.guest_address];
         const vk::Extent2D size{target.info.size.width, target.info.size.height};
         scheduler.EndRendering();
@@ -1054,10 +1394,11 @@ struct BbTemporalDlss::Impl {
         slot->Transit(command, vk::ImageLayout::eColorAttachmentOptimal,
                       vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                       vk::AccessFlagBits2::eColorAttachmentWrite);
-        display_copy_replay = DisplayCopyReplay{.shader_hash = DisplayCopy,
-                                                .extent = size,
-                                                .hudless_input = *hud_dimmed->view,
-                                                .hudless_output = *slot->view};
+        display_copy_replay = DisplayCopyReplay{
+            .shader_hash = DisplayCopy,
+            .extent = size,
+            .hudless_input = *hud_dimmed->view,
+            .hudless_output = renodx ? *slot->view : slot->TargetView(target_view_format)};
         replay_hudless = slot.get();
         slot->fresh = true;
         scheduler.GetDynamicState().Invalidate();
@@ -1071,8 +1412,18 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                                    VideoCore::TextureCache& cache, BbVelocityMirror& mirror,
                                    VideoCore::Image& source, bool pre_hud,
                                    std::optional<vk::Extent2D> upscale_to) {
+    if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(&scheduler)) {
+        profiler->Mark(0xD155ull, [] { return std::string{"DLSS (temporal upscale and passes)"}; });
+    }
     const bool hdr = upscale_to.has_value();
+    Common::Crumbs::Add("upscaler: evaluate (width, height)", source.info.size.width,
+                        source.info.size.height);
     auto* ngx = instance.GetDlssNgx();
+    if (const int failure = evaluate_failed.exchange(0, std::memory_order_relaxed)) {
+        (failure == 2 ? decoupled_unsupported : failed) = true;
+        LOG_ERROR(Render_Vulkan, "[DLSS-TEMPORAL] Evaluation failed; stock rendering");
+        return false;
+    }
     const vk::Extent2D in{source.info.size.width, source.info.size.height};
     VideoCore::Image* depth =
         r32_depth ? cache.TryGetImage(r32_depth->id, r32_depth->uid) : nullptr;
@@ -1212,8 +1563,10 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     }
 
     // Only now: the Finish() calls above submit the command buffer, and recording into a
-    // submitted one crashes AMD's driver.
-    const auto command = scheduler.CommandBuffer();
+    // submitted one crashes AMD's driver. Queued: a direct command buffer here made the draw
+    // recorder wait for the recording thread (about 0.5 ms a frame, mostly the velocity mirror's
+    // batch recorded just before).
+    const QueuedCommands command{scheduler};
     // Snapshot of the scene as DLSS color input (pre-HUD at the first Scaleform draw).
     VideoCore::ImageViewInfo source_info{};
     source_info.format = vk::Format::eR8G8B8A8Unorm;
@@ -1271,7 +1624,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                       vk::AccessFlagBits2::eShaderRead);
 
     // Motion: camera reprojection, replaced by object velocity where the mirror covers.
-    const auto mirror_frame = mirror.ConsumeFrame(command);
+    const auto mirror_frame = mirror.ConsumeFrame(scheduler);
     mirror.SetTargetSize(in);
     const bool use_mirror =
         tune.mirror && velocity_constants && mirror_frame && mirror_frame->extent == in;
@@ -1291,13 +1644,23 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                     vk::AccessFlagBits2::eShaderWrite);
     const bool jittered = tune.jitter && jittered_draws > 0;
     const std::array<float, 2> applied = jittered ? jitter : std::array<float, 2>{};
+    // Character motion: the skinned meshes' own vectors, written with the G-buffer.
+    bool character_valid = false;
+    vk::ImageView character_view{};
+    if (object_motion && object_motion->Enabled())
+        character_view = object_motion->PrepareRead(in.width, in.height, character_valid);
+    if (character_valid)
+        ++character_motion_frames;
     {
         const std::array images{
             vk::DescriptorImageInfo{*nearest, *depth_view.image_view,
                                     vk::ImageLayout::eShaderReadOnlyOptimal},
             vk::DescriptorImageInfo{*nearest, use_mirror ? mirror_frame->view : *snapshot->view,
                                     vk::ImageLayout::eShaderReadOnlyOptimal},
-            vk::DescriptorImageInfo{{}, *motion->view, vk::ImageLayout::eGeneral}};
+            vk::DescriptorImageInfo{{}, *motion->view, vk::ImageLayout::eGeneral},
+            vk::DescriptorImageInfo{*nearest, character_view ? character_view : *snapshot->view,
+                                    character_view ? vk::ImageLayout::eGeneral
+                                                   : vk::ImageLayout::eShaderReadOnlyOptimal}};
         const vk::DescriptorBufferInfo buffer{coefficients->Handle(), 0, CoefficientBytes};
         const std::array writes{
             vk::WriteDescriptorSet{.dstBinding = 0,
@@ -1315,7 +1678,11 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
             vk::WriteDescriptorSet{.dstBinding = 3,
                                    .descriptorCount = 1,
                                    .descriptorType = vk::DescriptorType::eStorageBuffer,
-                                   .pBufferInfo = &buffer}};
+                                   .pBufferInfo = &buffer},
+            vk::WriteDescriptorSet{.dstBinding = 4,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                   .pImageInfo = &images[3]}};
         struct {
             float reproject[12];
             float proj[4], prev_proj[4];
@@ -1356,7 +1723,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         push.jitter[0] = applied[0];
         push.jitter[1] = applied[1];
         push.use_mirror = use_mirror ? 1u : 0u;
-        push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u);
+        push.flags =
+            (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u) | (character_valid ? 4u : 0u);
         command.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_pass->pipeline);
         command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *motion_pass->layout, 0,
                                      writes);
@@ -1419,21 +1787,76 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     const DlssNgx::EvalDesc eval{(tune.swap ? applied[1] : applied[0]) * tune.sign_x,
                                  (tune.swap ? applied[0] : applied[1]) * tune.sign_y, reset,
                                  frame_ms};
-    const bool success =
-        backend == Backend::Dlss
-            ? ngx->Evaluate(command, (linear ? linear_color : snapshot)->Resource(), depth_resource,
-                            motion->Resource(), upscaled->Resource(), eval)
-        : backend == Backend::Fsr4
-            ? fsr4->Evaluate(command, (linear ? linear_color : snapshot)->Resource(),
-                             depth_resource, motion->Resource(), upscaled->Resource(), eval,
-                             FsrCamera(), hdr ? (tune.auto_exposure ? 1 : 2) : 0)
-            : fsr->Evaluate(command, (linear ? linear_color : snapshot)->Resource(), depth_resource,
-                            motion->Resource(), upscaled->Resource(), eval, FsrCamera());
+    bool success = true;
+    if (backend == Backend::Dlss) {
+        // Recorded by the recording thread like the passes around it; a failure is seen at the
+        // next evaluation (stock rendering from then on, as before).
+        scheduler.Record([ngx, color = (linear ? linear_color : snapshot)->Resource(),
+                          depth_resource, motion_resource = motion->Resource(),
+                          output_resource = upscaled->Resource(), eval, failure = &evaluate_failed,
+                          mode = upscale_to ? 2 : 1](vk::CommandBuffer cmdbuf) {
+            const auto start = std::chrono::steady_clock::now();
+            if (!ngx->Evaluate(cmdbuf, color, depth_resource, motion_resource, output_resource,
+                               eval)) {
+                failure->store(mode, std::memory_order_relaxed);
+            }
+            RecordingCosts::upscaler_ns.fetch_add(
+                (std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+            RecordingCosts::upscaler_calls.fetch_add(1, std::memory_order_relaxed);
+        });
+    } else {
+        // FSR 4 waits for and tracks its own submissions through the scheduler: recorded here.
+        const auto direct = scheduler.CommandBuffer();
+        success = backend == Backend::Fsr4
+                      ? fsr4->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
+                                       depth_resource, motion->Resource(), upscaled->Resource(),
+                                       eval, FsrCamera(), hdr ? (tune.auto_exposure ? 1 : 2) : 0)
+                      : fsr->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
+                                      depth_resource, motion->Resource(), upscaled->Resource(),
+                                      eval, FsrCamera());
+    }
     scheduler.GetDynamicState().Invalidate(); // the upscaler records its own Vulkan state
     if (!success) {
         (upscale_to ? decoupled_unsupported : failed) = true;
         LOG_ERROR(Render_Vulkan, "[DLSS-TEMPORAL] Evaluation failed; stock rendering");
         return false;
+    }
+    if (upscale_to && tune.debug_motion) {
+        // The composite (and its motion view) does not run when the upscaled image replaces
+        // the game's own upscale: draw the motion view over the upscaled image instead.
+        motion->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        upscaled->Transit(command, vk::ImageLayout::eGeneral,
+                          vk::PipelineStageFlagBits2::eComputeShader,
+                          vk::AccessFlagBits2::eShaderWrite);
+        const std::array images{
+            vk::DescriptorImageInfo{*nearest, *motion->view,
+                                    vk::ImageLayout::eShaderReadOnlyOptimal},
+            vk::DescriptorImageInfo{*nearest, character_view ? character_view : *motion->view,
+                                    character_view ? vk::ImageLayout::eGeneral
+                                                   : vk::ImageLayout::eShaderReadOnlyOptimal},
+            vk::DescriptorImageInfo{{}, *upscaled->view, vk::ImageLayout::eGeneral}};
+        const std::array writes{
+            vk::WriteDescriptorSet{.dstBinding = 0,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                   .pImageInfo = &images[0]},
+            vk::WriteDescriptorSet{.dstBinding = 1,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                   .pImageInfo = &images[1]},
+            vk::WriteDescriptorSet{.dstBinding = 2,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eStorageImage,
+                                   .pImageInfo = &images[2]}};
+        const u32 debug_character = character_valid ? 1u : 0u;
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_debug_pass->pipeline);
+        command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *motion_debug_pass->layout, 0,
+                                     writes);
+        command.pushConstants(*motion_debug_pass->layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(debug_character), &debug_character);
+        command.dispatch((out.width + 7) / 8, (out.height + 7) / 8, 1);
     }
     if (upscale_to && tune.sharpness > 0 && sharpened) {
         // Sharpened into its own image: the upscaler keeps the unsharpened one as history.
@@ -1490,6 +1913,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         status.output_width = out.width;
         status.output_height = out.height;
         status.backend = BackendName(backend);
+        status.preset = backend == Backend::Dlss ? tune.preset : 0;
         status.decoupled = upscale_to.has_value();
         status.reason.clear();
     }
@@ -1506,10 +1930,10 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                  "[DLSS-TEMPORAL] {} evaluations={} {}x{}->{}x{} preHUD={} "
                  "jitter=({:.3f},{:.3f}) "
                  "jitteredDraws={} (before display copy {}) objectMotion={} reset={} fallbacks={} "
-                 "sceneCameraFrames={}",
+                 "sceneCameraFrames={} characterMotion={} (frames with it {})",
                  BackendName(backend), evaluations, in.width, in.height, out.width, out.height,
                  pre_hud, applied[0], applied[1], jittered_draws, jittered_before_copy, use_mirror,
-                 reset, fallbacks, scene_camera_frames);
+                 reset, fallbacks, scene_camera_frames, character_valid, character_motion_frames);
     return true;
 }
 
@@ -1561,6 +1985,28 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
             pre_lut_hudless = std::make_unique<OwnedImage>(instance, pre_lut_format, output,
                                                            U::eSampled | U::eStorage);
     }
+    // The HUD as its own layer (see bb_hud_layer.comp): its images at the render size.
+    const bool hud_layer =
+        tune.menu_fix && dlss_pre_hud && tune.hud && !replay && !upscaled_tone_mapped;
+    hud_layer_on = hud_layer;
+    if (hud_layer && (!hud_layer_image || hud_layer_image->extent != render)) {
+        if (hud_layer_image)
+            scheduler.Finish();
+        using U = vk::ImageUsageFlagBits;
+        const auto make = [&] {
+            return std::make_unique<OwnedImage>(instance, vk::Format::eR16G16B16A16Sfloat, render,
+                                                U::eSampled | U::eStorage);
+        };
+        for (u32 i = 0; i < 2; ++i) {
+            hud_finals[i] = make();
+            hud_scenes[i] = make();
+        }
+        hud_layer_image = make();
+        hud_history = false;
+    }
+    if (hud_layer && !hud_dimming)
+        hud_dimming = std::make_unique<VideoCore::Buffer>(instance, 0, DimmingBytes,
+                                                          VideoCore::MemoryType::DeviceLocal);
     auto& written = replay ? *pre_lut : *outputs_slot;
     auto* written_hudless = !hudless ? nullptr
                             : replay ? pre_lut_hudless.get()
@@ -1623,13 +2069,83 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
     const std::array clear_barriers{coverage_barrier, dimming_barrier};
     command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 2,
                                                 .pBufferMemoryBarriers = clear_barriers.data()});
+    // The HUD as its own layer, measured at the render size before the composite.
+    if (hud_layer) {
+        const vk::Extent2D size{render.width, render.height};
+        const u32 last = hud_last, next = hud_last ^ 1;
+        for (auto* image : {hud_finals[last].get(), hud_scenes[last].get()})
+            image->Transit(command, ro, vk::PipelineStageFlagBits2::eComputeShader,
+                           vk::AccessFlagBits2::eShaderRead);
+        for (auto* image : {hud_finals[next].get(), hud_scenes[next].get(), hud_layer_image.get()})
+            image->Transit(command, vk::ImageLayout::eGeneral,
+                           vk::PipelineStageFlagBits2::eComputeShader,
+                           vk::AccessFlagBits2::eShaderWrite);
+        const std::array layer_images{
+            vk::DescriptorImageInfo{*nearest, *source_view.image_view, ro},
+            vk::DescriptorImageInfo{*nearest, *snapshot->view, ro},
+            vk::DescriptorImageInfo{*nearest, *hud_finals[last]->view, ro},
+            vk::DescriptorImageInfo{*nearest, *hud_scenes[last]->view, ro},
+            vk::DescriptorImageInfo{{}, *hud_finals[next]->view, vk::ImageLayout::eGeneral},
+            vk::DescriptorImageInfo{{}, *hud_scenes[next]->view, vk::ImageLayout::eGeneral},
+            vk::DescriptorImageInfo{{}, *hud_layer_image->view, vk::ImageLayout::eGeneral}};
+        std::array<vk::WriteDescriptorSet, 8> layer_writes;
+        for (u32 i = 0; i < layer_images.size(); ++i)
+            layer_writes[i] = {.dstBinding = i,
+                               .descriptorCount = 1,
+                               .descriptorType = i >= 4 ? vk::DescriptorType::eStorageImage
+                                                        : vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &layer_images[i]};
+        const vk::DescriptorBufferInfo layer_dimming{hud_dimming->Handle(), 0, DimmingBytes};
+        layer_writes[7] = {.dstBinding = 7,
+                           .descriptorCount = 1,
+                           .descriptorType = vk::DescriptorType::eStorageBuffer,
+                           .pBufferInfo = &layer_dimming};
+        // First the histogram of the even darkening, then the layer.
+        auto histogram_barrier = dimming_barrier;
+        histogram_barrier.buffer = hud_dimming->Handle();
+        histogram_barrier.dstStageMask = vk::PipelineStageFlagBits2::eTransfer;
+        histogram_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                                    .pBufferMemoryBarriers = &histogram_barrier});
+        command.fillBuffer(hud_dimming->Handle(), 0, DimmingBytes, 0);
+        histogram_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+        histogram_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        histogram_barrier.dstStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+        histogram_barrier.dstAccessMask =
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+        command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                                    .pBufferMemoryBarriers = &histogram_barrier});
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, *hud_layer_pass->pipeline);
+        command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *hud_layer_pass->layout, 0,
+                                     layer_writes);
+        const u32 layer_push = hud_history ? 1u : 0u;
+        const u32 count_push = layer_push | 4u;
+        command.pushConstants(*hud_layer_pass->layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(count_push), &count_push);
+        command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+        histogram_barrier.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+        histogram_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+        command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                                    .pBufferMemoryBarriers = &histogram_barrier});
+        command.pushConstants(*hud_layer_pass->layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(layer_push), &layer_push);
+        command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+        hud_layer_image->Transit(command, ro, vk::PipelineStageFlagBits2::eComputeShader,
+                                 vk::AccessFlagBits2::eShaderRead);
+        hud_last = next;
+        hud_history = true;
+    } else {
+        hud_history = false;
+    }
     const std::array images{vk::DescriptorImageInfo{*nearest, *upscaled->view, ro},
                             vk::DescriptorImageInfo{*linear, *source_view.image_view, ro},
                             vk::DescriptorImageInfo{*linear, *snapshot->view, ro},
                             vk::DescriptorImageInfo{*linear, *lut_view.image_view, ro},
                             vk::DescriptorImageInfo{{}, *written.view, vk::ImageLayout::eGeneral},
                             vk::DescriptorImageInfo{*linear, *motion->view, ro}};
-    std::array<vk::WriteDescriptorSet, 8> writes;
+    const vk::DescriptorImageInfo layer_info{
+        *linear, hud_layer ? *hud_layer_image->view : *snapshot->view, ro};
+    std::array<vk::WriteDescriptorSet, 9> writes;
     for (u32 i = 0; i < images.size(); ++i)
         writes[i] = {.dstBinding = i,
                      .descriptorCount = 1,
@@ -1646,9 +2162,13 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
                  .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eStorageBuffer,
                  .pBufferInfo = &dimming_info};
+    writes[8] = {.dstBinding = 8,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                 .pImageInfo = &layer_info};
     const u32 flags = (dlss_pre_hud && tune.hud ? 1u : 0u) | (replay ? 32u : 2u) |
-                      (tune.debug_motion ? 4u : 0u) | (menu && dlss_pre_hud ? 8u : 0u) |
-                      (upscaled_linear ? 16u : 0u) | (upscaled_tone_mapped ? 128u : 0u);
+                      (tune.debug_motion ? 4u : 0u) | (upscaled_linear ? 16u : 0u) |
+                      (upscaled_tone_mapped ? 128u : 0u) | (hud_layer ? 512u : 0u);
     const auto& pass = replay ? *composite_hdr_pass : *composite_pass;
     command.bindPipeline(vk::PipelineBindPoint::eCompute, *pass.pipeline);
     command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pass.layout, 0, writes);
@@ -1669,7 +2189,7 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
             {}, *written_hudless->view, vk::ImageLayout::eGeneral};
         writes[4].pImageInfo = &hudless_image;
         command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pass.layout, 0, writes);
-        push.flags = (flags & ~1u) | 64u; // keeps 8: in menus, the game's own scene
+        push.flags = (flags & ~1u) | 64u;
         command.pushConstants(*pass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
                               &push);
         command.dispatch((output.width + 7) / 8, (output.height + 7) / 8, 1);
@@ -1714,12 +2234,33 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
 BbTemporalDlss::BbTemporalDlss() : impl{std::make_unique<Impl>()} {}
 BbTemporalDlss::~BbTemporalDlss() = default;
 
+std::string BbTemporalDlss::DescribeBlur() const {
+    if (!impl->requested)
+        return "(no upscaler requested: motion blur watch off)";
+    return impl->DescribeBlurFrame(impl->CameraChange());
+}
+
 bool BbTemporalDlss::Requested() const {
     return impl->requested;
 }
 
+bool BbTemporalDlss::CharacterMotionRequested() const {
+    return impl->requested && impl->tune.character_motion;
+}
+
+bool BbTemporalDlss::ObjectMotionRequested() const {
+    return impl->requested && impl->tune.mirror;
+}
+
+void BbTemporalDlss::SetObjectMotion(BbObjectMotion* object_motion) {
+    impl->object_motion = object_motion;
+    if (object_motion)
+        object_motion->SetActive(impl->tune.character_motion);
+}
+
 void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::ImageId id,
                                     const VideoCore::ImageViewInfo& view, u64 hash, u32 slot) {
+    BB_STAGE_CENSUS("BbTemporalDlss::ObserveTexture", Features);
     if (!impl->requested || impl->failed || impl->stopped)
         return;
     if (hash == DepthProducer && slot == 0 && image.info.pixel_format == vk::Format::eR32Sfloat &&
@@ -1736,10 +2277,25 @@ void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::Im
         impl->copy_source = Impl::Bound{id, view};
     else if (hash == DisplayCopy && slot == 1)
         impl->copy_lut = Impl::Bound{id, view};
-    else if (hash == MotionBlur && slot == 0)
+    else if ((hash == MotionBlur || hash == MotionBlurAlt) && slot == 0)
         impl->blur_source = Impl::Bound{id, view};
     else if (hash == HdrSceneCopy && slot == 0)
         impl->hdr_copy_source = Impl::Bound{id, view};
+}
+
+void BbTemporalDlss::ObserveBlurInputs(const void* data, u64 size, u64 hash, u32 binding) {
+    auto& s = *impl;
+    if (!s.requested || s.failed || s.stopped || !data)
+        return;
+    const auto* f = static_cast<const float*>(data);
+    if (hash == DepthProducer && binding == 0 && !s.blur.sampled &&
+        size >= (0x380 + 16) * sizeof(float)) {
+        std::copy_n(f + 0x380, 16, s.blur.matrix.begin());
+        s.blur.shift_px = Impl::BlurShiftPx(s.blur.matrix);
+        s.blur.sampled = true;
+    } else if (hash == OpaqueVelocity && binding == 0 && size >= 2 * sizeof(float)) {
+        s.blur.velocity_scale = {f[0], f[1]};
+    }
 }
 
 void BbTemporalDlss::ObserveSceneConstants(const void* data, u64 size) {
@@ -1776,6 +2332,7 @@ void BbTemporalDlss::ObserveSceneConstants(const void* data, u64 size) {
 void BbTemporalDlss::ObserveConstants(Runtime& runtime, const Instance& instance,
                                       const VideoCore::Buffer* source, u64 offset, u64 size,
                                       u64 hash, u32 binding) {
+    BB_STAGE_CENSUS("BbTemporalDlss::ObserveConstants", Features);
     if (!impl->requested || impl->failed || impl->stopped || !source)
         return;
     impl->producer_constants += hash == DepthProducer && binding == 0;
@@ -1813,7 +2370,8 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
         return {};
     auto* color = draw.color ? &cache.GetImage(draw.color) : nullptr;
     try {
-        if (draw.ps_hash == MotionBlur) {
+        if (draw.ps_hash == MotionBlur || draw.ps_hash == MotionBlurAlt) {
+            ++s.blur.blur_draws;
             const auto source = std::exchange(s.blur_source, std::nullopt);
             if (s.tune.motion_blur || !color || !source || source->id == draw.color)
                 return {};
@@ -1887,12 +2445,14 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
                 if (s.hud_snapshot_taken && s.hud_snapshot &&
                     s.hud_snapshot->extent ==
                         vk::Extent2D{color->info.size.width, color->info.size.height})
-                    s.ReplayHudless(instance, runtime, scheduler, cache, *color);
+                    s.ReplayHudless(instance, runtime, scheduler, cache, *color,
+                                    draw.color_view_format);
             } else {
                 s.decoupled_frame_gen.erase(color->info.guest_address);
             }
             s.last_copy_source = s.copy_source->id;
             s.last_copy_format = s.copy_source->view.format;
+            s.last_copy_view = s.copy_source->view;
             s.hud_snapshot_taken = false;
             s.DisplayCopyDone();
             return {};
@@ -1954,12 +2514,28 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
         // HUD draws share the scene depth for stencil; anything into the HUD target stays put.
         if (s.ui_target && draw.color == *s.ui_target)
             return {};
-        if (s.tune.enabled && s.tune.jitter && !s.menu && s.scene_depth &&
+        // The HUD's stencil masks (no colour, no depth test) share the scene depth too: a
+        // jittered mask moves the edge of what it masks (the stamina bar's end line).
+        if (s.ui_phase && !color && draw.stencil && !draw.depth_test)
+            return {};
+        // In menus the jitter stops where the HUD layer can't be drawn; the HUD layer measures
+        // the HUD against the moving scene, so there it keeps running.
+        if (s.tune.enabled && s.tune.jitter && !(s.menu && !s.hud_layer_on) && s.scene_depth &&
             draw.depth == s.scene_depth->id &&
-            cache.GetImage(draw.depth).image_uid == s.scene_depth->uid &&
-            (draw.indirect || draw.num_indices > 6 || draw.num_instances > 1)) {
-            ++s.jittered_draws;
-            return s.jitter;
+            cache.GetImage(draw.depth).image_uid == s.scene_depth->uid) {
+            const bool small = !draw.indirect && draw.num_indices <= 6 && draw.num_instances <= 1;
+            if (!small) {
+                ++s.jittered_draws;
+                return s.jitter;
+            }
+            ++s.small_draws;
+            if (draw.depth_test && draw.depth_write) {
+                ++s.small_depth_draws;
+                if (s.tune.jitter_small) {
+                    ++s.jittered_draws;
+                    return s.jitter;
+                }
+            }
         }
         return {};
     } catch (const std::exception& e) {
@@ -1972,10 +2548,18 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
 }
 
 std::optional<BbTemporalDlss::DrawReplacement> BbTemporalDlss::TakeDrawReplacement() {
+    BB_STAGE_CENSUS("BbTemporalDlss::TakeDrawReplacement", Features);
+    if (!impl->replacement) [[likely]] { // every draw asks
+        return std::nullopt;
+    }
     return std::exchange(impl->replacement, std::nullopt);
 }
 
 std::optional<BbTemporalDlss::DisplayCopyReplay> BbTemporalDlss::TakeDisplayCopyReplay() {
+    BB_STAGE_CENSUS("BbTemporalDlss::TakeDisplayCopyReplay", Features);
+    if (!impl->display_copy_replay) [[likely]] { // every draw asks
+        return std::nullopt;
+    }
     return std::exchange(impl->display_copy_replay, std::nullopt);
 }
 
@@ -2080,6 +2664,7 @@ void BbTemporalDlss::Shutdown(const Instance& instance, Scheduler& scheduler) {
     s.composite_hdr_pass.reset();
     s.linearize_pass.reset();
     s.sharpen_pass.reset();
+    s.motion_debug_pass.reset();
     s.hudless_dim_pass.reset();
     LOG_INFO(Render_Vulkan, "[DLSS-TEMPORAL] Teardown: evaluations={} composites={} fallbacks={}",
              s.evaluations, s.composites, s.fallbacks);

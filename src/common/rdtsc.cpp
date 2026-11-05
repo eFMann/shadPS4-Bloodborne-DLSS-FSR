@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <thread>
 #include "common/rdtsc.h"
 #include "common/uint128.h"
@@ -55,6 +56,19 @@ u64 EstimateRDTSCFrequency() {
     const u64 tsc_diff = tsc_end - tsc_start;
     const u64 tsc_freq = MultiplyAndDivide64(tsc_diff, 1000000000ULL, end_time - start_time);
     return RoundToNearest<100'000>(tsc_freq);
+}
+
+double TscNsPerTick() {
+    static const u64 tsc_start = FencedRDTSC();
+    static const auto time_start = std::chrono::steady_clock::now();
+    const u64 ticks = FencedRDTSC() - tsc_start;
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - time_start)
+                        .count();
+    if (ticks < 1'000'000 || ns <= 0) {
+        return 1.0 / 3.0; // the first moments: about 3 GHz
+    }
+    return double(ns) / double(ticks);
 }
 
 } // namespace Common

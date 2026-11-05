@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <thread>
@@ -11,6 +12,7 @@
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/threads/pthread.h"
 
+#include "common/bb_tuning.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
@@ -22,6 +24,9 @@
 #elif defined(_WIN32)
 #include <windows.h>
 #include "common/string_util.h"
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <pthread_np.h>
@@ -110,21 +115,107 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
     SetThreadPriority(handle, windows_priority);
 }
 
+namespace {
+/// One waitable timer per thread, created on first use, closed on exit
+/// Uses High-Res Timer so sleeps aren't rounded up
+struct ThreadTimer {
+    HANDLE handle{};
+
+    HANDLE Get() {
+        if (!handle) {
+            handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+            if (!handle) {
+                handle = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+            }
+        }
+        return handle;
+    }
+
+    void Reset() {
+        if (handle) {
+            CloseHandle(handle);
+            handle = nullptr;
+        }
+    }
+
+    ~ThreadTimer() {
+        Reset();
+    }
+};
+thread_local ThreadTimer thread_timer;
+} // namespace
+
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
-    const auto begin_sleep = std::chrono::high_resolution_clock::now();
+    if (!BbTuning::FastLocks()) {
+        // The emulator's own sleep (one waitable timer per thread, from 0.21.0).
+        if (duration.count() <= 0) {
+            const auto ret = SleepEx(0, interruptible);
+            if (remaining) {
+                *remaining = std::chrono::nanoseconds(0);
+            }
+            return ret != WAIT_IO_COMPLETION;
+        }
 
-    LARGE_INTEGER interval{
-        .QuadPart = -1 * (duration.count() / 100u),
-    };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+        const auto begin_sleep = std::chrono::high_resolution_clock::now();
 
+        LARGE_INTEGER interval{
+            .QuadPart = -1 * std::max<s64>(duration.count() / 100, 1),
+        };
+        HANDLE timer = thread_timer.Get();
+        SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
+        const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+
+        // After an interrupted wait the timer is still armed: reset it so it can't end the
+        // next sleep early.
+        if (ret != WAIT_OBJECT_0) {
+            thread_timer.Reset();
+        }
+
+        if (remaining) {
+            const auto end_sleep = std::chrono::high_resolution_clock::now();
+            const auto sleep_time = end_sleep - begin_sleep;
+            *remaining =
+                duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
+        }
+        return ret == WAIT_OBJECT_0;
+    }
+    const auto begin_sleep = std::chrono::steady_clock::now();
+    DWORD ret = WAIT_OBJECT_0;
+    if (duration.count() <= 0) {
+        // A zero sleep is a yield.
+        SwitchToThread();
+    } else {
+        // One timer per thread, high resolution where available (Windows 10 1803+): a plain
+        // waitable timer rounds up to the system timer period (1 ms at best), so a guest
+        // usleep(100) took 1-2 ms. Creating a timer per call also cost two system calls.
+        thread_local HANDLE timer = [] {
+            HANDLE handle = CreateWaitableTimerExW(
+                nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!handle) {
+                handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+            }
+            return handle;
+        }();
+        LARGE_INTEGER interval{
+            .QuadPart = -std::max<LONGLONG>(1, (duration.count() + 99) / 100),
+        };
+        if (timer && SetWaitableTimer(timer, &interval, 0, nullptr, nullptr, FALSE)) {
+            ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+            // An interrupted wait leaves the timer armed: it would end the next sleep early.
+            if (ret != WAIT_OBJECT_0) {
+                CancelWaitableTimer(timer);
+            }
+        } else {
+            ret = SleepEx(static_cast<DWORD>((duration.count() + 999'999) / 1'000'000),
+                          interruptible) == 0
+                      ? WAIT_OBJECT_0
+                      : WAIT_IO_COMPLETION;
+        }
+    }
+    const auto sleep_time = std::chrono::steady_clock::now() - begin_sleep;
     if (remaining) {
-        const auto end_sleep = std::chrono::high_resolution_clock::now();
-        const auto sleep_time = end_sleep - begin_sleep;
         *remaining = duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
     }
     return ret == WAIT_OBJECT_0;
@@ -156,7 +247,7 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
         .tv_sec = duration.count() / 1'000'000'000,
         .tv_nsec = duration.count() % 1'000'000'000,
     };
-    timespec remain;
+    timespec remain{};
     int ret;
     while ((ret = nanosleep(&request, &remain)) < 0 && errno == EINTR) {
         if (interruptible) {

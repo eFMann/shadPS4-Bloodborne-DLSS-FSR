@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 name: Build
+# Manual runs show the title typed in when starting them (e.g. what the build is for).
+run-name: ${{ inputs.title || github.event.head_commit.message || github.event.pull_request.title || format('Build {0}', github.ref_name) }}
 
 on:
   push:
@@ -16,10 +18,22 @@ on:
       - "**/*.md"
 
   workflow_dispatch:
+    inputs:
+      title:
+        description: "What this build is for (shown as the run's name)"
+        required: false
+        type: string
+      pgo:
+        description: "PGO: auto (use the profiles in pgo/ if any), off, or generate (a training build)"
+        required: false
+        default: auto
+        type: choice
+        options: [auto, off, generate]
 
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' || github.repository != 'shadps4-emu/shadPS4' || github.event_name != 'push' }}
+  queue: ${{ (github.ref != 'refs/heads/main' || github.repository != 'shadps4-emu/shadPS4' || github.event_name != 'push') && 'single' || 'max' }}
 
 env:
   BUILD_TYPE: Release
@@ -40,16 +54,16 @@ jobs:
     - name: Install
       run: |
         wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-        sudo add-apt-repository 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main'
+        sudo add-apt-repository 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main'
         sudo apt update
-        sudo apt install clang-format-19
+        sudo apt install clang-format-23
     - name: Build
       env:
         COMMIT_RANGE: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
       run: ./.github/workflows/scripts/clang-format.sh
 
   get-info:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     outputs:
       date: ${{ steps.vars.outputs.date }}
       shorthash: ${{ steps.vars.outputs.shorthash }}
@@ -69,6 +83,10 @@ jobs:
   windows-sdl:
     runs-on: windows-2025-vs2026
     needs: get-info
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
     - uses: actions/checkout@v6
       with:
@@ -96,14 +114,192 @@ jobs:
     - name: Print CPU Info
       run: bash -c "cat /proc/cpuinfo"
 
+    # Streamline SDK headers for frame generation (the same version as the DLLs in the release).
+    - name: Get Streamline SDK
+      uses: actions/checkout@v6
+      with:
+        repository: NVIDIA-RTX/Streamline
+        ref: v2.14.16
+        path: streamline-sdk
+        sparse-checkout: include
+
+    # PGO: a training build (generate), or the profiles committed in pgo/ (.profraw from a
+    # training build, or .profdata) merged with this runner's llvm-profdata and used.
+    - name: PGO profile
+      id: pgo
+      shell: pwsh
+      run: |
+        $mode = "${{ inputs.pgo }}"
+        if (-not $mode) { $mode = "auto" }
+        $flag = ""
+        $suffix = ""
+        if ($mode -eq "generate") {
+          $flag = "-DBB_PGO=generate"
+          $suffix = "-pgo-training"
+        } elseif ($mode -eq "auto") {
+          $profiles = @(Get-ChildItem -Path pgo -Recurse -File -Include *.profraw,*.profdata -ErrorAction SilentlyContinue)
+          if ($profiles.Count -gt 0) {
+            $bin = Split-Path (Get-Command clang-cl).Source
+            & "$bin\llvm-profdata.exe" merge "-output=${{github.workspace}}\bb.profdata" $profiles.FullName
+            if ($LASTEXITCODE -eq 0) {
+              $flag = "-DBB_PGO=${{github.workspace}}/bb.profdata"
+              $suffix = "-pgo"
+              Write-Host "PGO: $($profiles.Count) profile(s) merged"
+            } else {
+              Write-Host "PGO: merging failed, building without a profile"
+            }
+          }
+        }
+        "flag=$flag" >> $env:GITHUB_OUTPUT
+        "suffix=$suffix" >> $env:GITHUB_OUTPUT
+
     - name: Configure CMake
-      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DBB_STREAMLINE_DIR=${{github.workspace}}/streamline-sdk ${{ steps.pgo.outputs.flag }}
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
 
+    - name: Attest
+      if: github.event_name != 'pull_request'
+      uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: ${{github.workspace}}/build/shadPS4.exe
+
     - name: Upload Windows SDL artifact
       uses: actions/upload-artifact@v7
       with:
-        name: shadPS4-exe-only-win64-${{ needs.get-info.outputs.shorthash }}
+        name: shadPS4-exe-only-win64-${{ needs.get-info.outputs.shorthash }}${{ steps.pgo.outputs.suffix }}
         path: ${{github.workspace}}/build/shadPS4.exe
+
+  linux:
+    runs-on: ubuntu-24.04
+    needs: get-info
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    # Clang 19 and libstdc++ 14 (std::ranges::to), the emulator's dependencies, and SDL's for
+    # X11 and Wayland windows.
+    - name: Install
+      run: |
+        sudo apt update
+        sudo apt install -y clang-19 clang-tools-19 libstdc++-14-dev ninja-build patch \
+          libasound2-dev libpulse-dev libopenal-dev libssl-dev zlib1g-dev libedit-dev \
+          libudev-dev libevdev-dev libjack-dev libsndio-dev libvulkan-dev libpng-dev \
+          libusb-1.0-0-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+          libxss-dev libxtst-dev libxfixes-dev libxkbcommon-dev libwayland-dev \
+          wayland-protocols libdecor-0-dev libdrm-dev libgbm-dev libegl-dev libgl-dev
+
+    - name: Cache CMake Build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      env:
+          cache-name: ${{ runner.os }}-sdl-cache-cmake-build
+      with:
+        append-timestamp: false
+        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    # The SDKs the upscaler libraries are built from, at the versions they were tested with.
+    - name: Get DLSS SDK
+      uses: actions/checkout@v6
+      with:
+        repository: NVIDIA/DLSS
+        ref: v310.9.16
+        path: sdk/dlss
+        sparse-checkout: |
+          include
+          lib/Linux_x86_64/rel
+
+    - name: Get FidelityFX SDK
+      uses: actions/checkout@v6
+      with:
+        repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+        ref: v1.1.4
+        path: sdk/ffx
+        sparse-checkout: |
+          ffx-api
+          sdk/src/backends/vk/FrameInterpolationSwapchain
+
+    - name: Get FSR-Vulkan
+      uses: actions/checkout@v6
+      with:
+        repository: FireBurn/FSR-Vulkan
+        ref: 69fecd7c477a87aff148d41d3b454cb40295f154
+        path: sdk/fsr-vulkan
+
+    - name: Get FSR 4 model files
+      uses: actions/checkout@v6
+      with:
+        repository: FireBurn/Q2RTX
+        ref: ae8d628fae208813172446d1e49ed94150b04658
+        path: sdk/q2rtx
+        sparse-checkout: baseq2/fsr4_shaders
+
+    - name: Configure CMake
+      run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_CXX_COMPILER_CLANG_SCAN_DEPS=clang-scan-deps-19 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build
+      run: cmake --build build --parallel $(nproc)
+
+    - name: Build upscaler libraries
+      run: |
+        set -e
+        common="-G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19"
+        cmake -S dlss_bridge -B build-dlss $common -DDLSS_SDK_ROOT=$PWD/sdk/dlss
+        cmake --build build-dlss
+        cmake -S fsr3_linux -B build-fsr3 $common -DFFX_SDK_ROOT=$PWD/sdk/ffx -DFSR_VULKAN_ROOT=$PWD/sdk/fsr-vulkan
+        cmake --build build-fsr3
+        cmake -S fsr4_addon -B build-fsr4 $common -DFSR_VULKAN_ROOT=$PWD/sdk/fsr-vulkan
+        cmake --build build-fsr4
+
+    # A folder like the Windows release: the emulator with the upscaler libraries next to it, and
+    # the FSR 4 add-on as its own download (its fsr4 folder goes next to shadps4).
+    - name: Package
+      run: |
+        set -e
+        name=shadPS4-Bloodborne-linux-x64-${{ needs.get-info.outputs.shorthash }}
+        mkdir -p pkg/main/LICENSES pkg/addon/fsr4
+        cp build/shadps4 build-dlss/shadps4_dlss.so build-fsr3/libamd_fidelityfx_vk.so pkg/main/
+        cp sdk/dlss/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.* pkg/main/
+        cp sdk/dlss/lib/Linux_x86_64/rel/libnvidia-ngx-dlssg.so.* pkg/main/
+        strip pkg/main/shadps4
+        strip --strip-unneeded pkg/main/shadps4_dlss.so pkg/main/libamd_fidelityfx_vk.so
+        cp LICENSE pkg/main/LICENSES/shadPS4-GPL-2.0.txt
+        cp dlss_bridge/LICENSE.txt pkg/main/LICENSES/dlss_bridge-MIT.txt
+        cp sdk/dlss/LICENSE.txt pkg/main/LICENSES/NVIDIA-DLSS-SDK.txt
+        cp sdk/ffx/LICENSE.txt pkg/main/LICENSES/AMD-FidelityFX-SDK-MIT.txt
+        cp sdk/fsr-vulkan/LICENSE.txt pkg/main/LICENSES/FSR-Vulkan-MIT.txt
+        models=sdk/q2rtx/baseq2/fsr4_shaders
+        cp build-fsr4/shadps4_fsr4.so pkg/addon/fsr4/
+        strip --strip-unneeded pkg/addon/fsr4/shadps4_fsr4.so
+        cp $models/fsr4_model_v07_i8_* $models/rcas.spv $models/spd_auto_exposure.spv \
+          $models/LICENSE-FSR4-v07.txt pkg/addon/fsr4/
+        cp sdk/fsr-vulkan/LICENSE.txt pkg/addon/fsr4/LICENSE-FSR-Vulkan.txt
+        cp LICENSE pkg/addon/fsr4/LICENSE-shadps4_fsr4-GPL-2.0.txt
+        tar -C pkg/main -cJf $name.tar.xz .
+        tar -C pkg/addon -cJf shadPS4-Bloodborne-FSR4-addon-linux-x64-${{ needs.get-info.outputs.shorthash }}.tar.xz fsr4
+        echo "name=$name" >> $GITHUB_ENV
+
+    # Records that these files were built by this workflow from this commit, which anyone can
+    # check with: gh attestation verify <file> --repo <owner>/<repo>
+    - name: Attest
+      if: github.event_name != 'pull_request'
+      uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: shadPS4-Bloodborne-*linux-x64-*.tar.xz
+
+    - name: Upload Linux artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.name }}
+        path: shadPS4-Bloodborne-linux-x64-*.tar.xz
+
+    - name: Upload Linux FSR 4 add-on
+      uses: actions/upload-artifact@v7
+      with:
+        name: shadPS4-Bloodborne-FSR4-addon-linux-x64-${{ needs.get-info.outputs.shorthash }}
+        path: shadPS4-Bloodborne-FSR4-addon-linux-x64-*.tar.xz

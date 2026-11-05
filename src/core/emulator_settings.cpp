@@ -9,6 +9,7 @@
 #include <common/scm_rev.h>
 #include <toml.hpp>
 #include "common/assert.h"
+#include "common/elf_info.h"
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
 #include "emulator_settings.h"
@@ -104,14 +105,52 @@ EmulatorSettingsImpl::~EmulatorSettingsImpl() {}
 
 std::shared_ptr<EmulatorSettingsImpl> EmulatorSettingsImpl::GetInstance() {
     std::lock_guard lock(s_mutex);
-    if (!s_instance)
+    if (!s_instance) {
         s_instance = std::make_shared<EmulatorSettingsImpl>();
+        s_current.store(s_instance.get(), std::memory_order_release);
+    }
     return s_instance;
+}
+
+EmulatorSettingsImpl::ReloadScope::ReloadScope() {
+    if (t_private || Common::ElfInfo::Instance().GameSerial().empty()) {
+        return; // within another scope, or no game running
+    }
+    copy = std::make_shared<EmulatorSettingsImpl>();
+    *copy = *Instance();
+    t_private = copy.get();
+    s_private_users.fetch_add(1, std::memory_order_relaxed);
+}
+
+EmulatorSettingsImpl::ReloadScope::~ReloadScope() {
+    if (!copy) {
+        return;
+    }
+    t_private = nullptr;
+    s_private_users.fetch_sub(1, std::memory_order_relaxed);
+    const std::string running{Common::ElfInfo::Instance().GameSerial()};
+    if (copy->m_loaded_profile != running) {
+        return; // another profile (or the global one alone): only saved
+    }
+    {
+        std::lock_guard lock(s_mutex);
+        if (s_instance) {
+            copy->m_shadnet_session_disabled.store(
+                s_instance->m_shadnet_session_disabled.load(std::memory_order_relaxed));
+        }
+    }
+    SetInstance(std::move(copy));
 }
 
 void EmulatorSettingsImpl::SetInstance(std::shared_ptr<EmulatorSettingsImpl> instance) {
     std::lock_guard lock(s_mutex);
+    // Instance() hands out plain pointers: a replaced instance stays alive.
+    static std::vector<std::shared_ptr<EmulatorSettingsImpl>> replaced;
+    if (s_instance) {
+        replaced.push_back(s_instance);
+    }
     s_instance = std::move(instance);
+    s_current.store(s_instance.get(), std::memory_order_release);
 }
 
 // --------------------
@@ -230,6 +269,28 @@ void EmulatorSettingsImpl::ClearGameSpecificOverrides() {
     ClearGroupOverrides(m_audio);
     ClearGroupOverrides(m_gpu);
     ClearGroupOverrides(m_vulkan);
+}
+
+nlohmann::json EmulatorSettingsImpl::Snapshot() const {
+    json global;
+    global["General"] = m_general;
+    global["Network"] = m_network;
+    global["Log"] = m_log;
+    global["Debug"] = m_debug;
+    global["Input"] = m_input;
+    global["Audio"] = m_audio;
+    global["GPU"] = m_gpu;
+    global["Vulkan"] = m_vulkan;
+    json game = json::object();
+    SaveGroupGameSpecific(m_general, game["General"]);
+    SaveGroupGameSpecific(m_network, game["Network"]);
+    SaveGroupGameSpecific(m_log, game["Log"]);
+    SaveGroupGameSpecific(m_debug, game["Debug"]);
+    SaveGroupGameSpecific(m_input, game["Input"]);
+    SaveGroupGameSpecific(m_audio, game["Audio"]);
+    SaveGroupGameSpecific(m_gpu, game["GPU"]);
+    SaveGroupGameSpecific(m_vulkan, game["Vulkan"]);
+    return json{{"global", global}, {"game", game}};
 }
 
 bool EmulatorSettingsImpl::Save(const std::string& serial) {
@@ -394,7 +455,78 @@ void EmulatorSettingsImpl::MigrateNetworkKeys(const json& general, const json& n
 
 // ── Load ──────────────────────────────────────────────────────────────
 
+bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific) {
+    const json gpu = file.contains("GPU") && file["GPU"].is_object() ? file["GPU"] : json::object();
+    const auto saved = gpu.find("bb_defaults");
+    const int version = saved != gpu.end() && saved->is_number_integer() ? saved->get<int>() : 0;
+    if (version >= BbDefaultsVersion) {
+        return false;
+    }
+    // Saved before these defaults: switch them on once. A game's file only overrides what it holds.
+    const auto set = [&]<typename T>(Setting<T>& setting, T value) {
+        if (!game_specific) {
+            setting.value = value;
+        } else if (setting.game_specific_value) {
+            setting.game_specific_value = value;
+        }
+    };
+    const auto switch_on = [&](Setting<bool>& setting) { set(setting, true); };
+    if (version < 1) {
+        switch_on(m_gpu.bb_buffer_eviction);
+        switch_on(m_gpu.bb_background_texture_copies);
+    }
+    if (version < 2) {
+        switch_on(m_gpu.bb_real_occlusion);
+    }
+    if (version < 3) {
+        switch_on(m_gpu.bb_more_vram);
+        switch_on(m_gpu.bb_overlap_frames);
+        switch_on(m_gpu.bb_early_writeback);
+        switch_on(m_gpu.bb_render_during_present);
+        switch_on(m_gpu.bb_skip_left_out_levels);
+        switch_on(m_gpu.bb_direct_texture_copies);
+    }
+    if (version < 4) {
+        switch_on(m_gpu.bb_copy_thread);
+        switch_on(m_vulkan.bb_cached_texture_staging);
+        switch_on(m_vulkan.bb_lower_detail_first);
+        switch_on(m_vulkan.bb_clear_shader_written);
+        switch_on(m_vulkan.bb_ce_skip_huge_writes);
+        switch_on(m_vulkan.bb_evict_keep_protection);
+        switch_on(m_vulkan.bb_evict_keep_returning);
+        switch_on(m_vulkan.bb_protect_helper_thread);
+        switch_on(m_vulkan.bb_cpu_copy_shader);
+        switch_on(m_vulkan.bb_copy_skip_same);
+        switch_on(m_vulkan.bb_clear_one_layer);
+        set(m_gpu.bb_real_occlusion, false);
+        set(m_vulkan.bb_ssr_mode, 0);
+        switch_on(m_general.redzone_patches);
+        switch_on(m_vulkan.pipeline_cache_enabled);
+    }
+    if (version < 5) {
+        switch_on(m_vulkan.bb_draw_finisher);
+        switch_on(m_vulkan.bb_async_submit);
+        switch_on(m_vulkan.bb_gx_pipelines);
+        switch_on(m_gpu.bb_early_writeback);
+    }
+    if (version < 6) {
+        // Reflections are built in now (no patch file needed): the old default ("Game's", which
+        // did nothing without the patch) becomes Off, so nobody gets their cost unasked.
+        if (m_vulkan.bb_ssr_mode.value == 0) {
+            set(m_vulkan.bb_ssr_mode, 2);
+        }
+    }
+    if (game_specific && m_gpu.bb_defaults.game_specific_value) {
+        m_gpu.bb_defaults.game_specific_value = BbDefaultsVersion;
+    }
+    m_gpu.bb_defaults.value = BbDefaultsVersion;
+    LOG_INFO(Config, "Bloodborne settings: new defaults from version {} ({} config)", version,
+             game_specific ? "game" : "global");
+    return true;
+}
+
 bool EmulatorSettingsImpl::Load(const std::string& serial) {
+    m_loaded_profile = serial;
     // A newly loaded profile replaces, rather than extends, the previous profile.
     ClearGameSpecificOverrides();
 
@@ -427,6 +559,9 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 mergeGroup(m_audio, "Audio");
                 mergeGroup(m_gpu, "GPU");
                 mergeGroup(m_vulkan, "Vulkan");
+                if (UpdateBbDefaults(gj, false)) {
+                    Save();
+                }
             } else {
                 if (std::filesystem::exists(Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
                                             "config.toml")) {
@@ -514,6 +649,7 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 ApplyGroupOverrides(m_gpu, gj.at("GPU"), changed);
             if (gj.contains("Vulkan"))
                 ApplyGroupOverrides(m_vulkan, gj.at("Vulkan"), changed);
+            UpdateBbDefaults(gj, true);
 
             // Backwards compat for red-zone setting
             if (gj.contains("WindowsGuestRedZoneProtection") &&

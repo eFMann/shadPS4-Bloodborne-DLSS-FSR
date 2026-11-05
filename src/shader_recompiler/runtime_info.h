@@ -79,6 +79,29 @@ struct SwVertexRuntimeInfo {
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
 };
 
+/// Character motion vectors for temporal upscaling (ported from bbport). Skinned G-buffer
+/// vertex shaders store each vertex's clip position and load the previous frame's, by buffer
+/// device address; the fragment shader writes the screen-space difference to an extra color
+/// attachment. The addresses come per draw through push data, so the SPIR-V does not depend
+/// on the session and can be cached.
+struct MotionVectors {
+    static constexpr u8 VertexVersion = 2;      ///< bump when the vertex motion code changes
+    static constexpr u32 CurrentLocation = 30;  ///< varying: current clip position
+    static constexpr u32 PreviousLocation = 31; ///< varying: previous clip position, z = valid
+    static constexpr u32 Output = 7;            ///< color attachment index
+    static inline bool enabled = false;         ///< set at startup when the buffers exist
+};
+
+/// Temporal upscaler jitter added to the vertex shader's clip position instead of the viewport
+/// offset. With the viewport offset, AMD's RDNA4 driver leaves out the last column/row of the
+/// image when the jitter is negative (it rounds the fractional viewport edge down), which the
+/// upscaler then smears in as a border. The per-draw offset comes through push data (0 for draws
+/// that are not jittered), so the SPIR-V does not depend on the session.
+struct ClipJitter {
+    static constexpr u8 Version = 1;    ///< bump when the jitter code changes
+    static inline bool enabled = false; ///< set at startup when an upscaler is on
+};
+
 struct HwLocalRuntimeInfo {
     u32 ls_stride;
 
@@ -96,6 +119,11 @@ struct HwVertexRuntimeInfo {
     std::array<OutputMap, 3> outputs;
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
+    /// MotionVectors: store/load clip positions; 0 = off, else the code version, so shaders
+    /// cached with older motion code are not reused (fills padding).
+    u8 motion_vectors{};
+    /// ClipJitter: 0 = off, else the code version (fills padding).
+    u8 clip_jitter{};
     u32 user_clip_plane_mask{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
@@ -210,7 +238,8 @@ struct HwFragmentRuntimeInfo {
     u32 dual_source_blending : 1;
     u32 clip_distance_emulation : 1;
     u32 depth_before_shader : 1;
-    u32 : 12;
+    u32 motion_vectors : 1; ///< MotionVectors: write the motion attachment
+    u32 : 11;
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -221,6 +250,7 @@ struct HwFragmentRuntimeInfo {
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
                depth_before_shader == other.depth_before_shader &&
+               motion_vectors == other.motion_vectors &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }
