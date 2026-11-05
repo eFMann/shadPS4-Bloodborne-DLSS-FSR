@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -198,6 +199,16 @@ constexpr u32 SpotEvery = 256;
 constexpr size_t MemoLimit = 1 << 18;
 std::chrono::steady_clock::time_point counts_start{};
 u32 differences_logged = 0;
+/// Spot checks that found a different pipeline: the key is set aside (always worked out from
+/// the registers) and reuse goes on; past MaxDiffers, reuse stops for the session.
+std::unordered_set<u64> unreliable_keys;
+u32 spot_differences = 0;
+constexpr u32 MaxDiffers = 16;
+/// The render target signature of the draw being looked up (RememberedPipeline/NotePipeline).
+u64 current_targets = 0;
+u64 KeyFor(size_t k) {
+    return current_memo[k] ^ (current_targets * 0x9e3779b97f4a7c15ull);
+}
 
 bool Unlock(u64 address, std::size_t size) {
     const std::uintptr_t first = address & ~std::uintptr_t(0xfff);
@@ -558,10 +569,11 @@ void CheckDraw(u64 guest_end, std::span<const u32, 2> tail, const AmdGpu::Regs& 
     }
 }
 
-const void* RememberedPipeline(u64 generation) {
+const void* RememberedPipeline(u64 generation, u64 targets) {
     if (!use_pipelines || !current_valid) {
         return nullptr;
     }
+    current_targets = targets;
     if (generation != memo_generation) {
         for (auto& memo : memos) {
             memo.clear();
@@ -569,8 +581,9 @@ const void* RememberedPipeline(u64 generation) {
         memo_generation = generation;
         return nullptr;
     }
-    const auto it = memos[UseKey].find(current_memo[UseKey]);
-    if (it == memos[UseKey].end()) {
+    const u64 key = KeyFor(UseKey);
+    const auto it = memos[UseKey].find(key);
+    if (it == memos[UseKey].end() || unreliable_keys.contains(key)) {
         return nullptr;
     }
     // Every 256th one is worked out again and compared (NotePipeline): the caller gets null.
@@ -584,19 +597,37 @@ const void* RememberedPipeline(u64 generation) {
     return it->second;
 }
 
-void NotePipeline(const void* pipeline) {
+const void* NotePipeline(const void* pipeline, u64 targets) {
     if (!current_valid || !pipeline) {
         spot_pending = nullptr;
-        return;
+        return nullptr;
     }
     current_valid = false;
+    current_targets = targets;
+    const void* differed = nullptr;
     if (spot_pending) {
         if (spot_pending != pipeline) {
+            differed = spot_pending;
             ++counts.spot_differed;
-            use_pipelines = false;
-            reuse_stopped = true;
-            LOG_ERROR(Render, "GX pipelines: a draw's objects told a different pipeline than its "
-                              "registers; pipelines are worked out from the registers again");
+            ++spot_differences;
+            // This key told two pipelines apart: never reused again. Past a few such keys the
+            // objects aren't telling pipelines reliably here: reuse stops.
+            unreliable_keys.insert(KeyFor(UseKey));
+            if (spot_differences >= MaxDiffers) {
+                use_pipelines = false;
+                reuse_stopped = true;
+                LOG_ERROR(Render,
+                          "GX pipelines: {} draws' objects told a different pipeline than "
+                          "their registers; pipelines are worked out from the registers "
+                          "again",
+                          spot_differences);
+            } else {
+                LOG_WARNING(Render,
+                            "GX pipelines: a draw's objects told a different pipeline than "
+                            "its registers ({} of {} allowed); that key is worked out from "
+                            "the registers from now on",
+                            spot_differences, MaxDiffers);
+            }
         }
         spot_pending = nullptr;
     }
@@ -607,7 +638,7 @@ void NotePipeline(const void* pipeline) {
         if (memo.size() >= MemoLimit) {
             memo.clear();
         }
-        const auto [it, added] = memo.try_emplace(current_memo[k], pipeline);
+        const auto [it, added] = memo.try_emplace(KeyFor(k), pipeline);
         if (added) {
             ++counts.memo_new[k];
         } else if (it->second == pipeline) {
@@ -617,6 +648,7 @@ void NotePipeline(const void* pipeline) {
             it->second = pipeline;
         }
     }
+    return differed;
 }
 
 } // namespace Core::BbGxDraws

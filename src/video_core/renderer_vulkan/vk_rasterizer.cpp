@@ -1021,8 +1021,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         const GraphicsPipeline* pipeline = nullptr;
         const bool gx = ::Core::BbGxDraws::Observing();
         if (gx) {
-            if (const void* remembered =
-                    ::Core::BbGxDraws::RememberedPipeline(pipeline_cache.Generation())) {
+            gx_targets = GxTargetSignature();
+            if (const void* remembered = ::Core::BbGxDraws::RememberedPipeline(
+                    pipeline_cache.Generation(), gx_targets)) {
                 pipeline = pipeline_cache.ReuseGraphicsPipeline(
                     static_cast<const GraphicsPipeline*>(remembered));
             }
@@ -1030,7 +1031,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         if (!pipeline) {
             pipeline = pipeline_cache.GetGraphicsPipeline({}, true);
             if (gx) {
-                ::Core::BbGxDraws::NotePipeline(pipeline);
+                LogGxPipelineDifference(::Core::BbGxDraws::NotePipeline(pipeline, gx_targets),
+                                        pipeline);
             }
         }
         ALap(ASection::Pipeline);
@@ -1577,7 +1579,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (UseDrawPipe() && FilterDrawPasses()) {
         const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params, true);
         if (::Core::BbGxDraws::Observing()) {
-            ::Core::BbGxDraws::NotePipeline(pipeline);
+            LogGxPipelineDifference(::Core::BbGxDraws::NotePipeline(pipeline, GxTargetSignature()),
+                                    pipeline);
         }
         if (pipeline) {
             QueueDraw(PacketKind::DrawIndirect, pipeline, is_indexed, 0, args);
@@ -6703,6 +6706,104 @@ const Rasterizer::PrefetchedBuffer* Rasterizer::FindPrefetched(u32 buffer_index)
         }
     }
     return nullptr;
+}
+
+// "Faster pipeline lookup": the render targets as the registers set them (formats, which are
+// written, export formats), part of the remembered pipeline's key. One engine target object
+// stood for a two-target and a one-target pass, which take different pixel shaders.
+u64 Rasterizer::GxTargetSignature() const {
+    const auto& regs = liverpool->regs;
+    u64 h = 0xcbf29ce484222325ull;
+    const auto mix = [&h](u64 v) { h = (h ^ v) * 0x100000001b3ull; };
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& buffer = regs.color_buffers[cb];
+        mix(buffer ? (u64(buffer.info.raw) << 1 | 1) : 0);
+    }
+    mix(regs.color_target_mask.raw);
+    mix(regs.color_export_format.raw);
+    mix(regs.color_shader_mask.raw);
+    return h;
+}
+
+// "Faster pipeline lookup" stopped: a draw's engine objects told a different pipeline than its
+// registers. Which parts of the two pipelines' keys differ, so the objects' key can be made to
+// tell them apart.
+void Rasterizer::LogGxPipelineDifference(const void* remembered_ptr,
+                                         const GraphicsPipeline* worked_out) {
+    if (!remembered_ptr || !worked_out) {
+        return;
+    }
+    const auto& a = static_cast<const GraphicsPipeline*>(remembered_ptr)->GetGraphicsKey();
+    const auto& b = worked_out->GetGraphicsKey();
+    std::string parts;
+    const auto add = [&parts](std::string_view what) {
+        if (!parts.empty()) {
+            parts += ", ";
+        }
+        parts += what;
+    };
+    static constexpr std::array<const char*, MaxShaderStages> stage_names{
+        "pixel", "hull", "domain", "vertex", "geometry", "compute"};
+    for (size_t i = 0; i < a.stage_hashes.size(); ++i) {
+        if (a.stage_hashes[i] != b.stage_hashes[i]) {
+            add(fmt::format("{} shader {:#x}/{:#x}",
+                            i < stage_names.size() ? stage_names[i] : "stage", a.stage_hashes[i],
+                            b.stage_hashes[i]));
+        }
+    }
+    for (size_t i = 0; i < a.vertex_buffer_formats.size(); ++i) {
+        if (a.vertex_buffer_formats[i] != b.vertex_buffer_formats[i]) {
+            add(fmt::format("vertex buffer {} format {}/{}", i,
+                            vk::to_string(a.vertex_buffer_formats[i]),
+                            vk::to_string(b.vertex_buffer_formats[i])));
+        }
+    }
+    for (size_t i = 0; i < a.color_buffers.size(); ++i) {
+        if (!(a.color_buffers[i] == b.color_buffers[i])) {
+            add(fmt::format("target {} format {}/{} number {}/{} export {}/{}", i,
+                            static_cast<u32>(a.color_buffers[i].data_format),
+                            static_cast<u32>(b.color_buffers[i].data_format),
+                            static_cast<u32>(a.color_buffers[i].num_format),
+                            static_cast<u32>(b.color_buffers[i].num_format),
+                            static_cast<u32>(a.color_buffers[i].export_format),
+                            static_cast<u32>(b.color_buffers[i].export_format)));
+        }
+        if (std::memcmp(&a.blend_controls[i], &b.blend_controls[i], sizeof(a.blend_controls[i])) !=
+            0) {
+            add(fmt::format("target {} blend", i));
+        }
+        if (a.write_masks[i] != b.write_masks[i]) {
+            add(fmt::format("target {} write mask", i));
+        }
+        if (a.color_samples[i] != b.color_samples[i]) {
+            add(fmt::format("target {} samples", i));
+        }
+    }
+    const auto field = [&](bool differs, std::string_view what) {
+        if (differs) {
+            add(what);
+        }
+    };
+    field(a.num_color_attachments != b.num_color_attachments, "number of targets");
+    field(std::memcmp(&a.cb_shader_mask, &b.cb_shader_mask, sizeof(a.cb_shader_mask)) != 0,
+          "shader target mask");
+    field(a.mrt_mask != b.mrt_mask, "target mask");
+    field(a.logic_op != b.logic_op, "logic op");
+    field(a.num_samples != b.num_samples || a.depth_samples != b.depth_samples, "samples");
+    field(a.patch_control_points != b.patch_control_points, "patch control points");
+    field(a.z_format != b.z_format || a.stencil_format != b.stencil_format, "depth format");
+    field(a.depth_clamp_enable != b.depth_clamp_enable, "depth clamp");
+    field(a.motion_vectors != b.motion_vectors || a.motion_slot != b.motion_slot,
+          "character motion");
+    field(a.prim_type != b.prim_type, fmt::format("primitive {}/{}", static_cast<u32>(a.prim_type),
+                                                  static_cast<u32>(b.prim_type)));
+    field(a.polygon_mode != b.polygon_mode, "polygon mode");
+    field(a.clip_space != b.clip_space, "clip space");
+    field(a.provoking_vtx_last != b.provoking_vtx_last, "provoking vertex");
+    field(a.depth_clip_enable != b.depth_clip_enable, "depth clip");
+    LOG_ERROR(Render, "GX pipelines: the remembered and the worked-out pipeline differ in: {}",
+              parts.empty() ? std::string{"nothing in the key (two pipelines with one key)"}
+                            : parts);
 }
 
 bool Rasterizer::HitchProfile() {

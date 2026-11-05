@@ -262,6 +262,9 @@ private:
     /// "Detailed stutter reports" (with diagnostics): every draw timed by section, every packet
     /// timed by kind, and both shown for each stutter. Slower; for finding stutter causes.
     static bool HitchProfile();
+    void LogGxPipelineDifference(const void* remembered, const GraphicsPipeline* worked_out);
+    u64 GxTargetSignature() const;
+    u64 gx_targets{}; ///< this draw's GxTargetSignature (command thread)
     std::array<std::atomic<u64>, 5> packet_kind_ns{}; ///< draw recorder, by PacketKind
     void DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,

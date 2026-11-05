@@ -44,10 +44,14 @@ void CheckDraw(u64 guest_end, std::span<const u32, 2> tail, const AmdGpu::Regs& 
 /// The command thread, before working a draw's pipeline out: the pipeline the draw CheckDraw saw
 /// took when its objects were seen before ("Pipelines from the engine's objects"), else null.
 /// `generation` is the pipeline cache's (remembered pipelines are forgotten when it changes).
-const void* RememberedPipeline(u64 generation);
+/// `targets`: a signature of the render targets as the registers set them (formats and which are
+/// written), part of the key: one engine target object can stand for different formats.
+const void* RememberedPipeline(u64 generation, u64 targets);
 
 /// The command thread, once the draw CheckDraw saw has its pipeline (from the registers): whether
-/// the engine's objects would have told the same one (the pipeline memo check).
-void NotePipeline(const void* pipeline);
+/// the engine's objects would have told the same one (the pipeline memo check). Returns the
+/// remembered pipeline when a spot check found it different (reuse stops; the caller logs how
+/// the two differ), else null.
+const void* NotePipeline(const void* pipeline, u64 targets);
 
 } // namespace Core::BbGxDraws
