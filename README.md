@@ -12,20 +12,26 @@ SPDX-License-Identifier: GPL-2.0-or-later
 > for the threaded renderer, frame pacing, character motion vectors and VRAM work he has already
 > contributed. Old links to `IFreemz/shadPS4-Bloodborne-DLSS-FSR` redirect here.
 
-> **New: [2.1.0-pre.5](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.5) (experimental), most likely the last pre-release before these changes go into the stable build.** The BB Remaster mod runs smoothly on a 6 GB RTX 3060, about 99% of stutters fixed, GT-VBAO ambient occlusion, an FPS cap in F1 that changes while you play (no FPS patch needed), updated DLSS and DLSS frame generation with model presets, and a faster LTO and PGO build. The stable build is still [2.0.1](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.1). Bug reports are welcome in the [issues](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues).
+> **New: [2.1.0](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0), the biggest update yet.** A new multi-threaded renderer (up to 3x the frame rate with the BB PC Remaster mod), almost all stutters gone, resolution and FPS cap set in F1 (no resolution or FPS patches needed), Better ambient occlusion and Better SSR built in, a Linux build, and shadPS4 0.21.0. See the [release notes](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0). Bug reports are welcome in the [issues](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues).
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
 and 50 series, up to 4x on RTX 50; FSR on every other GPU).
 
-This is a modified shadPS4 0.20.0. The game renders at the resolution set by its resolution patch
-(say 2560x1440) and is upscaled to your window (say 3840x2160). It is real temporal upscaling: the
-scene is jittered and the upscaler gets depth plus camera and character motion, so it rebuilds
-detail instead of sharpening a stretched image. The HUD is drawn on top afterwards and stays
-crisp.
+This is a modified shadPS4 0.21.0 for Windows and Linux. The game renders at a lower resolution
+(say 2560x1440, set in F1) and is upscaled to your window (say 3840x2160). It is real temporal
+upscaling: the scene is jittered and the upscaler gets depth plus camera and character motion, so
+it rebuilds detail instead of sharpening a stretched image. The HUD is drawn on top afterwards and
+stays crisp.
 
-DLSS looks better, especially from low render resolutions; FSR 3.1 runs on any GPU. Without the
-upscaler DLLs the build behaves exactly like shadPS4 0.20.0.
+DLSS looks better, especially from low render resolutions; FSR 3.1 runs on any GPU.
+
+It is also much faster than standard shadPS4 for Bloodborne: a multi-threaded renderer and many
+other changes give up to 3x the frame rate in CPU-heavy areas with the BB PC Remaster mod (28 to
+83 FPS on an RTX 3060 Laptop with an i7-11800H, a CPU in the same class as a desktop Ryzen 5
+5600), and new textures, geometry and shaders load in the background, so almost all stutters are
+gone. With *Threaded Renderer* off in F3 and without the upscaler files, it behaves like shadPS4
+0.21.0.
 
 | 1280x720, DLSS off | 1280x720 upscaled to 3840x2160 with DLSS |
 |---|---|
@@ -33,15 +39,15 @@ upscaler DLLs the build behaves exactly like shadPS4 0.20.0.
 
 Both rendered at 1280x720; open them full size to compare.
 
-**Jump to:** [Install](#install) · [Frame generation](#frame-generation) ·
+**Jump to:** [Install](#install) · [Resolution](#resolution) · [Frame generation](#frame-generation) ·
 [HDR](#hdr-sdr-to-hdr) · [Keyboard and mouse](#keyboard-and-mouse) · [Tested setups](#tested-setups) · [Settings](#settings) ·
 [Troubleshooting](#troubleshooting) · [FAQ](#faq)
 
 ## Requirements
 
-- Windows 10 or 11, 64-bit
+- Windows 10 or 11, 64-bit, or Linux x64
 - Bloodborne v1.09 already running in shadPS4 (any region; tested with CUSA03173)
-- DLSS: an RTX 20 series or newer card and a recent driver (ships DLSS 310.9.1, DLSS 4.5)
+- DLSS: an RTX 20 series or newer card and a recent driver (ships DLSS 310.9.16, DLSS 4.5)
 - DLSS Frame Generation: an RTX 40 or 50 series card, a recent driver, Windows 10 20H1 or newer
   with *Hardware-accelerated GPU scheduling* on (Settings > Display > Graphics)
 - FSR 3.1 and FSR frame generation: any GPU that runs shadPS4
@@ -50,22 +56,31 @@ Both rendered at 1280x720; open them full size to compare.
 
 ## Install
 
-1. Download the latest zip from [Releases](../../releases).
+1. Download the latest `shadPS4-Bloodborne-win64-….zip` from [Releases](../../releases).
 2. Copy `shadPS4.exe` and all the DLLs into your shadPS4 folder, replacing its `shadPS4.exe`
    (back it up if you want to switch back).
    - `shadps4_dlss.dll`, `nvngx_dlss.dll`: DLSS, used on RTX cards only
    - `amd_fidelityfx_vk.dll`: FSR 3.1 upscaling and FSR frame generation
    - `sl.*.dll`, `nvngx_dlssg.dll`: DLSS Frame Generation (NVIDIA Streamline), loaded only when
      frame generation is on
-3. In the Bloodborne patches (shadPS4 patch manager or BBLauncher's Patches tab), enable a
-   **Resolution Patch** (see the table below), **Disable AA**, **Disable Chromatic Aberration**
-   and **Disable DoF**, and leave **Disable Motion Blur** off (see below).
-4. Start the game and press **F1** in gameplay. The panel should say *Active* and show the
-   upscaler and resolutions.
+3. Start the game and press **F1** in gameplay. Under *Recommended game patches* (Main tab),
+   **Apply recommended patches** turns on **Disable AA**, **Disable Chromatic Aberration** and
+   **Disable DoF** and keeps **Disable Motion Blur** off (see below). Then set your resolution
+   under *Resolution* (Display tab, see [Resolution](#resolution)) and restart once.
+4. F1 should say *Active* and show the upscaler and resolutions.
 
 Without a launcher, double-click `shadPS4.exe` and pick Bloodborne from the game list.
 
 To go back to normal rendering, delete the DLLs or untick *Upscaling enabled* in F1.
+
+**On Linux:** unpack `shadPS4-Bloodborne-linux-x64-….tar.xz` into its own folder and start
+`shadps4` from there; the upscaler libraries are next to it. The rest works as on Windows.
+
+**Verifying a download:** every release file is built by GitHub Actions from this repository's
+source, with NVIDIA's and AMD's files taken unchanged from their own repositories, and nothing
+added by hand. Each release lists the build it came from, with `SHA256SUMS.txt` to compare your
+download against. With the [GitHub CLI](https://cli.github.com/) you can also check where a file
+was built: `gh attestation verify <file> --repo eFMann/shadPS4-Bloodborne-DLSS-FSR`.
 
 **With BBLauncher:** unzip this build into its own folder. In BBLauncher, click *Manage Builds* >
 *Add Local Build*, pick this `shadPS4.exe`, tick it under *Selected* and start the game as
@@ -76,7 +91,8 @@ normal `shadPS4.exe`.
 
 FSR 4 is AMD's machine-learning upscaler, sharper and steadier than FSR 3.1, mainly for Radeon
 and Intel Arc cards (on RTX cards DLSS is the better fit). It is a separate download from
-[Releases](../../releases), `shadPS4-Bloodborne-FSR4-addon-…-win64.zip`.
+[Releases](../../releases), `shadPS4-Bloodborne-FSR4-addon-win64-….zip` (Linux:
+`shadPS4-Bloodborne-FSR4-addon-linux-x64-….tar.xz`).
 
 1. Put the `fsr4` folder from the zip next to `shadPS4.exe` (the folder, not its contents).
 2. Start the game. *Automatic* now uses FSR 4 on cards without DLSS; you can also pick
@@ -117,20 +133,20 @@ frame rate when the GPU is saturated or the generated output is limited by VSync
 
 Tips:
 
-- **Use a 60 fps base**: *Uncap FPS++* or *60 FPS++* with vblank 60 in shadPS4's settings. Frame
-  generation holds back a frame, which adds input delay; small at 60 fps, noticeable at 30, where
-  moving characters also smear, more so at 3x and above.
+- **Use a 60 fps base**: set *FPS cap* to 60 in F1 (Display tab). Frame generation holds back a
+  frame, which adds input delay; small at 60 fps, noticeable at 30, where moving characters also
+  smear, more so at 3x and above.
 - **Leave GPU headroom**: frame generation costs about 2-3 ms per frame at 4K. If the base frame
   rate drops below 60 and gets uneven, it stutters instead of smoothing. Lower the render
-  resolution if needed, for example native 1080p on a 4K screen, or the 1280x720 patch on 1440p.
+  resolution if needed, for example 1080p on a 4K screen, or 720p on 1440p.
 - **Close overlays** (NVIDIA app overlay, RivaTuner/RTSS): they break frame generation.
 - **Use Fullscreen or Borderless** and keep the game focused; frame generation pauses in the
   background. With DLSS and *Fullscreen*, the build takes the display exclusively.
 - **Present mode**: DLSS frame generation uses Immediate. Disable driver-forced VSync for
   `shadPS4.exe`; it can lower the base frame rate. FSR keeps your selected present mode.
-- **Other base rates work too**: vblank 45 with *Uncap FPS++* gives 45 to 90. A steady base
-  matters more than a high one. Set the rate with vblank: outside limiters (RTSS, NVIDIA app)
-  don't cap generated frames reliably.
+- **Other base rates work too**: an FPS cap of 45 gives 45 to 90. A steady base matters more
+  than a high one. Use F1's FPS cap: outside limiters (RTSS, NVIDIA app) don't cap generated
+  frames reliably.
 
 It turns itself off in menus, loading screens and while the window resizes. Multi Frame
 Generation is DLSS only, and with the RenoDX HDR mod frame generation always uses FSR.
@@ -164,41 +180,34 @@ their original page and report their problems to their authors.
 Frame generation uses NVIDIA [Streamline](https://github.com/NVIDIA-RTX/Streamline) (DLSS-G and
 Reflex) or AMD's FidelityFX SDK (FSR 3.1.4), loaded only when the setting is on.
 
-### Which resolution patch
+### Resolution
 
-The resolution patch sets the render resolution; the upscaler goes from there to your window
-size, keeping the aspect ratio.
+F1 → Display → *Resolution*: tick **Set the resolution here** and pick:
 
-| Window | Resolution Patch | Result |
+- **Output resolution**: the game's own frame, its post-processing and UI. *Window* follows your
+  window size.
+- **Upscale from**: the render resolution of the 3D scene, which the upscaler brings up to the
+  output. *Native* is anti-aliasing only (DLAA / FSR Native AA).
+- **UI and effects at**: *Output (sharp UI)* keeps the UI and effects at the output resolution;
+  *Render resolution (faster)* renders the whole frame lower, like a Resolution Patch.
+
+It applies after a restart. While it's on, the Resolution, Decoupled UI and HD Motion Blur
+patches are skipped, so you can leave them as they are; F1 lists what it skipped.
+
+| Window | Upscale from | Result |
 |---|---|---|
 | 3840x2160 | 2560x1440 | Quality mode (recommended for 4K) |
-| 3840x2160 | none (native 1920x1080) | Performance mode, faster and a bit softer |
-| 2560x1440 | none (native 1920x1080) | Quality mode |
-| 2560x1440 | 2560x1440 | Anti-aliasing only (DLAA / FSR Native AA) |
+| 3840x2160 | 1920x1080 | Performance mode, faster and a bit softer |
+| 2560x1440 | 1920x1080 | Quality mode |
+| 2560x1440 | Native | Anti-aliasing only (DLAA / FSR Native AA) |
 | 1920x1080 | 1280x720 | Quality mode, for slower GPUs |
-| 1920x1080 | none (native 1920x1080) | Anti-aliasing only |
-
-16:10 and ultrawide work with a matching Resolution Patch. Explicit `output=WxH` values
-also keep the patched aspect ratio instead of stretching the image.
+| 1920x1080 | Native | Anti-aliasing only |
 
 FSR struggles more than DLSS from low resolutions: with FSR, render at 1920x1080 or more for a
-4K window.
+4K window. Render resolutions above 1080p need more VRAM (F1 marks them).
 
-A render resolution above the window is anti-aliased and scaled down. The upscaler goes up to 3x
-per side; beyond that the rest is plain scaling. Higher render resolutions need more VRAM, and
-the resolution patch notes about raising dmem still apply.
-
-### Decoupled 1080p UI patches
-
-These patches render the scene lower (for example 1280x720) and keep the UI at 1080p. The build
-detects them: the scene is upscaled to 1080p, then the game adds its effects and its own sharp
-UI. Use one instead of a regular Resolution Patch, not with one. The 640x360, 960x540, 1280x720
-and 1600x900 versions are supported; with 320x180 and those above 1080p the upscaler stays off
-(F1 says why).
-
-They are meant for 1080p screens and low VRAM. The result is 1080p scaled to your window, so on
-1440p or 4K the regular Resolution Patches look sharper. FSR shimmers more on thin detail from
-720p and below; DLSS copes well. Sharpness applies here too.
+The resolution and Decoupled UI patches still work if you'd rather use them, with *Set the
+resolution here* off.
 
 ### HDR: SDR to HDR
 
@@ -233,8 +242,9 @@ left out of the timing. Routes without enemies repeat best: enemies can act diff
 ### HDR with RenoDX
 
 > [!WARNING]
-> **RenoDX doesn't work with 2.0.0, 2.0.1 and the 2.1.0-pre.2 and later builds yet.** shadPS4 0.20.0 compiles the game's shaders
-> differently, so RenoDX doesn't recognise them until it gets an update. For HDR, use
+> **RenoDX doesn't work with 2.0.0 and later builds yet, including 2.1.0.** shadPS4 0.20.0 and
+> newer compile the game's shaders differently, so RenoDX doesn't recognise them until it gets an
+> update. For HDR, use
 > [1.8.6](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.6) or [2.1.0-pre.1](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1) (experimental) for now.
 
 The [RenoDX](https://github.com/clshortfuse/renodx) HDR mod for Bloodborne (ReShade 6.8.0 or
@@ -264,13 +274,12 @@ RenoDX authors.
 ### Other patches
 
 Keep *Better AA* and *Enable TAA* off: the upscaler replaces the game's anti-aliasing.
-*Frame rate hooks* (F1, on by default) unlock the frame rate themselves, so the frame rate
-patches (*60 FPS++*, *Uncap FPS++* and the like) are left out while they are on. *FPS cap* in F1
-changes while the game runs.
-*60FPS++ (no deltatime)* may crash while an area loads; use *60 FPS++*. *Enable Screen Space
-Reflections* turns off object motion for the upscaler, so characters and weapons can smear; keep
-it off for the sharpest image. Patches and mods that
-players tested with this build are under [Tested setups](#tested-setups).
+The frame rate hooks (on by default) unlock the frame rate themselves, so the frame rate patches
+(*60 FPS++*, *Uncap FPS++* and the like) are left out while they are on. *FPS cap* in F1 changes
+while the game runs. *Enable Screen Space Reflections* isn't needed any more: reflections are
+built in (F1 → Graphics, *Game's* or *Better SSR*). The *Performance Patch* is left out while
+upscaling, as it changes the game's render targets. Patches and mods that players tested with
+this build are under [Tested setups](#tested-setups).
 
 ### Why the three "Disable" patches, and not Disable Motion Blur
 
@@ -335,9 +344,22 @@ the panel is open.
 - **Frame gen multiplier**: 2x to 4x with DLSS on cards with Multi Frame Generation.
 - **Lower input delay (Reflex)**: DLSS frame generation; less input delay, possibly fewer fps.
 - **Frame gen FPS counter**: the game's frame rate and the displayed one, top left.
-- **Menu fix**: on by default. While a menu covers most of the screen, the game's own image is
-  shown and jitter pauses, so nothing shimmers behind it. Same frame rate; small popups keep the
-  upscaled image.
+- **Menu fix**: on by default. Menus and dialogue don't jitter, and the scene behind them stays
+  upscaled.
+- **Display tab**: *FPS cap* (changes while you play), *Even frames with a cap* and the
+  resolution (see [Resolution](#resolution)).
+- **Graphics tab**: anisotropic filtering (16x by default), *Texture quality* (for cards with
+  less VRAM), **Better ambient occlusion (GT-VBAO)** (recommended: it looks much better than the
+  game's own and costs about 1-2% GPU time at half resolution), screen space reflections
+  (*Game's*, **Better SSR** or *Off*; switching between Off and on needs a restart) and *Game
+  motion blur*.
+- **Other tab**: the FPS counter (frame time, upscaler, preset, mode, resolution, a frame time
+  graph), keyboard and mouse, the benchmark route and F1's own UI scale.
+
+**F3** → *Bloodborne* holds the emulator's settings, in sections (Performance, Stutters,
+Graphics, VRAM, Interface, Diagnostics). The defaults are the tested ones; *Show advanced
+settings* shows the rest. Settings that can cause visual artefacts are marked (!) and ask before
+turning on, and saving one that needs a restart offers to restart the game for you.
 
 Settings live in `dlss.ini` in the shadPS4 user folder (`user` next to `shadPS4.exe`, or
 `%APPDATA%\shadPS4`). Hand edits apply within a second.
@@ -365,8 +387,7 @@ F1 shows why upscaling isn't running.
   *Relaxed* and restart. F1 warns about it.
 - **Missing faces or arms (the Doll, your character) or other glitches**: close RivaTuner / MSI
   Afterburner (a per-game profile isn't enough) and the NVIDIA app overlay, and check Readbacks
-  Mode is *Relaxed*. An FPS patch matching the vblank (*60 FPS++* with 60, *90 FPS++* with 90)
-  also helps.
+  Mode is *Relaxed*.
 - **"DLSS Frame generation needs …"**: F1 names what's missing (RTX 40/50 card, newer driver or
   Hardware-accelerated GPU scheduling). *Automatic* uses FSR frame generation instead.
 - **Crash on AMD Radeon when the upscaler starts**: fixed in 1.7.0
@@ -374,13 +395,14 @@ F1 shows why upscaling isn't running.
   attach `user/log/shad_log.txt` there.
 - **Frame generation on, but not smoother**: close overlays (NVIDIA app overlay, RivaTuner), keep
   the game focused and check the GPU isn't maxed out (see *Frame generation*).
-- **Memory use grows over a long session**: a lower render resolution slows it down.
+- **VRAM runs out with texture mods**: check *VRAM cleanup* is on in F3 (on by default), try
+  *Texture quality* High or Medium in F1 → Graphics, or a lower render resolution.
 - **"Waiting for gameplay"**: expected in menus, the title screen and loading screens. If it stays
   in gameplay, check that Disable Motion Blur is off.
 - **F1 doesn't open**: check `input_config/global.ini` in the user folder for
   `hotkey_toggle_dlss = f1`; you can bind another key there.
-- **G-SYNC / FreeSync flicker**: uneven frame pacing in emulation, not DLSS. Use an FPS patch
-  matching your vblank (60 FPS++ with 60) rather than *Uncap FPS++*.
+- **G-SYNC / FreeSync flicker**: uneven frame pacing, not DLSS. Set an *FPS cap* in F1 with *Even
+  frames with a cap* on.
 - **No sound effects in menus**: if Windows uses *Dolby Atmos for Home Theater* (or another
   spatial sound format) for your audio device, turn it off in Windows' sound settings. Thanks to
   @DarthBane768 for tracking this down
@@ -396,14 +418,15 @@ add-on uses the community Vulkan port of the v07 model.
 **Frame generation?** Built in, see *Frame generation*, including mods for DLSS frame
 generation on RTX 20, 30 and 40.
 
-**HDR?** Yes: SDR to HDR in F1 on any GPU (see *HDR: SDR to HDR*), NVIDIA RTX HDR, or RenoDX on 1.8.6 or 2.1.0-pre.1 (it doesn't work on the shadPS4 0.20.0 builds yet).
+**HDR?** Yes: SDR to HDR in F1 on any GPU (see *HDR: SDR to HDR*), NVIDIA RTX HDR, or RenoDX on 1.8.6 or 2.1.0-pre.1 (it doesn't work on the newer builds yet).
 
 **Other games?** No. It depends on how Bloodborne renders: which shaders draw the HUD, where the
 camera matrices live and which passes write motion data.
 
-**Linux or Steam Deck?** No, Windows only for now.
+**Linux or Steam Deck?** Linux yes, with DLSS, FSR 3.1, FSR 4 and frame generation: see
+*Install*. The Steam Deck runs Linux, but isn't tested yet.
 
-**Is this an official shadPS4 release?** No, it is a separate build based on shadPS4 0.20.0.
+**Is this an official shadPS4 release?** No, it is a separate build based on shadPS4 0.21.0.
 Please report problems here, not to the shadPS4 team.
 
 ## How it works
@@ -454,8 +477,12 @@ Menus, the title screen and loading screens aren't upscaled.
 
 ## Building
 
+Releases are built by the GitHub Actions workflow in [`.github/workflows/build.yml`](.github/workflows/build.yml),
+which does everything below; pushing a version tag makes a draft release from its files.
+
 The emulator builds like normal shadPS4 (see [documents/building-windows.md](documents/building-windows.md))
-and doesn't need the DLSS SDK.
+and doesn't need the DLSS SDK. Release builds use profile-guided optimisation (see
+[`pgo/README.md`](pgo/README.md)).
 
 The bridge needs the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS):
 
@@ -492,19 +519,23 @@ An AI coding agent was used in the development of this project.
 - IFreemz, the original author: the DLSS and FSR upscaling and frame generation integration
   (camera and object motion, jitter, HUD handling, Reflex), the F1 panel and keyboard and mouse
   controls with the mouse camera.
-- eFMann, the current maintainer: the threaded renderer, frame pacing, character motion vectors,
-  the VRAM cleanup rounds and buffer eviction, the shadPS4 0.20.0 port, the RTX 3060 DLSS
-  frame-pacing diagnosis and the Reflex options reapplication patch.
+- eFMann, the current maintainer: the threaded renderer and the other performance work, the
+  stutter fixes, frame pacing, character motion vectors, resolution and frame rate in F1, the
+  F3 Bloodborne settings, the VRAM cleanup rounds and buffer eviction, the shadPS4 0.20.0 and
+  0.21.0 ports, the Linux build, the RTX 3060 DLSS frame-pacing diagnosis and the Reflex options
+  reapplication patch.
 - Cainhurst27 (u/EnglishDave_), for finding and fixing shadPS4's long-standing VRAM leak, and for
   testing.
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) and its contributors, for the emulator.
-- deadinside28's [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc), whose notes on
-  the scene constants and viewport jitter were the starting point for camera motion and jitter
-  here, and whose FSR 4 integration the add-on follows.
+- deadinside28's [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) (BBport), whose
+  notes on the scene constants and viewport jitter were the starting point for camera motion and
+  jitter here, whose FSR 4 integration the add-on follows, and from which GT-VBAO ambient
+  occlusion, the frame rate hooks and several ideas behind the renderer work were ported.
 - FireBurn's [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), which runs FSR 4 on Vulkan, and
   the Q2RTX project, which built the FSR 4 v07 model files.
 - The authors of the Bloodborne patches for shadPS4 (Kyo, illusion and others), including the
-  resolution patches and the AA, chromatic aberration and depth-of-field patches.
+  resolution patches and the AA, chromatic aberration and depth-of-field patches; F1's
+  resolution and the built-in reflections are made from Kyo's patches.
 - The [RenoDX](https://github.com/clshortfuse/renodx) authors, for the HDR mod.
 - zeroznet, for SDR to HDR.
 - NVIDIA, for DLSS, Streamline and Reflex, and AMD, for FSR and the open FidelityFX SDK.
