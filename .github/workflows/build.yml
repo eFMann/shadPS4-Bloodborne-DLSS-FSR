@@ -8,6 +8,8 @@ run-name: ${{ inputs.title || github.event.head_commit.message || github.event.p
 on:
   push:
     branches: [main]
+    # A version tag (v2.1.0) also builds a draft release from this workflow's own files.
+    tags: ["v*"]
     paths-ignore:
       - "documents/**"
       - "**/*.md"
@@ -68,6 +70,7 @@ jobs:
       date: ${{ steps.vars.outputs.date }}
       shorthash: ${{ steps.vars.outputs.shorthash }}
       fullhash: ${{ steps.vars.outputs.fullhash }}
+      label: ${{ steps.vars.outputs.label }}
     steps:
     - uses: actions/checkout@v6
     - name: Get date and git hash
@@ -79,6 +82,12 @@ jobs:
         echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
         echo "shorthash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
         echo "fullhash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+        # File names: the version on a tag (release) build, the short commit otherwise.
+        if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          echo "label=$GITHUB_REF_NAME" >> $GITHUB_OUTPUT
+        else
+          echo "label=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        fi
 
   windows-sdl:
     runs-on: windows-2025-vs2026
@@ -159,17 +168,161 @@ jobs:
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
 
+    # The release zip is made here, like the Linux package: the DLSS bridge built from this
+    # repository, and NVIDIA's and AMD's own files at the versions tested, taken unchanged from
+    # their repositories. Nothing in it is built or added by hand.
+    - name: Get DLSS SDK
+      uses: actions/checkout@v6
+      with:
+        repository: NVIDIA/DLSS
+        ref: v310.9.16
+        path: sdk/dlss
+        sparse-checkout-cone-mode: false
+        sparse-checkout: |
+          /include/
+          /lib/Windows_x86_64/rel/nvngx_dlss.dll
+          /lib/Windows_x86_64/rel/nvngx_dlssg.dll
+          /lib/Windows_x86_64/x64/nvsdk_ngx_s.lib
+          /LICENSE.txt
+
+    - name: Get FidelityFX SDK
+      uses: actions/checkout@v6
+      with:
+        repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+        ref: v1.1.4
+        path: sdk/ffx
+        sparse-checkout-cone-mode: false
+        sparse-checkout: |
+          /PrebuiltSignedDLL/amd_fidelityfx_vk.dll
+          /LICENSE.txt
+
+    - name: Get FSR-Vulkan
+      uses: actions/checkout@v6
+      with:
+        repository: FireBurn/FSR-Vulkan
+        ref: 69fecd7c477a87aff148d41d3b454cb40295f154
+        path: sdk/fsr-vulkan
+
+    - name: Get FSR 4 model files
+      uses: actions/checkout@v6
+      with:
+        repository: FireBurn/Q2RTX
+        ref: ae8d628fae208813172446d1e49ed94150b04658
+        path: sdk/q2rtx
+        sparse-checkout: baseq2/fsr4_shaders
+
+    # Frame generation's DLLs: NVIDIA's Streamline release, the version the headers above are from.
+    - name: Get Streamline binaries
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $PSNativeCommandUseErrorActionPreference = $true
+        New-Item -ItemType Directory -Force sdk/sl | Out-Null
+        gh release download v2.14.16 -R NVIDIA-RTX/Streamline -p "*.zip" -D sdk/sl
+        Get-ChildItem sdk/sl/*.zip | ForEach-Object {
+          Write-Host "Streamline: $($_.Name)"
+          Expand-Archive $_.FullName -DestinationPath sdk/sl -Force
+        }
+        $dll = Get-ChildItem sdk/sl -Recurse -Filter sl.interposer.dll |
+          Where-Object { $_.Directory.Name -eq "x64" -and $_.Directory.Parent.Name -eq "bin" } |
+          Select-Object -First 1
+        if (-not $dll) { throw "Streamline: bin/x64/sl.interposer.dll not found" }
+        "SL_BIN=$($dll.DirectoryName)" >> $env:GITHUB_ENV
+        $license = Get-ChildItem sdk/sl -Recurse -File -Filter "license*" | Select-Object -First 1
+        if ($license) { "SL_LICENSE=$($license.FullName)" >> $env:GITHUB_ENV }
+
+    - name: Build upscaler libraries
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $PSNativeCommandUseErrorActionPreference = $true
+        $root = (Get-Location).Path -replace '\\', '/'
+        $bin = Split-Path (Get-Command clang-cl).Source
+        # The Vulkan loader's import library for the FSR 4 add-on, from the Vulkan headers.
+        python .github/workflows/scripts/vulkan_def.py externals/vulkan-headers/include/vulkan build-vk/vulkan-1.def
+        & "$bin\llvm-lib.exe" /def:build-vk/vulkan-1.def /machine:x64 /out:build-vk/vulkan-1.lib
+        $common = @("-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
+                    "-DCMAKE_CXX_COMPILER=clang-cl")
+        cmake -S dlss_bridge -B build-dlss @common "-DDLSS_SDK_ROOT=$root/sdk/dlss"
+        cmake --build build-dlss
+        cmake -S fsr4_addon -B build-fsr4 @common "-DFSR_VULKAN_ROOT=$root/sdk/fsr-vulkan" "-DVULKAN_LIBRARY=$root/build-vk/vulkan-1.lib"
+        cmake --build build-fsr4
+
+    # The same files as a hand-made release: the emulator with the upscaler DLLs next to it, and
+    # the FSR 4 add-on as its own download (its fsr4 folder goes next to shadPS4.exe).
+    - name: Package
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $label = "${{ needs.get-info.outputs.label }}"
+        $suffix = "${{ steps.pgo.outputs.suffix }}"
+        # Release files are named by their version only; test builds say how they were built.
+        if ("${{ github.ref_type }}" -eq "tag" -and $suffix -eq "-pgo") { $suffix = "" }
+        $name = "shadPS4-Bloodborne-win64-$label$suffix"
+        $addon = "shadPS4-Bloodborne-FSR4-addon-win64-$label$suffix"
+        New-Item -ItemType Directory -Force pkg/main/LICENSES, pkg/addon/fsr4 | Out-Null
+        Copy-Item build/shadPS4.exe, build-dlss/shadps4_dlss.dll pkg/main/
+        Copy-Item sdk/dlss/lib/Windows_x86_64/rel/nvngx_dlss.dll pkg/main/
+        Copy-Item sdk/ffx/PrebuiltSignedDLL/amd_fidelityfx_vk.dll pkg/main/
+        foreach ($dll in "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll") {
+          Copy-Item (Join-Path $env:SL_BIN $dll) pkg/main/
+        }
+        foreach ($dll in "sl.reflex.dll", "sl.pcl.dll") {
+          $path = Join-Path $env:SL_BIN $dll
+          if (Test-Path $path) { Copy-Item $path pkg/main/ }
+        }
+        # Frame generation's model: Streamline's own copy when it has one, else the DLSS SDK's.
+        $dlssg = Join-Path $env:SL_BIN nvngx_dlssg.dll
+        if (-not (Test-Path $dlssg)) { $dlssg = "sdk/dlss/lib/Windows_x86_64/rel/nvngx_dlssg.dll" }
+        Copy-Item $dlssg pkg/main/
+        Copy-Item LICENSE pkg/main/LICENSES/shadPS4-GPL-2.0.txt
+        Copy-Item dlss_bridge/LICENSE.txt pkg/main/LICENSES/dlss_bridge-MIT.txt
+        Copy-Item sdk/dlss/LICENSE.txt pkg/main/LICENSES/NVIDIA-DLSS-SDK.txt
+        Copy-Item sdk/ffx/LICENSE.txt pkg/main/LICENSES/AMD-FidelityFX-SDK-MIT.txt
+        if ($env:SL_LICENSE) { Copy-Item $env:SL_LICENSE pkg/main/LICENSES/NVIDIA-Streamline-MIT.txt }
+        $models = "sdk/q2rtx/baseq2/fsr4_shaders"
+        Copy-Item build-fsr4/shadps4_fsr4.dll pkg/addon/fsr4/
+        Copy-Item "$models/fsr4_model_v07_i8_*", "$models/rcas.spv", "$models/spd_auto_exposure.spv", "$models/LICENSE-FSR4-v07.txt" pkg/addon/fsr4/
+        Copy-Item sdk/fsr-vulkan/LICENSE.txt pkg/addon/fsr4/LICENSE-FSR-Vulkan.txt
+        Copy-Item LICENSE pkg/addon/fsr4/LICENSE-shadps4_fsr4-GPL-2.0.txt
+        # Each file's version in the log, to compare with an earlier release.
+        Get-ChildItem pkg/main -File | ForEach-Object {
+          "{0,-24} {1,12:N0} bytes  {2}" -f $_.Name, $_.Length, $_.VersionInfo.FileVersion
+        }
+        Compress-Archive -Path pkg/main/* -DestinationPath "$name.zip"
+        Compress-Archive -Path pkg/addon/fsr4 -DestinationPath "$addon.zip"
+        "name=$name" >> $env:GITHUB_ENV
+        "addon=$addon" >> $env:GITHUB_ENV
+
+    # Records that these files were built by this workflow from this commit, which anyone can
+    # check with: gh attestation verify <file> --repo <owner>/<repo>
     - name: Attest
       if: github.event_name != 'pull_request'
       uses: actions/attest-build-provenance@v4
       with:
-        subject-path: ${{github.workspace}}/build/shadPS4.exe
+        subject-path: |
+          ${{github.workspace}}/build/shadPS4.exe
+          ${{github.workspace}}/shadPS4-Bloodborne-*win64-*.zip
 
     - name: Upload Windows SDL artifact
       uses: actions/upload-artifact@v7
       with:
         name: shadPS4-exe-only-win64-${{ needs.get-info.outputs.shorthash }}${{ steps.pgo.outputs.suffix }}
         path: ${{github.workspace}}/build/shadPS4.exe
+
+    - name: Upload Windows release zip
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.name }}
+        path: ${{ env.name }}.zip
+
+    - name: Upload Windows FSR 4 add-on
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.addon }}
+        path: ${{ env.addon }}.zip
 
   linux:
     runs-on: ubuntu-24.04
@@ -261,7 +414,7 @@ jobs:
     - name: Package
       run: |
         set -e
-        name=shadPS4-Bloodborne-linux-x64-${{ needs.get-info.outputs.shorthash }}
+        name=shadPS4-Bloodborne-linux-x64-${{ needs.get-info.outputs.label }}
         mkdir -p pkg/main/LICENSES pkg/addon/fsr4
         cp build/shadps4 build-dlss/shadps4_dlss.so build-fsr3/libamd_fidelityfx_vk.so pkg/main/
         cp sdk/dlss/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.* pkg/main/
@@ -281,7 +434,7 @@ jobs:
         cp sdk/fsr-vulkan/LICENSE.txt pkg/addon/fsr4/LICENSE-FSR-Vulkan.txt
         cp LICENSE pkg/addon/fsr4/LICENSE-shadps4_fsr4-GPL-2.0.txt
         tar -C pkg/main -cJf $name.tar.xz .
-        tar -C pkg/addon -cJf shadPS4-Bloodborne-FSR4-addon-linux-x64-${{ needs.get-info.outputs.shorthash }}.tar.xz fsr4
+        tar -C pkg/addon -cJf shadPS4-Bloodborne-FSR4-addon-linux-x64-${{ needs.get-info.outputs.label }}.tar.xz fsr4
         echo "name=$name" >> $GITHUB_ENV
 
     # Records that these files were built by this workflow from this commit, which anyone can
@@ -301,5 +454,48 @@ jobs:
     - name: Upload Linux FSR 4 add-on
       uses: actions/upload-artifact@v7
       with:
-        name: shadPS4-Bloodborne-FSR4-addon-linux-x64-${{ needs.get-info.outputs.shorthash }}
+        name: shadPS4-Bloodborne-FSR4-addon-linux-x64-${{ needs.get-info.outputs.label }}
         path: shadPS4-Bloodborne-FSR4-addon-linux-x64-*.tar.xz
+
+  # A version tag: a draft release with exactly the files built above, their checksums, and a link
+  # to this run. Nothing is published: the draft waits for its notes and the Publish button.
+  release:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    needs: [get-info, windows-sdl, linux]
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v7
+      with:
+        pattern: shadPS4-Bloodborne-*
+        path: dist
+        merge-multiple: true
+
+    - name: Checksums
+      working-directory: dist
+      run: |
+        sha256sum * > SHA256SUMS.txt
+        cat SHA256SUMS.txt
+
+    - name: Draft release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        tag="$GITHUB_REF_NAME"
+        run="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        cat > notes.md <<EOF
+        (Release notes go here.)
+
+        ---
+
+        Built by GitHub Actions ([this run]($run)) from commit ${{ needs.get-info.outputs.fullhash }}.
+        Every file comes straight from that build. To check a download, compare it with
+        \`SHA256SUMS.txt\`, or verify where it was built with the GitHub CLI:
+
+            gh attestation verify <file> --repo ${{ github.repository }}
+        EOF
+        prerelease=""
+        if [[ "$tag" == *-* ]]; then prerelease="--prerelease"; fi
+        gh release create "$tag" dist/* --repo "${{ github.repository }}" --draft --verify-tag \
+          --title "$tag" --notes-file notes.md $prerelease
