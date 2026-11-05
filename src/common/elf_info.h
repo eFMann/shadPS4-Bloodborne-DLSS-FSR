@@ -103,6 +103,11 @@ public:
         return *Singleton<ElfInfo>::Instance();
     }
 
+    /// True once a game is loaded (the getters below assert it).
+    [[nodiscard]] bool IsInitialized() const {
+        return initialized;
+    }
+
     [[nodiscard]] std::string_view GameSerial() const {
         ASSERT(initialized);
         return Instance().game_serial;

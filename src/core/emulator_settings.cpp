@@ -113,7 +113,9 @@ std::shared_ptr<EmulatorSettingsImpl> EmulatorSettingsImpl::GetInstance() {
 }
 
 EmulatorSettingsImpl::ReloadScope::ReloadScope() {
-    if (t_private || Common::ElfInfo::Instance().GameSerial().empty()) {
+    // No game loaded yet (Big Picture's game list, started without a game): nothing to protect.
+    if (t_private || !Common::ElfInfo::Instance().IsInitialized() ||
+        Common::ElfInfo::Instance().GameSerial().empty()) {
         return; // within another scope, or no game running
     }
     copy = std::make_shared<EmulatorSettingsImpl>();
