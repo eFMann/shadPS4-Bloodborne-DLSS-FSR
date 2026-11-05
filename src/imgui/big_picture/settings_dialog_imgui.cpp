@@ -15,6 +15,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/render_affinity.h"
+#include "core/bb_game_fixes.h"
 #include "core/bb_resolution.h"
 #include "core/cpu_patches.h"
 #include "core/devtools/layer.h"
@@ -1480,6 +1481,30 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
     ImGui::EndChild();
 }
 
+// A sub-setting's indent (leading spaces, 4 a level): its name and its control both move in.
+static float SubSettingIndent(const std::string& name) {
+    size_t spaces = 0;
+    while (spaces < name.size() && name[spaces] == ' ') {
+        ++spaces;
+    }
+    return ImGui::GetFontSize() * 1.25f * static_cast<float>(spaces / 4);
+}
+
+// The L-shaped connector of a sub-setting's name at the cursor: from the row above down to the
+// middle of a row this high, then across to the indented name.
+static void DrawSubSettingConnector(int level, float row_height) {
+    const float step = ImGui::GetFontSize() * 1.25f;
+    const float line_height = ImGui::GetTextLineHeight();
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImU32 colour = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    const float thickness = std::max(1.0f, ImGui::GetFontSize() / 12.0f);
+    const float x = pos.x + step * static_cast<float>(level - 1) + step * 0.4f;
+    const float y_mid = pos.y + row_height * 0.5f;
+    auto* draw_list = ImGui::GetWindowDrawList();
+    draw_list->AddLine(ImVec2(x, y_mid - line_height * 0.95f), ImVec2(x, y_mid), colour, thickness);
+    draw_list->AddLine(ImVec2(x, y_mid), ImVec2(x + step * 0.45f, y_mid), colour, thickness);
+}
+
 // The same settings as F1's Graphics tab (ambient occlusion, reflections, the game's effects), read
 // and written directly, so that F1 and F3 always show the same (not loaded into F3's copies and
 // saved with them).
@@ -1501,13 +1526,20 @@ void SettingsWindow::DrawBbImageSettings() {
     const auto slider = [&](const char* name, int value, auto set, const char* tooltip) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
-        ImGui::TextWrapped("%s", name);
+        DrawSettingName(name);
         ImGui::TableNextColumn();
+        const float indent = SubSettingIndent(name);
+        if (indent > 0.0f) {
+            ImGui::Indent(indent);
+        }
         float shown = float(value) * 0.01f;
         if (ImGui::SliderFloat((std::string("##") + name).c_str(), &shown, 0.25f, 4.0f, "%.2f")) {
             set(int(std::lround(shown * 100.0f)));
         }
         NoteRowFocus();
+        if (indent > 0.0f) {
+            ImGui::Unindent(indent);
+        }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             saved();
         }
@@ -1565,12 +1597,17 @@ void SettingsWindow::DrawBbImageSettings() {
     const int ssr_before = ssr_mode;
     AddSettingCombo("Screen space reflections", ssr_mode, ssr_modes);
     if (ImGui::IsItemHovered()) {
-        ShowTooltip("With the game's \"Enable Screen Space Reflections\" patch. Better: traced "
-                    "more precisely, sharper, to the screen's edges");
+        ShowTooltip("Built in, no patch needed. Better: traced more precisely, sharper, to the "
+                    "screen's edges. Off: no cost. Switching between Off and on needs a restart");
     }
     if (ssr_mode != ssr_before) {
         EmulatorSettings.SetBbSsrMode(ssr_mode);
         saved();
+        // Off to on or back: the game's own reflection code is patched in at a start.
+        if (isGameRunning && ::Core::BbGameFixes::SsrNeedsRestart(ssr_mode)) {
+            restartChanged = {"Screen space reflections"};
+            restartPromptRequest = true;
+        }
     }
     if (ssr_mode == 1) {
         checkbox(
@@ -1590,15 +1627,6 @@ void SettingsWindow::DrawBbImageSettings() {
 
 // A setting's name. Leading spaces (4 a level) make it a sub-setting of the row above: indented,
 // a little dimmer, with a connector line from its parent so it reads as part of it.
-// A sub-setting's indent (leading spaces, 4 a level): its name and its control both move in.
-static float SubSettingIndent(const std::string& name) {
-    size_t spaces = 0;
-    while (spaces < name.size() && name[spaces] == ' ') {
-        ++spaces;
-    }
-    return ImGui::GetFontSize() * 1.25f * static_cast<float>(spaces / 4);
-}
-
 void SettingsWindow::DrawSettingName(const std::string& name) {
     size_t spaces = 0;
     while (spaces < name.size() && name[spaces] == ' ') {
@@ -1610,16 +1638,7 @@ void SettingsWindow::DrawSettingName(const std::string& name) {
         return;
     }
     const float step = ImGui::GetFontSize() * 1.25f;
-    const float line_height = ImGui::GetTextLineHeight();
-    const ImVec2 pos = ImGui::GetCursorScreenPos();
-    const ImU32 colour = ImGui::GetColorU32(ImGuiCol_TextDisabled);
-    const float thickness = std::max(1.0f, ImGui::GetFontSize() / 12.0f);
-    const float x = pos.x + step * static_cast<float>(level - 1) + step * 0.4f;
-    const float y_mid = pos.y + line_height * 0.5f;
-    auto* draw_list = ImGui::GetWindowDrawList();
-    // From the row above down to this one's middle, then across to its name.
-    draw_list->AddLine(ImVec2(x, pos.y - line_height * 0.45f), ImVec2(x, y_mid), colour, thickness);
-    draw_list->AddLine(ImVec2(x, y_mid), ImVec2(x + step * 0.45f, y_mid), colour, thickness);
+    DrawSubSettingConnector(level, ImGui::GetTextLineHeight());
     ImVec4 text = ImGui::GetStyleColorVec4(ImGuiCol_Text);
     text.w *= 0.8f;
     const float indent = step * static_cast<float>(level);

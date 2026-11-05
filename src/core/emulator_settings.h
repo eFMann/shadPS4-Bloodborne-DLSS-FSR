@@ -423,7 +423,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // Protection" on (crashes without it) and "Enable Shader Cache" on. 5: "Draw recorder on two
 // threads", "Submit on the recording thread", "Faster pipeline lookup (1.09)" and "Early GPU data
 // write-back" on (on for everyone, so problems with them get reported).
-constexpr int BbDefaultsVersion = 5;
+constexpr int BbDefaultsVersion = 6;
 
 struct GPUSettings {
     Setting<u32> window_width{1280};
@@ -759,8 +759,12 @@ struct VulkanSettings {
     Setting<bool> bb_vbao_half_res{true};
     // Screen-space reflections (with the game's "Enable Screen Space Reflections" patch):
     // 0 the game's, 1 better (traced through a depth pyramid with the game's own inputs, and
-    // denoised), 2 off (none at all). Global only.
-    Setting<int> bb_ssr_mode{0};
+    // denoised), 2 off (none at all). The patch is built in (installed at a start when this
+    // isn't Off), so Off to on or back needs a restart. Global only.
+    Setting<int> bb_ssr_mode{2};
+    // Once, at the first game start with built-in reflections: a patch file that already has the
+    // reflection patch on keeps the game's reflections (Off becomes "Game's"). Global only.
+    Setting<bool> bb_ssr_check_patch_file{true};
     // Better reflections at the scene's full size (not the game's half size), from a full-size
     // copy of the last frame, read by the lighting directly: a little sharper, at more GPU time.
     Setting<bool> bb_ssr_full_res{false};
@@ -903,7 +907,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_perf_meter, bb_gx_observe,
     bb_gx_pipelines, bb_recorder_census, bb_draw_finisher, bb_async_submit, bb_vram_upload_staging,
     bb_render_threads_off_core0, bb_even_capped_flips, bb_merged_no_stream_sources,
-    bb_merged_large_batches)
+    bb_merged_large_batches, bb_ssr_check_patch_file)
 
 // -------------------------------
 // Main manager
@@ -1258,6 +1262,7 @@ public:
     SETTING_FORWARD(m_vulkan, BbVbaoRadius, bb_vbao_radius)
     SETTING_FORWARD_BOOL(m_vulkan, BbVbaoHalfRes, bb_vbao_half_res)
     SETTING_FORWARD(m_vulkan, BbSsrMode, bb_ssr_mode)
+    SETTING_FORWARD_BOOL(m_vulkan, BbSsrCheckPatchFile, bb_ssr_check_patch_file)
     SETTING_FORWARD_BOOL(m_vulkan, BbSsrFullRes, bb_ssr_full_res)
     SETTING_FORWARD_BOOL(m_vulkan, BbSsrRoughRays, bb_ssr_rough_rays)
     SETTING_FORWARD(m_vulkan, BbSsrMinGloss, bb_ssr_min_gloss)

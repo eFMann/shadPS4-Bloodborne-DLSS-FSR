@@ -19,6 +19,7 @@
 #include "common/guest_stats.h"
 #include "common/path_util.h"
 #include "core/bb_frame_rate.h"
+#include "core/bb_game_fixes.h"
 #include "core/bb_mouse_camera.h"
 #include "core/bb_resolution.h"
 #include "core/devtools/layer.h"
@@ -1461,9 +1462,17 @@ void DlssLayer::DrawWindow() {
                 }
                 if (IsItemHovered())
                     SetTooltip(
-                        "With the game's \"Enable Screen Space Reflections\" patch. Game's: as "
-                        "the game draws them.\nBetter: traced more precisely, sharper, to the "
-                        "screen's edges. Off: no screen-space reflections at all.");
+                        "Built in, no patch needed. Game's: as the game draws them.\nBetter: "
+                        "traced more precisely, sharper, to the screen's edges. Off: none "
+                        "at all, no cost.\nSwitching between Off and on needs a restart.");
+                if (::Core::BbGameFixes::SsrNeedsRestart(mode)) {
+                    SameLine();
+                    TextColored(ImVec4(1.0f, 0.78f, 0.35f, 1.0f), "restart to apply");
+                } else if (::Core::BbGameFixes::GetSsrPatch() ==
+                           ::Core::BbGameFixes::SsrPatch::Unavailable) {
+                    SameLine();
+                    TextDisabled("not available (needs game version 1.09)");
+                }
                 BeginDisabled(mode != 1);
                 bool full_res = EmulatorSettings.IsBbSsrFullRes();
                 if (Checkbox("Full resolution", &full_res)) {

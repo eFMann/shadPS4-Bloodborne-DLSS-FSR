@@ -509,6 +509,13 @@ bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific
         switch_on(m_vulkan.bb_gx_pipelines);
         switch_on(m_gpu.bb_early_writeback);
     }
+    if (version < 6) {
+        // Reflections are built in now (no patch file needed): the old default ("Game's", which
+        // did nothing without the patch) becomes Off, so nobody gets their cost unasked.
+        if (m_vulkan.bb_ssr_mode.value == 0) {
+            set(m_vulkan.bb_ssr_mode, 2);
+        }
+    }
     if (game_specific && m_gpu.bb_defaults.game_specific_value) {
         m_gpu.bb_defaults.game_specific_value = BbDefaultsVersion;
     }

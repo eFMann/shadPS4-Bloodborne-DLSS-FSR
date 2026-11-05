@@ -4,12 +4,14 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <string_view>
 
 #include "common/crash_crumbs.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/types.h"
 #include "core/bb_game_fixes.h"
+#include "core/emulator_settings.h"
 
 namespace Core::BbGameFixes {
 namespace {
@@ -151,6 +153,83 @@ bool FindLoadingFlag() {
     return true;
 }
 
+// Screen-space reflections: Kyo's "Enable Screen Space Reflections" patch (1.09), built in so the
+// reflection setting works without the patch file. Only the lines that change the game's bytes
+// (the patch's other lines write what is already there). Installed at a start, and only when
+// reflections aren't Off: the game then also allocates and draws its reflection passes.
+struct PatchLine {
+    u64 offset;
+    std::string_view original;
+    std::string_view patched;
+    std::string_view other = {}; ///< also accepted: another patch's value here
+};
+constexpr std::array<PatchLine, 8> SsrLines{{
+    {0x22c4fd3, "77", "74"},
+    {0x22c3d2f, "7453", "9090"},
+    {0x2295a5b, "CDCC4CBF", "00401CC6"},
+    {0x22b8d65, "C5FA10051F0F6702", "C5FA1005C77C5C02"},
+    {0xea8cfd, "0000803F", "00000000"},
+    // The half-size target's format: Kyo's "Performance Patch" sets 0x37 here; with both patches
+    // in the patch file the reflection patch's 0x28 wins too.
+    {0xe5b1bf, "14", "28", "37"},
+    {0x22c429a, "4489E1", "6A0A59"},
+    {0x22c42b4, "C704240000000031C941B9140000004589E0", "8324240031C941B91400000041B80A000000"},
+}};
+
+std::atomic<SsrPatch> ssr_patch{SsrPatch::Off};
+
+u8 HexByte(std::string_view hex, size_t i) {
+    const auto digit = [](char c) -> u8 {
+        return c <= '9' ? u8(c - '0') : u8((c | 0x20) - 'a' + 10);
+    };
+    return u8(digit(hex[i * 2]) << 4 | digit(hex[i * 2 + 1]));
+}
+
+bool Matches(const PatchLine& line, std::string_view bytes) {
+    const size_t size = bytes.size() / 2;
+    if (!Fits(line.offset, size)) {
+        return false;
+    }
+    for (size_t i = 0; i < size; ++i) {
+        if (At(line.offset)[i] != HexByte(bytes, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+SsrPatch InstallSsr() {
+    // Every line must hold the game's bytes or the patch's (the patch file may have it on).
+    bool all_patched = true;
+    for (const auto& line : SsrLines) {
+        const bool patched = Matches(line, line.patched);
+        if (!patched && !Matches(line, line.original) &&
+            (line.other.empty() || !Matches(line, line.other))) {
+            return SsrPatch::Unavailable;
+        }
+        all_patched &= patched;
+    }
+    if (all_patched) {
+        // Players who used the patch file before reflections were built in keep them, once:
+        // after that, the setting is theirs.
+        if (EmulatorSettings.IsBbSsrCheckPatchFile() && EmulatorSettings.GetBbSsrMode() == 2) {
+            EmulatorSettings.SetBbSsrMode(0);
+            LOG_INFO(Loader, "Screen space reflections: the patch file has them on, so the "
+                             "setting is now \"Game's\" (once)");
+        }
+        return SsrPatch::FromPatchFile;
+    }
+    if (EmulatorSettings.GetBbSsrMode() == 2) {
+        return SsrPatch::Off;
+    }
+    for (const auto& line : SsrLines) {
+        for (size_t i = 0; i < line.patched.size() / 2; ++i) {
+            At(line.offset)[i] = HexByte(line.patched, i);
+        }
+    }
+    return SsrPatch::Installed;
+}
+
 } // namespace
 
 void Install() {
@@ -159,11 +238,34 @@ void Install() {
     }
     LOG_INFO(Loader, "Game fix: save-load command buffer race {}",
              InstallFxInitClear() ? "on" : "not installed (other code there)");
+    const SsrPatch ssr = InstallSsr();
+    ssr_patch.store(ssr, std::memory_order_release);
+    if (EmulatorSettings.IsBbSsrCheckPatchFile()) {
+        EmulatorSettings.SetBbSsrCheckPatchFile(false);
+        EmulatorSettings.Save();
+    }
+    LOG_INFO(Loader, "Screen space reflections: {}",
+             ssr == SsrPatch::Installed       ? "on (built-in patch)"
+             : ssr == SsrPatch::FromPatchFile ? "on (from the patch file)"
+             : ssr == SsrPatch::Off           ? "off"
+                                              : "not available (the game's code differs)");
     loading_flag_found.store(FindLoadingFlag(), std::memory_order_release);
     LOG_INFO(Loader, "Loading screen detection: {}",
              loading_flag_found.load(std::memory_order_relaxed)
                  ? "on"
                  : "off (the game's code differs there)");
+}
+
+SsrPatch GetSsrPatch() {
+    return ssr_patch.load(std::memory_order_acquire);
+}
+
+bool SsrNeedsRestart(int ssr_mode) {
+    const SsrPatch state = GetSsrPatch();
+    if (state == SsrPatch::FromPatchFile || state == SsrPatch::Unavailable) {
+        return false;
+    }
+    return (ssr_mode != 2) != (state == SsrPatch::Installed);
 }
 
 bool IsLoadingScreen() {
