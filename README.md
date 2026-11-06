@@ -114,11 +114,11 @@ AMD's own FSR 4.1 upscaler, from the
 [FSR SDK 2.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/tag/v2.4.0),
 the first release that runs it on Vulkan. Windows only.
 
-1. Make a folder `amd_fsr` next to `shadPS4.exe`.
-2. Copy `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from the SDK's
-   [`Kits/FidelityFX/signedbin`](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
-   into it.
-3. Start the game and pick *FSR 4.1.2 (AMD)* in F1 (the version comes from the DLL), or set
+1. Unpack the release's AMD FSR download (`shadPS4-Bloodborne-AMD-FSR-win64-*.zip`) next to
+   `shadPS4.exe`, so its `amd_fsr` folder sits beside it. Or make that folder yourself and copy
+   `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` into it from the SDK's
+   [`Kits/FidelityFX/signedbin`](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin).
+2. Start the game and pick *FSR 4.1.2 (AMD)* in F1 (the version comes from the DLL), or set
    `upscaler=amdfsr` in `dlss.ini`. *Automatic* does not pick it.
 
 Delete the folder to remove it. FSR 3.1 and the FSR 4 add-on are unaffected. Tested on a
