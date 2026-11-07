@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -13,15 +14,26 @@ namespace Vulkan {
 
 class Instance;
 
-// AMD FSR 3.1 upscaling through amd_fidelityfx_vk.dll next to the executable. Works on any GPU;
-// without the DLL rendering stays unchanged. Callers own synchronization and must drain recorded
-// work before destroying a context.
+// AMD FSR upscaling through one of two AMD runtimes, see Runtime. Without the runtime's DLLs
+// rendering stays unchanged. Callers own synchronization and must drain recorded work before
+// destroying a context.
 class FsrUpscaler {
 public:
-    // True when amd_fidelityfx_vk.dll is present and FSR is not disabled.
-    static bool Present();
+    enum class Runtime {
+        // amd_fidelityfx_vk.dll (libamd_fidelityfx_vk.so) next to the executable: FidelityFX
+        // SDK 1.1.4, FSR 3.1 on any GPU.
+        Fsr31,
+        // amd_fsr\amd_fidelityfx_loader_vk.dll with amd_fidelityfx_upscaler_vk.dll beside it:
+        // AMD FSR SDK 2.4 or later, FSR 4.1 on GPUs that support it. Windows only.
+        AmdFsr,
+    };
+    // True when the runtime's loader DLL is present and FSR is not disabled.
+    static bool Present(Runtime runtime = Runtime::Fsr31);
     // Null when the DLL cannot be loaded.
-    static std::unique_ptr<FsrUpscaler> Create(const Instance& instance);
+    static std::unique_ptr<FsrUpscaler> Create(const Instance& instance,
+                                               Runtime runtime = Runtime::Fsr31);
+    // The version of the AMD FSR runtime's upscaler DLL, e.g. "4.1.2"; empty when not present.
+    static std::string AmdFsrVersion();
     // The vkGetDeviceProcAddr the FidelityFX backend gets (PFN_vkGetDeviceProcAddr), with
     // stand-ins for functions it calls that the device may lack.
     static void* FfxDeviceProcAddr();
