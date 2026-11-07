@@ -23,9 +23,9 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
 void LowerHardwareIntrinsics(IR::Program& program);
 void LowerPhisToRegsPass(IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
-/// Pixel shader inputs read with GCN's manual interpolation go back to the hardware's where no
-/// use needs the exact bits (Profile::hardware_interpolation).
-void HardwareInterpolationPass(IR::Program& program, const RuntimeInfo& runtime_info);
+/// The pixel shader inputs (bit n: Param n) that can use the hardware's interpolation instead of
+/// GCN's manual formula, where no use needs the exact bits; `apply` rewrites them.
+u32 HardwareInterpolationInputs(IR::Program& program, const RuntimeInfo& runtime_info, bool apply);
 void ConstantPropagationPass(IR::BlockList& program);
 void FlattenExtendedUserdataPass(IR::Program& program);
 void ReadLaneEliminationPass(IR::Program& program);

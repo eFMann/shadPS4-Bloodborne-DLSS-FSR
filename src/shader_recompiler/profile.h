@@ -56,8 +56,8 @@ struct Profile {
     /// to fuse (FFMA instead of FMUL and FADD on NVIDIA, less code). Off: every one unfused, as
     /// GCN's v_mad_f32. Results differ in the last bit at most.
     bool fragment_fp_contraction{};
-    /// With needs_manual_interpolation: a pixel shader input goes back to the hardware's
-    /// interpolation when no use of it needs GCN's exact formula. Off: every input by the formula.
+    /// Where interpolation is manual (needs_manual_interpolation): let the GPU interpolate the
+    /// pixel shader inputs whose result can't change by the last bit. Off: all stay manual.
     bool hardware_interpolation{};
     bool fast_shader_math{};
     bool support_bda{};
