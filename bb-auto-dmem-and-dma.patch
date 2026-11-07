@@ -1,0 +1,482 @@
+diff --git a/src/common/bb_tuning.h b/src/common/bb_tuning.h
+index cd131adc1..c872f540f 100644
+--- a/src/common/bb_tuning.h
++++ b/src/common/bb_tuning.h
+@@ -40,10 +40,24 @@ inline std::atomic<unsigned long long> mods_bytes{0};
+ /// How many of the game's biggest map textures are much bigger than the game's own (a texture
+ /// pack such as BB PC Remaster, merged into the game folder or in the mods folder).
+ inline std::atomic<unsigned> bigger_map_textures{0};
++/// Extra direct memory (MiB) for this launch, decided at game start (emulator.cpp): the
++/// setting, raised to what the resolution and a texture pack need. -1: not decided (the setting).
++inline std::atomic<int> extra_dmem_mb{-1};
++/// Direct memory access switched on for a texture pack (BB PC Remaster and the like) while the
++/// setting itself is off, decided at game start (emulator.cpp).
++inline std::atomic<bool> dma_for_texture_pack{false};
+ /// F1's output size when the whole frame renders at the lower size (Regular resolution mode):
+ /// the upscaler's target, width << 32 | height (0: the window).
+ inline std::atomic<unsigned long long> upscale_output{0};
+ 
++inline int ExtraDmemMB(int setting) {
++    const int decided = extra_dmem_mb.load(std::memory_order_relaxed);
++    return decided < 0 ? setting : decided;
++}
++inline bool DmaForTexturePack() {
++    return dma_for_texture_pack.load(std::memory_order_relaxed);
++}
++
+ inline bool FastLocks() {
+     return fast_locks.load(std::memory_order_relaxed);
+ }
+diff --git a/src/core/address_space.cpp b/src/core/address_space.cpp
+index 10b0bc3a7..7734403ed 100644
+--- a/src/core/address_space.cpp
++++ b/src/core/address_space.cpp
+@@ -8,6 +8,7 @@
+ #include "common/alignment.h"
+ #include "common/arch.h"
+ #include "common/assert.h"
++#include "common/bb_tuning.h"
+ #include "common/elf_info.h"
+ #include "common/error.h"
+ #include "core/address_space.h"
+@@ -193,8 +194,9 @@ struct AddressSpace::Impl {
+         user_size = supported_user_max - USER_MIN - 1;
+ 
+         // Increase BackingSize to account for config options.
+-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+-                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
++        BackingSize +=
++            Common::BbTuning::ExtraDmemMB(EmulatorSettings.GetExtraDmemInMBytes()) * 1_MB +
++            EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
+ 
+         // Allocate backing file that represents the total physical memory.
+         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
+@@ -671,8 +673,9 @@ enum PosixPageProtection {
+ 
+ struct AddressSpace::Impl {
+     Impl() {
+-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+-                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
++        BackingSize +=
++            Common::BbTuning::ExtraDmemMB(EmulatorSettings.GetExtraDmemInMBytes()) * 1_MB +
++            EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
+         // Allocate virtual address placeholder for our address space.
+         system_managed_size = SystemManagedSize;
+         system_reserved_size = SystemReservedSize;
+diff --git a/src/core/bb_resolution.cpp b/src/core/bb_resolution.cpp
+index 0ebb1e0bf..a75a1d2a5 100644
+--- a/src/core/bb_resolution.cpp
++++ b/src/core/bb_resolution.cpp
+@@ -144,8 +144,6 @@ Choice applied;
+ bool deciding{};
+ std::vector<std::string> conflicting; // enabled patches that set sizes F1 sets
+ bool heap_patch_on{}; // an enabled patch raises the graphics heap (Auto then raises it too)
+-// Mods in the mods folder from this size on are texture mods that need a bigger heap.
+-constexpr u64 ModsHeapBytes = 4ull << 30;
+ 
+ // What a patch must not change while F1 sets the resolution, from the templates: the bytes
+ // holding a size, and the code bytes around them (the same in every size). The cave holding the
+diff --git a/src/core/bb_resolution.h b/src/core/bb_resolution.h
+index 47db2b94d..9711cd0b2 100644
+--- a/src/core/bb_resolution.h
++++ b/src/core/bb_resolution.h
+@@ -30,6 +30,24 @@ struct Choice {
+ 
+ // Above this render height the graphics heap is raised (more VRAM, extra dmem needed).
+ inline constexpr u32 HeapRenderHeight = 1080;
++
++// Texture packs (BB PC Remaster and the like) replace the map textures with bigger ones, also
++// when merged into the game folder (any version): a few of the biggest, with the game's own 1.09
++// sizes. Two or more at least a quarter bigger: a texture pack.
++struct MapTexture {
++    std::string_view path; // in the game folder
++    u64 size;
++};
++inline constexpr MapTexture MapTextures[] = {
++    {"dvdroot_ps4/map/m24/m24_0000.tpfbdt", 184005548},
++    {"dvdroot_ps4/map/m24/m24_0001.tpfbdt", 191139900},
++    {"dvdroot_ps4/map/m34/m34_0000.tpfbdt", 127588925},
++    {"dvdroot_ps4/map/m23/m23_0000.tpfbdt", 132185799},
++    {"dvdroot_ps4/map/m36/m36_0003.tpfbdt", 64461105},
++    {"dvdroot_ps4/map/m25/m25_0001.tpfbdt", 52182314},
++};
++// A mods folder at least this big is taken for a texture pack too.
++inline constexpr u64 ModsHeapBytes = 4ull << 30;
+ // The render heights F1 offers below this output height (16:9, usual sizes only, no more than
+ // 3x below it). Above 1080p they need the bigger graphics heap: more VRAM and extra dmem.
+ std::vector<u32> RenderHeights(u32 output_height);
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index f2be44d73..bc87a3250 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -4,6 +4,7 @@
+ #include <boost/container/small_vector.hpp>
+ #include "common/alignment.h"
+ #include "common/assert.h"
++#include "common/bb_tuning.h"
+ #include "common/debug.h"
+ #include "common/elf_info.h"
+ #include "core/emulator_settings.h"
+@@ -30,7 +31,7 @@ MemoryManager::MemoryManager() {
+ 
+     // Pre-initialize direct backing
+     auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
+-    s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
++    s32 extra_dmem = Common::BbTuning::ExtraDmemMB(EmulatorSettings.GetExtraDmemInMBytes());
+     if (extra_dmem != 0) {
+         total_size += extra_dmem * 1_MB;
+     }
+@@ -53,6 +54,17 @@ MemoryManager::MemoryManager() {
+ 
+ MemoryManager::~MemoryManager() = default;
+ 
++std::pair<u64, u64> MemoryManager::DirectMemoryUse() {
++    std::shared_lock lk{mutex};
++    u64 used = 0;
++    for (const auto& [base, area] : dmem_map) {
++        if (area.dma_type != PhysicalMemoryType::Free) {
++            used += area.size;
++        }
++    }
++    return {used, total_direct_size};
++}
++
+ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1,
+                                        bool use_extended_mem2) {
+     // Calculate actual direct and flexible memory sizes
+@@ -61,7 +73,7 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
+     if (EmulatorSettings.IsDevKit()) {
+         total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_DEV_PRO : ORBIS_KERNEL_TOTAL_MEM_DEV;
+     }
+-    s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
++    s32 extra_dmem = Common::BbTuning::ExtraDmemMB(EmulatorSettings.GetExtraDmemInMBytes());
+     if (extra_dmem != 0) {
+         LOG_WARNING(Kernel_Vmm,
+                     "extraDmemInMbytes is {} MB! Old Direct Size: {:#x} -> New Direct Size: {:#x}",
+@@ -246,6 +258,7 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size,
+ 
+     if (dmem_area == dmem_map.end()) {
+         // There are no suitable mappings in this range
++        dmem_failures.fetch_add(1, std::memory_order_relaxed);
+         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
+         return -1;
+     }
+@@ -287,6 +300,7 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
+ 
+     if (dmem_area == dmem_map.end() || mapping_end > search_end) {
+         // There are no suitable mappings in this range
++        dmem_failures.fetch_add(1, std::memory_order_relaxed);
+         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
+         return -1;
+     }
+diff --git a/src/core/memory.h b/src/core/memory.h
+index d4d639e7b..bfd42d9d7 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -3,10 +3,12 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <map>
+ #include <mutex>
+ #include <string>
+ #include <string_view>
++#include <utility>
+ #include "common/enum.h"
+ #include "common/shared_first_mutex.h"
+ #include "common/singleton.h"
+@@ -195,6 +197,13 @@ public:
+         return total_direct_size;
+     }
+ 
++    /// Diagnostics: direct memory in use (allocated or pooled) now, and the total.
++    std::pair<u64, u64> DirectMemoryUse();
++    /// Diagnostics: direct memory allocations that found no room since the last call.
++    u64 TakeDirectMemoryFailures() {
++        return dmem_failures.exchange(0, std::memory_order_relaxed);
++    }
++
+     u64 GetTotalFlexibleSize() const {
+         return total_flexible_size;
+     }
+@@ -356,6 +365,7 @@ private:
+     VMAMap vma_map;
+     Common::SharedFirstMutex mutex{};
+     std::mutex unmap_mutex{};
++    std::atomic<u64> dmem_failures{}; ///< allocations without room (TakeDirectMemoryFailures)
+     u64 total_direct_size{};
+     u64 total_flexible_size{};
+     u64 flexible_usage{};
+diff --git a/src/emulator.cpp b/src/emulator.cpp
+index 17b0ff73c..e00ebd3ef 100644
+--- a/src/emulator.cpp
++++ b/src/emulator.cpp
+@@ -87,6 +87,73 @@ std::unique_ptr<Vulkan::Instance> Emulator::TakeEarlyVulkanInstance() {
+ }
+ 
+ namespace {
++// Bloodborne's extra direct memory: the game's graphics heaps live in direct memory, and a raised
++// heap (texture packs, a scene above 1080p, F1's heap choice) or bigger render targets need more
++// of it than the PS4 had; too little shows as missing textures, broken cloth and vertex
++// explosions. The setting stays the minimum; this raises it to what the launch needs, as far as
++// the PC's free commit allows (the whole guest memory is committed at start; RAM is only used as
++// the game fills it).
++void DecideExtraDmem(const std::filesystem::path& game_folder,
++                     const std::filesystem::path& mods_folder) {
++    const int setting = EmulatorSettings.GetExtraDmemInMBytes();
++    // A texture pack: bigger map textures (in the mods folder or merged into the game folder),
++    // or a big mods folder.
++    u32 bigger = 0;
++    for (const auto& texture : Core::BbResolution::MapTextures) {
++        std::error_code error;
++        auto size = std::filesystem::file_size(mods_folder / texture.path, error);
++        if (error)
++            size = std::filesystem::file_size(game_folder / texture.path, error);
++        if (!error && size >= texture.size + texture.size / 4)
++            ++bigger;
++    }
++    const bool pack =
++        bigger >= 2 || Common::BbTuning::mods_bytes.load() >= Core::BbResolution::ModsHeapBytes;
++    // The scene's height: F1's render size, or (resolution patches) the window's, which the
++    // patches usually match.
++    const auto choice = Core::BbResolution::Preview();
++    const u32 height =
++        choice.enabled ? choice.render_height : u32(EmulatorSettings.GetWindowHeight());
++    int need = height <= 1080   ? (pack ? 5120 : 1024)
++               : height <= 1440 ? (pack ? 6144 : 4096)
++                                : (pack ? 8192 : 6144);
++    // F1's heap choice: both heaps raised need about 3.3 GB more, the first alone about 1.7 GB.
++    if (choice.enabled && (choice.heap == "full" || choice.heap == "smaller"))
++        need = std::max(need, 4096);
++    else if (choice.enabled && choice.heap == "first")
++        need = std::max(need, 2048);
++    std::string ram = "RAM not known";
++    int room = need;
++#ifdef _WIN32
++    MEMORYSTATUSEX status{};
++    status.dwLength = sizeof(status);
++    if (GlobalMemoryStatusEx(&status)) {
++        // The guest memory itself (the PS4's direct and flexible memory) plus 4 GiB for the
++        // rest of the emulator must still fit in the commit left.
++        const s64 base_mb =
++            s64((ORBIS_KERNEL_TOTAL_MEM_DEV_PRO + ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE) >> 20) +
++            EmulatorSettings.GetExtraFmemInMBytes() + 4096;
++        room = int(std::max<s64>(0, s64(status.ullAvailPageFile >> 20) - base_mb));
++        ram =
++            fmt::format("{} GiB RAM, {} MiB commit free",
++                        (status.ullTotalPhys + (1ull << 29)) >> 30, status.ullAvailPageFile >> 20);
++    }
++#endif
++    const int automatic = std::min(need, room);
++    const int chosen = std::max(setting, automatic);
++    Common::BbTuning::extra_dmem_mb.store(chosen);
++    LOG_INFO(Loader,
++             "Extra direct memory: {} MiB ({}; scene {}p{}{}, setting {} MiB, needed {} MiB; {})",
++             chosen, chosen > setting ? "raised automatically" : "the setting", height,
++             choice.enabled ? " from F1" : " (window)", pack ? ", texture pack" : "", setting, need,
++             ram);
++    if (automatic < need && setting < need)
++        LOG_WARNING(Loader,
++                    "Extra direct memory: only {} MiB of the {} MiB needed fit in the free commit "
++                    "(RAM and page file); missing textures or broken cloth can follow",
++                    chosen, need);
++}
++
+ bool IsBloodborne(std::string_view serial) {
+     static constexpr std::array serials{"CUSA00207", "CUSA00208", "CUSA00299", "CUSA00900",
+                                         "CUSA01363", "CUSA03014", "CUSA03023", "CUSA03173"};
+@@ -749,6 +816,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+         Common::BbTuning::mods_bytes.store(bytes);
+         LOG_INFO(Loader, "Files found in game mods folder ({} files, {} MiB)", files, bytes >> 20);
+     }
++    // Before the guest memory is set up (Core::Memory::Instance below).
++    Common::BbTuning::extra_dmem_mb.store(-1);
++    if (IsBloodborne(id)) {
++        DecideExtraDmem(game_folder, mods_folder);
++    }
+ 
+ #ifdef _WIN32
+     // Enable red-zone patching if the setting is enabled
+@@ -905,24 +977,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+         FileSys::BbHdrCompat::ProbeRemaster(
+             mnt->Open("/app0/dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx", false),
+             "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx");
+-        // Texture packs replace the map textures with bigger ones, also when merged into the
+-        // game folder (any version): a few of the biggest, at least a quarter bigger than the
+-        // game's own 1.09 files.
+-        struct MapTexture {
+-            std::string_view path;
+-            u64 size;
+-        };
+-        static constexpr MapTexture MapTextures[] = {
+-            {"/app0/dvdroot_ps4/map/m24/m24_0000.tpfbdt", 184005548},
+-            {"/app0/dvdroot_ps4/map/m24/m24_0001.tpfbdt", 191139900},
+-            {"/app0/dvdroot_ps4/map/m34/m34_0000.tpfbdt", 127588925},
+-            {"/app0/dvdroot_ps4/map/m23/m23_0000.tpfbdt", 132185799},
+-            {"/app0/dvdroot_ps4/map/m36/m36_0003.tpfbdt", 64461105},
+-            {"/app0/dvdroot_ps4/map/m25/m25_0001.tpfbdt", 52182314},
+-        };
++        // Texture packs replace the map textures with bigger ones (BbResolution::MapTextures).
++        const auto& MapTextures = Core::BbResolution::MapTextures;
+         u32 bigger = 0;
+         for (const auto& texture : MapTextures) {
+-            const auto file = mnt->Open(texture.path, false);
++            const auto file = mnt->Open(fmt::format("/app0/{}", texture.path), false);
+             if (file && file->IsOpen() && file->Size() >= texture.size + texture.size / 4)
+                 ++bigger;
+         }
+@@ -937,6 +996,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+                      "No texture pack found ({} of {} map textures bigger than the "
+                      "game's own)",
+                      bigger, std::size(MapTextures));
++        // BB PC Remaster shows artefacts without direct memory access: on for it when the
++        // setting itself is off. Before any shader is built.
++        Common::BbTuning::dma_for_texture_pack.store(
++            FileSys::BbHdrCompat::RemasterPresent() &&
++            !EmulatorSettings.IsDirectMemoryAccessEnabled());
++        if (Common::BbTuning::DmaForTexturePack())
++            LOG_INFO(Loader, "Direct memory access: on for BB PC Remaster");
+     }
+     if (FileSys::BbHdrCompat::IsCandidate(
+             "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx")) {
+diff --git a/src/imgui/dlss_layer.cpp b/src/imgui/dlss_layer.cpp
+index cd7854292..85f319207 100644
+--- a/src/imgui/dlss_layer.cpp
++++ b/src/imgui/dlss_layer.cpp
+@@ -847,11 +847,6 @@ void DlssLayer::DrawWindow() {
+                 }
+                 if (!now.problem.empty())
+                     TextDisabled("%s", now.problem.c_str());
+-                // A scene above 1080p raises the game's graphics heap: it needs extra dmem.
+-                if (next.render_height > Res::HeapRenderHeight &&
+-                    EmulatorSettings.GetExtraDmemInMBytes() < 4000)
+-                    TextColored({1.0f, 0.75f, 0.3f, 1.0f},
+-                                "Above 1080p needs extra dmem of 4000 MB or more (game settings).");
+                 // Patches from the patch file or launcher that set the same sizes: not applied.
+                 if (now.enabled && !Res::SkippedPatches().empty())
+                     TextWrapped("Ignored while this is on: %s",
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+index b170bd76a..294501720 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "common/assert.h"
++#include "common/bb_tuning.h"
+ #include "core/emulator_settings.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+@@ -54,7 +55,9 @@ Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
+ 
+ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
+     const u32 flatbuf_off_dw = inst->Flags<u32>();
+-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled() || !ctx.profile.support_bda) {
++    if (!(EmulatorSettings.IsDirectMemoryAccessEnabled() ||
++          Common::BbTuning::DmaForTexturePack()) ||
++        !ctx.profile.support_bda) {
+         return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
+     }
+     if (flatbuf_off_dw == 0) {
+diff --git a/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp b/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
+index 4fbab5660..d38d3a729 100644
+--- a/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
++++ b/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/bb_tuning.h"
+ #include "core/emulator_settings.h"
+ #include "shader_recompiler/ir/program.h"
+ #include "shader_recompiler/profile.h"
+@@ -217,7 +218,9 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
+         }
+     }
+ 
+-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled() || !profile.support_bda) {
++    if (!(EmulatorSettings.IsDirectMemoryAccessEnabled() ||
++          Common::BbTuning::DmaForTexturePack()) ||
++        !profile.support_bda) {
+         info.uses_dma = false;
+         info.readconst_types = Info::ReadConstType::None;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+index 48a08a275..21461e7a7 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <array>
+ 
++#include "common/bb_tuning.h"
+ #include "common/serdes.h"
+ #include "core/emulator_settings.h"
+ #include "shader_recompiler/frontend/fetch_shader.h"
+@@ -22,6 +23,15 @@ static constexpr u32 PipelineKeyVersion = 7u;
+ } // namespace Serialization
+ 
+ namespace {
++// The compiled shaders' version, with whether direct memory access was on: shaders built with it
++// differ (constant reads from guest memory), so switching it rebuilds the cache once instead of
++// loading shaders built the other way.
++u32 BinaryVersion() {
++    const bool dma =
++        EmulatorSettings.IsDirectMemoryAccessEnabled() || Common::BbTuning::DmaForTexturePack();
++    return Serialization::ShaderBinaryVersion | (dma ? 0x100u : 0u);
++}
++
+ // Cache layout of this build. 1: every shader variant preloaded, new ones saved after all known
+ // ones (earlier caches may hold variants saved over each other, so they are rebuilt once).
+ constexpr u32 CacheLayout = 1;
+@@ -94,7 +104,7 @@ void RegisterShaderMeta(const Shader::Info& info,
+     Serialization::Writer meta{ar};
+ 
+     meta.Write(Serialization::ShaderMetaVersion);
+-    meta.Write(Serialization::ShaderBinaryVersion);
++    meta.Write(BinaryVersion());
+ 
+     meta.Write(perm_hash);
+     meta.Write(perm_idx);
+@@ -129,7 +139,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+ 
+     u32 binary_version{};
+     meta.Read(binary_version);
+-    if (binary_version != Serialization::ShaderBinaryVersion) {
++    if (binary_version != BinaryVersion()) {
+         ++stale_reasons[MetaVersion];
+         return false;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index a8dd01f54..99847f784 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -7340,6 +7340,15 @@ void Rasterizer::LogDrawPipeStats() {
+                  protects / seconds, pages / seconds, protect_ns / seconds / 1e7,
+                  skipped / seconds);
+     }
++    {
++        // The game's direct memory (graphics heaps and the rest): how much of the extra direct
++        // memory it really uses, and whether it ran out (missing textures, broken cloth).
++        const auto [used, total] = memory->DirectMemoryUse();
++        dmem_peak = std::max(dmem_peak, used);
++        LOG_INFO(Render_Vulkan,
++                 "  direct memory: {} of {} MiB in use (peak {} MiB), {} allocations without room",
++                 used >> 20, total >> 20, dmem_peak >> 20, memory->TakeDirectMemoryFailures());
++    }
+     const u64 profiled = profile_draws.load(std::memory_order_relaxed);
+     if (profiled != pipe_stats_profile_draws) {
+         std::array<s64, static_cast<size_t>(Section::Count)> ns{};
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 946e43872..7cf80f4d2 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -697,6 +697,7 @@ private:
+     std::atomic<bool> pipe_enabled{}; // read by the presentation thread
+     std::vector<u16> pipe_blocks;
+     std::chrono::steady_clock::time_point pipe_stats_time{};
++    u64 dmem_peak{}; ///< diagnostics: the most direct memory seen in use
+     std::chrono::steady_clock::time_point vram_report_time{};
+     u64 pipe_stats_packets{};
+     u64 pipe_stats_drains{};

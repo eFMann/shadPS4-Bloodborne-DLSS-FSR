@@ -3,6 +3,7 @@
 
 #include <array>
 
+#include "common/bb_tuning.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -22,6 +23,15 @@ static constexpr u32 PipelineKeyVersion = 7u;
 } // namespace Serialization
 
 namespace {
+// The compiled shaders' version, with whether direct memory access was on: shaders built with it
+// differ (constant reads from guest memory), so switching it rebuilds the cache once instead of
+// loading shaders built the other way.
+u32 BinaryVersion() {
+    const bool dma =
+        EmulatorSettings.IsDirectMemoryAccessEnabled() || Common::BbTuning::DmaForTexturePack();
+    return Serialization::ShaderBinaryVersion | (dma ? 0x100u : 0u);
+}
+
 // Cache layout of this build. 1: every shader variant preloaded, new ones saved after all known
 // ones (earlier caches may hold variants saved over each other, so they are rebuilt once).
 constexpr u32 CacheLayout = 1;
@@ -94,7 +104,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(BinaryVersion());
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -129,7 +139,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    if (binary_version != BinaryVersion()) {
         ++stale_reasons[MetaVersion];
         return false;
     }

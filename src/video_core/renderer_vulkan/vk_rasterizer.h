@@ -697,6 +697,7 @@ private:
     std::atomic<bool> pipe_enabled{}; // read by the presentation thread
     std::vector<u16> pipe_blocks;
     std::chrono::steady_clock::time_point pipe_stats_time{};
+    u64 dmem_peak{}; ///< diagnostics: the most direct memory seen in use
     std::chrono::steady_clock::time_point vram_report_time{};
     u64 pipe_stats_packets{};
     u64 pipe_stats_drains{};

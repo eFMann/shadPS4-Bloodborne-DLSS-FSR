@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
@@ -195,6 +197,13 @@ public:
         return total_direct_size;
     }
 
+    /// Diagnostics: direct memory in use (allocated or pooled) now, and the total.
+    std::pair<u64, u64> DirectMemoryUse();
+    /// Diagnostics: direct memory allocations that found no room since the last call.
+    u64 TakeDirectMemoryFailures() {
+        return dmem_failures.exchange(0, std::memory_order_relaxed);
+    }
+
     u64 GetTotalFlexibleSize() const {
         return total_flexible_size;
     }
@@ -356,6 +365,7 @@ private:
     VMAMap vma_map;
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
+    std::atomic<u64> dmem_failures{}; ///< allocations without room (TakeDirectMemoryFailures)
     u64 total_direct_size{};
     u64 total_flexible_size{};
     u64 flexible_usage{};

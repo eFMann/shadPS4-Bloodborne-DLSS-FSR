@@ -144,8 +144,6 @@ Choice applied;
 bool deciding{};
 std::vector<std::string> conflicting; // enabled patches that set sizes F1 sets
 bool heap_patch_on{}; // an enabled patch raises the graphics heap (Auto then raises it too)
-// Mods in the mods folder from this size on are texture mods that need a bigger heap.
-constexpr u64 ModsHeapBytes = 4ull << 30;
 
 // What a patch must not change while F1 sets the resolution, from the templates: the bytes
 // holding a size, and the code bytes around them (the same in every size). The cave holding the

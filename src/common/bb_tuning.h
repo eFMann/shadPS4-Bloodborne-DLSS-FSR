@@ -40,9 +40,23 @@ inline std::atomic<unsigned long long> mods_bytes{0};
 /// How many of the game's biggest map textures are much bigger than the game's own (a texture
 /// pack such as BB PC Remaster, merged into the game folder or in the mods folder).
 inline std::atomic<unsigned> bigger_map_textures{0};
+/// Extra direct memory (MiB) for this launch, decided at game start (emulator.cpp): the
+/// setting, raised to what the resolution and a texture pack need. -1: not decided (the setting).
+inline std::atomic<int> extra_dmem_mb{-1};
+/// Direct memory access switched on for a texture pack (BB PC Remaster and the like) while the
+/// setting itself is off, decided at game start (emulator.cpp).
+inline std::atomic<bool> dma_for_texture_pack{false};
 /// F1's output size when the whole frame renders at the lower size (Regular resolution mode):
 /// the upscaler's target, width << 32 | height (0: the window).
 inline std::atomic<unsigned long long> upscale_output{0};
+
+inline int ExtraDmemMB(int setting) {
+    const int decided = extra_dmem_mb.load(std::memory_order_relaxed);
+    return decided < 0 ? setting : decided;
+}
+inline bool DmaForTexturePack() {
+    return dma_for_texture_pack.load(std::memory_order_relaxed);
+}
 
 inline bool FastLocks() {
     return fast_locks.load(std::memory_order_relaxed);

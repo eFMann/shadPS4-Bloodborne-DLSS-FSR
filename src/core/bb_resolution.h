@@ -30,6 +30,24 @@ struct Choice {
 
 // Above this render height the graphics heap is raised (more VRAM, extra dmem needed).
 inline constexpr u32 HeapRenderHeight = 1080;
+
+// Texture packs (BB PC Remaster and the like) replace the map textures with bigger ones, also
+// when merged into the game folder (any version): a few of the biggest, with the game's own 1.09
+// sizes. Two or more at least a quarter bigger: a texture pack.
+struct MapTexture {
+    std::string_view path; // in the game folder
+    u64 size;
+};
+inline constexpr MapTexture MapTextures[] = {
+    {"dvdroot_ps4/map/m24/m24_0000.tpfbdt", 184005548},
+    {"dvdroot_ps4/map/m24/m24_0001.tpfbdt", 191139900},
+    {"dvdroot_ps4/map/m34/m34_0000.tpfbdt", 127588925},
+    {"dvdroot_ps4/map/m23/m23_0000.tpfbdt", 132185799},
+    {"dvdroot_ps4/map/m36/m36_0003.tpfbdt", 64461105},
+    {"dvdroot_ps4/map/m25/m25_0001.tpfbdt", 52182314},
+};
+// A mods folder at least this big is taken for a texture pack too.
+inline constexpr u64 ModsHeapBytes = 4ull << 30;
 // The render heights F1 offers below this output height (16:9, usual sizes only, no more than
 // 3x below it). Above 1080p they need the bigger graphics heap: more VRAM and extra dmem.
 std::vector<u32> RenderHeights(u32 output_height);

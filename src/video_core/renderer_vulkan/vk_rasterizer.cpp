@@ -7340,6 +7340,15 @@ void Rasterizer::LogDrawPipeStats() {
                  protects / seconds, pages / seconds, protect_ns / seconds / 1e7,
                  skipped / seconds);
     }
+    {
+        // The game's direct memory (graphics heaps and the rest): how much of the extra direct
+        // memory it really uses, and whether it ran out (missing textures, broken cloth).
+        const auto [used, total] = memory->DirectMemoryUse();
+        dmem_peak = std::max(dmem_peak, used);
+        LOG_INFO(Render_Vulkan,
+                 "  direct memory: {} of {} MiB in use (peak {} MiB), {} allocations without room",
+                 used >> 20, total >> 20, dmem_peak >> 20, memory->TakeDirectMemoryFailures());
+    }
     const u64 profiled = profile_draws.load(std::memory_order_relaxed);
     if (profiled != pipe_stats_profile_draws) {
         std::array<s64, static_cast<size_t>(Section::Count)> ns{};

@@ -87,6 +87,73 @@ std::unique_ptr<Vulkan::Instance> Emulator::TakeEarlyVulkanInstance() {
 }
 
 namespace {
+// Bloodborne's extra direct memory: the game's graphics heaps live in direct memory, and a raised
+// heap (texture packs, a scene above 1080p, F1's heap choice) or bigger render targets need more
+// of it than the PS4 had; too little shows as missing textures, broken cloth and vertex
+// explosions. The setting stays the minimum; this raises it to what the launch needs, as far as
+// the PC's free commit allows (the whole guest memory is committed at start; RAM is only used as
+// the game fills it).
+void DecideExtraDmem(const std::filesystem::path& game_folder,
+                     const std::filesystem::path& mods_folder) {
+    const int setting = EmulatorSettings.GetExtraDmemInMBytes();
+    // A texture pack: bigger map textures (in the mods folder or merged into the game folder),
+    // or a big mods folder.
+    u32 bigger = 0;
+    for (const auto& texture : Core::BbResolution::MapTextures) {
+        std::error_code error;
+        auto size = std::filesystem::file_size(mods_folder / texture.path, error);
+        if (error)
+            size = std::filesystem::file_size(game_folder / texture.path, error);
+        if (!error && size >= texture.size + texture.size / 4)
+            ++bigger;
+    }
+    const bool pack =
+        bigger >= 2 || Common::BbTuning::mods_bytes.load() >= Core::BbResolution::ModsHeapBytes;
+    // The scene's height: F1's render size, or (resolution patches) the window's, which the
+    // patches usually match.
+    const auto choice = Core::BbResolution::Preview();
+    const u32 height =
+        choice.enabled ? choice.render_height : u32(EmulatorSettings.GetWindowHeight());
+    int need = height <= 1080   ? (pack ? 5120 : 1024)
+               : height <= 1440 ? (pack ? 6144 : 4096)
+                                : (pack ? 8192 : 6144);
+    // F1's heap choice: both heaps raised need about 3.3 GB more, the first alone about 1.7 GB.
+    if (choice.enabled && (choice.heap == "full" || choice.heap == "smaller"))
+        need = std::max(need, 4096);
+    else if (choice.enabled && choice.heap == "first")
+        need = std::max(need, 2048);
+    std::string ram = "RAM not known";
+    int room = need;
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        // The guest memory itself (the PS4's direct and flexible memory) plus 4 GiB for the
+        // rest of the emulator must still fit in the commit left.
+        const s64 base_mb =
+            s64((ORBIS_KERNEL_TOTAL_MEM_DEV_PRO + ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE) >> 20) +
+            EmulatorSettings.GetExtraFmemInMBytes() + 4096;
+        room = int(std::max<s64>(0, s64(status.ullAvailPageFile >> 20) - base_mb));
+        ram =
+            fmt::format("{} GiB RAM, {} MiB commit free",
+                        (status.ullTotalPhys + (1ull << 29)) >> 30, status.ullAvailPageFile >> 20);
+    }
+#endif
+    const int automatic = std::min(need, room);
+    const int chosen = std::max(setting, automatic);
+    Common::BbTuning::extra_dmem_mb.store(chosen);
+    LOG_INFO(Loader,
+             "Extra direct memory: {} MiB ({}; scene {}p{}{}, setting {} MiB, needed {} MiB; {})",
+             chosen, chosen > setting ? "raised automatically" : "the setting", height,
+             choice.enabled ? " from F1" : " (window)", pack ? ", texture pack" : "", setting, need,
+             ram);
+    if (automatic < need && setting < need)
+        LOG_WARNING(Loader,
+                    "Extra direct memory: only {} MiB of the {} MiB needed fit in the free commit "
+                    "(RAM and page file); missing textures or broken cloth can follow",
+                    chosen, need);
+}
+
 bool IsBloodborne(std::string_view serial) {
     static constexpr std::array serials{"CUSA00207", "CUSA00208", "CUSA00299", "CUSA00900",
                                         "CUSA01363", "CUSA03014", "CUSA03023", "CUSA03173"};
@@ -749,6 +816,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         Common::BbTuning::mods_bytes.store(bytes);
         LOG_INFO(Loader, "Files found in game mods folder ({} files, {} MiB)", files, bytes >> 20);
     }
+    // Before the guest memory is set up (Core::Memory::Instance below).
+    Common::BbTuning::extra_dmem_mb.store(-1);
+    if (IsBloodborne(id)) {
+        DecideExtraDmem(game_folder, mods_folder);
+    }
 
 #ifdef _WIN32
     // Enable red-zone patching if the setting is enabled
@@ -905,24 +977,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         FileSys::BbHdrCompat::ProbeRemaster(
             mnt->Open("/app0/dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx", false),
             "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx");
-        // Texture packs replace the map textures with bigger ones, also when merged into the
-        // game folder (any version): a few of the biggest, at least a quarter bigger than the
-        // game's own 1.09 files.
-        struct MapTexture {
-            std::string_view path;
-            u64 size;
-        };
-        static constexpr MapTexture MapTextures[] = {
-            {"/app0/dvdroot_ps4/map/m24/m24_0000.tpfbdt", 184005548},
-            {"/app0/dvdroot_ps4/map/m24/m24_0001.tpfbdt", 191139900},
-            {"/app0/dvdroot_ps4/map/m34/m34_0000.tpfbdt", 127588925},
-            {"/app0/dvdroot_ps4/map/m23/m23_0000.tpfbdt", 132185799},
-            {"/app0/dvdroot_ps4/map/m36/m36_0003.tpfbdt", 64461105},
-            {"/app0/dvdroot_ps4/map/m25/m25_0001.tpfbdt", 52182314},
-        };
+        // Texture packs replace the map textures with bigger ones (BbResolution::MapTextures).
+        const auto& MapTextures = Core::BbResolution::MapTextures;
         u32 bigger = 0;
         for (const auto& texture : MapTextures) {
-            const auto file = mnt->Open(texture.path, false);
+            const auto file = mnt->Open(fmt::format("/app0/{}", texture.path), false);
             if (file && file->IsOpen() && file->Size() >= texture.size + texture.size / 4)
                 ++bigger;
         }
@@ -937,6 +996,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                      "No texture pack found ({} of {} map textures bigger than the "
                      "game's own)",
                      bigger, std::size(MapTextures));
+        // BB PC Remaster shows artefacts without direct memory access: on for it when the
+        // setting itself is off. Before any shader is built.
+        Common::BbTuning::dma_for_texture_pack.store(
+            FileSys::BbHdrCompat::RemasterPresent() &&
+            !EmulatorSettings.IsDirectMemoryAccessEnabled());
+        if (Common::BbTuning::DmaForTexturePack())
+            LOG_INFO(Loader, "Direct memory access: on for BB PC Remaster");
     }
     if (FileSys::BbHdrCompat::IsCandidate(
             "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx")) {

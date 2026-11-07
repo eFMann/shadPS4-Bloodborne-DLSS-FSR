@@ -4,6 +4,7 @@
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/bb_tuning.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "core/emulator_settings.h"
@@ -30,7 +31,7 @@ MemoryManager::MemoryManager() {
 
     // Pre-initialize direct backing
     auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
-    s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
+    s32 extra_dmem = Common::BbTuning::ExtraDmemMB(EmulatorSettings.GetExtraDmemInMBytes());
     if (extra_dmem != 0) {
         total_size += extra_dmem * 1_MB;
     }
@@ -53,6 +54,17 @@ MemoryManager::MemoryManager() {
 
 MemoryManager::~MemoryManager() = default;
 
+std::pair<u64, u64> MemoryManager::DirectMemoryUse() {
+    std::shared_lock lk{mutex};
+    u64 used = 0;
+    for (const auto& [base, area] : dmem_map) {
+        if (area.dma_type != PhysicalMemoryType::Free) {
+            used += area.size;
+        }
+    }
+    return {used, total_direct_size};
+}
+
 void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1,
                                        bool use_extended_mem2) {
     // Calculate actual direct and flexible memory sizes
@@ -61,7 +73,7 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
     if (EmulatorSettings.IsDevKit()) {
         total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_DEV_PRO : ORBIS_KERNEL_TOTAL_MEM_DEV;
     }
-    s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
+    s32 extra_dmem = Common::BbTuning::ExtraDmemMB(EmulatorSettings.GetExtraDmemInMBytes());
     if (extra_dmem != 0) {
         LOG_WARNING(Kernel_Vmm,
                     "extraDmemInMbytes is {} MB! Old Direct Size: {:#x} -> New Direct Size: {:#x}",
@@ -246,6 +258,7 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, 
 
     if (dmem_area == dmem_map.end()) {
         // There are no suitable mappings in this range
+        dmem_failures.fetch_add(1, std::memory_order_relaxed);
         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
         return -1;
     }
@@ -287,6 +300,7 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
 
     if (dmem_area == dmem_map.end() || mapping_end > search_end) {
         // There are no suitable mappings in this range
+        dmem_failures.fetch_add(1, std::memory_order_relaxed);
         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
         return -1;
     }

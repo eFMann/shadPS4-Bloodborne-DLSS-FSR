@@ -847,11 +847,6 @@ void DlssLayer::DrawWindow() {
                 }
                 if (!now.problem.empty())
                     TextDisabled("%s", now.problem.c_str());
-                // A scene above 1080p raises the game's graphics heap: it needs extra dmem.
-                if (next.render_height > Res::HeapRenderHeight &&
-                    EmulatorSettings.GetExtraDmemInMBytes() < 4000)
-                    TextColored({1.0f, 0.75f, 0.3f, 1.0f},
-                                "Above 1080p needs extra dmem of 4000 MB or more (game settings).");
                 // Patches from the patch file or launcher that set the same sizes: not applied.
                 if (now.enabled && !Res::SkippedPatches().empty())
                     TextWrapped("Ignored while this is on: %s",
