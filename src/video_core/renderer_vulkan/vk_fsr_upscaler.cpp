@@ -178,6 +178,15 @@ FfxApiResource ToFfx(const DlssNgx::Resource& resource, bool writable) {
 // FFX_API_MAKE_BACKEND_SUB_ID(FFX_API_BACKEND_ID_VK, 0x03) and rejects the 1.x number. The struct
 // layout is unchanged, so the 1.1.4 headers serve both runtimes.
 constexpr ffxStructType_t AmdFsrBackendVkType = 0x01000003u;
+// SDK 2.1 and later want the upscaler API version the game was built against chained to the
+// context description (ffxCreateContextDescUpscaleVersion, absent from the 1.1.4 headers):
+// FFX_UPSCALER_VERSION of the pinned SDK 2.4.0, upscaler 4.1.2.
+struct AmdFsrUpscaleVersionDesc {
+    ffxCreateContextDescHeader header;
+    uint32_t version;
+};
+constexpr ffxStructType_t AmdFsrUpscaleVersionType = 0x0001000bu;
+constexpr uint32_t AmdFsrUpscalerVersion = (4u << 22) | (1u << 12) | 2u;
 } // namespace
 
 struct FsrUpscaler::Impl {
@@ -247,9 +256,13 @@ bool FsrUpscaler::CreateContext(const ContextDesc& desc) {
     backend.vkDevice = impl->device;
     backend.vkPhysicalDevice = impl->physical;
     backend.vkDeviceProcAddr = DeviceProcAddr;
+    AmdFsrUpscaleVersionDesc version_desc{};
+    version_desc.header.type = AmdFsrUpscaleVersionType;
+    version_desc.header.pNext = &backend.header;
+    version_desc.version = AmdFsrUpscalerVersion;
     ffxCreateContextDescUpscale create{};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    create.header.pNext = &backend.header;
+    create.header.pNext = impl->runtime == Runtime::AmdFsr ? &version_desc.header : &backend.header;
     create.flags = (desc.hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
                                    (desc.auto_exposure ? FFX_UPSCALE_ENABLE_AUTO_EXPOSURE : 0u)
                              : FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE) |
