@@ -1276,6 +1276,9 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_fsr_upscaler.cpp
                src/video_core/renderer_vulkan/vk_fsr4_addon.cpp
                src/video_core/renderer_vulkan/vk_fsr4_addon.h
+               src/video_core/renderer_vulkan/vk_bb_neural_rendering.cpp
+               src/video_core/renderer_vulkan/vk_bb_neural_rendering.h
+               src/video_core/renderer_vulkan/vk_bb_nr_settings.h
                src/video_core/renderer_vulkan/vk_fsr_upscaler.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h

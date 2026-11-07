@@ -124,6 +124,27 @@ the first release that runs it on Vulkan. Windows only.
 Delete the folder to remove it. FSR 3.1 and the FSR 4 add-on are unaffected. Tested on a
 Radeon RX 9070 XT (driver 26.10.1), 2560x1440 to 3840x2160.
 
+### Optional: DLSS 5 neural rendering on AMD
+
+The DLSS 5 neural rendering network as reimplemented for Radeon RX 9000 by
+[DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD) (MIT), run on the render-resolution
+scene right before AMD FSR 4.1. Windows and RX 9000 only; it needs AMD FSR 4.1 (above).
+Nothing from NVIDIA is included: the model comes from your own `nvngx_dlssnr.dll`.
+
+1. Unpack this build's NR add-on download next to `shadPS4.exe` (its `dlssnr-amd` folder and
+   `dlssnr-amd.ini`).
+2. Drop your `nvngx_dlssnr.dll` (NVIDIA's own 310.9.16, for example from NBA 2K27, or 310.8.0;
+   modified copies are refused) or a zip that contains it on `dlssnr-amd\install-model.bat`. It
+   makes the model in that folder; 310.9.16 gives both networks, 310.8.0 CC_SILVER_AARDWOLD only.
+3. Pick AMD FSR in F1 and tick *Neural rendering*, or set `nr=1` in `dlss.ini`. F1 also sets the
+   network, its resolution (`nr_scale`, 0.33 to 1) and the intensity (`nr_intensity`, 0 to 2).
+
+The first start builds the network while the game runs normally (about 80 seconds on an
+RX 9070 XT); it is cached in `dlssnr-amd`, so later starts take a few seconds. F1 shows when it is
+ready and what it costs. Delete `dlssnr-amd\shadps4_nr.dll` to remove it. While that
+file is there, the GPU device is set up for the network even with *Neural rendering* off in F1,
+which only skips the pass; to compare a problem without NR, rename the file instead.
+
 ### Frame generation
 
 Tick *Frame generation* in F1 and restart. The game then shows generated frames between the ones
@@ -491,6 +512,17 @@ For the curious, or for porting this to a newer shadPS4:
   with the FSR SDK 2.x number for the Vulkan backend description. With the folder present, the
   device also enables cooperative matrices and FP8 (`VK_KHR_cooperative_matrix`,
   `VK_EXT_shader_float8`) for its RDNA 4 model, plus what the add-on enables.
+- **Neural rendering**: `dlssnr-amd/shadps4_nr.dll` (source in [`dlssnr_addon/`](dlssnr_addon))
+  is DLSSNR-AMD's network with a small C interface instead of its game plugin. With the add-on
+  and a model present, the Vulkan device is created through it, so the device gets what the
+  network needs. Each frame the network runs on a copy of AMD FSR 4.1's colour input, with the
+  same depth and motion vectors, on shadPS4's own command buffer; AMD FSR then takes that copy.
+  Until the network is built, frames go through unchanged. That C interface
+  (`dlssnr_addon/shadps4_nr.h`) is the one every backend speaks: another one, such as NVIDIA's own
+  NR through NGX on RTX cards, is a `shadps4_nr.dll` in its own folder that names the upscalers it
+  runs before, plus a line in the backend list in `vk_bb_neural_rendering.cpp`. Before DLSS the
+  network is recorded in the same step as DLSS; no backend runs there yet, so that path is
+  untested.
 - **DLSS frame generation**: Streamline is loaded before the Vulkan instance and hands out its
   versions of the instance, device and swapchain functions. Each upscaled frame keeps its depth,
   motion and camera matrices in a small ring until presented. DLSS-G also gets the window without
@@ -527,6 +559,14 @@ cmake --build build-fsr4
 
 Its model files are `fsr4_model_v07_i8_*`, `rcas.spv` and `spd_auto_exposure.spv` from
 [Q2RTX's `baseq2/fsr4_shaders`](https://github.com/FireBurn/Q2RTX/tree/ae8d628fae208813172446d1e49ed94150b04658/baseq2/fsr4_shaders).
+
+The NR add-on is built with mingw-w64 (posix threads) from a
+[DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD) v0.0.8.2 checkout, the way that project
+builds its Windows DLLs:
+
+```
+bash dlssnr_addon/build.sh <path to DLSSNR-AMD> build-nr
+```
 
 Frame generation needs the [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline/releases)
 2.14.16 headers: add `-DBB_STREAMLINE_DIR=<path to the Streamline SDK>` when configuring the
@@ -580,6 +620,11 @@ An AI coding agent was used in the development of this project.
 - The FSR 4 add-on: its wrapper is GPL-2.0-or-later and FSR-Vulkan inside it is MIT. The model
   files carry the MIT notice of the FSR 4 source they were built from; the add-on zip includes
   all three license texts.
+- The NR add-on: its interface in `dlssnr_addon/` is MIT, DLSSNR-AMD inside it and its network
+  data are MIT, and it contains MinHook (BSD-2-Clause), Dear ImGui (MIT), the Inter font
+  (OFL-1.1) and the mingw-w64 runtime; the add-on zip includes their license texts. The model
+  `install-model.bat` makes comes from your own `nvngx_dlssnr.dll` and is not covered by the
+  licenses above.
 
 NVIDIA, GeForce RTX and DLSS are trademarks of NVIDIA Corporation. AMD and FidelityFX are
 trademarks of Advanced Micro Devices, Inc. Bloodborne is a trademark of Sony Interactive

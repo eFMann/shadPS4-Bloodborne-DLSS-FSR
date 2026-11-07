@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_bb_fsr_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_bb_neural_rendering.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_fsr4_addon.h"
 #include "video_core/renderer_vulkan/vk_fsr_upscaler.h"
@@ -211,6 +212,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 Instance::~Instance() {
     FrameGen::Shutdown();
     dlss_ngx.reset();
+    neural_rendering.reset();
     if (ImGui::GetCurrentContext()) {
         ImGui::Core::Shutdown(GetDevice());
     }
@@ -779,12 +781,26 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
-    auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
-    if (device_result != vk::Result::eSuccess) {
-        LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
-        return false;
+    neural_rendering = BbNeuralRendering::Load();
+    if (neural_rendering) {
+        vk::Device created{};
+        const auto device_result =
+            neural_rendering->CreateDevice(physical_device, device_chain.get(), created);
+        if (device_result != vk::Result::eSuccess) {
+            LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}",
+                         vk::to_string(device_result));
+            return false;
+        }
+        device = vk::UniqueDevice{created};
+    } else {
+        auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+        if (device_result != vk::Result::eSuccess) {
+            LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}",
+                         vk::to_string(device_result));
+            return false;
+        }
+        device = std::move(dev);
     }
-    device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
@@ -794,6 +810,10 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, present_queue_index);
+    if (neural_rendering &&
+        !neural_rendering->Init(*instance, physical_device, *device, queue_family_index)) {
+        neural_rendering.reset();
+    }
     buffer_queue_families[0] = queue_family_index;
     if (readback_family != ~0u) {
         readback_queue = device->getQueue(readback_family, readback_index);
