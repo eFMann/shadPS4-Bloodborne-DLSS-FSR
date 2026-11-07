@@ -64,11 +64,10 @@ void LogCopyStats() {
         LOG_INFO(Render_Vulkan,
                  "Copy shader sources (issue #25): {:.0f} of {:.0f} GPU batches/s ({:.0f}%, "
                  "{:.2f} MiB/s) read from a snapshot of game memory in the stream buffer; "
-                 "merged {} sources from buffer memory {} large batches {}",
+                 "merged {} sources from buffer memory {}",
                  stream_sources / seconds, gpu_batches / seconds,
                  100.0 * stream_sources / gpu_batches, stream_bytes / seconds / (1 << 20),
-                 Common::BbTuning::MergedCopies(), Common::BbTuning::MergedNoStreamSources(),
-                 Common::BbTuning::MergedLargeBatches());
+                 Common::BbTuning::MergedCopies(), Common::BbTuning::MergedNoStreamSources());
     }
     if (same_copies != 0) {
         LOG_INFO(Render_Vulkan,
@@ -340,9 +339,8 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     // copy shader's GPU time 1.5 -> 0.6 ms/frame.
     // Off (threaded renderer toggle): the original 64 MiB and one copy command per batch.
     const bool merged = Common::BbTuning::MergedCopies();
-    // Tests (issue #25): the old 64 MiB batches, and sources never snapshotted.
-    const vk::DeviceSize MaxDistanceForMerge =
-        merged && !Common::BbTuning::MergedLargeBatches() ? 64_KB : 64_MB;
+    const vk::DeviceSize MaxDistanceForMerge = merged ? 64_KB : 64_MB;
+    // Test (issue #25, white dots): sources never snapshotted from game memory.
     const bool allow_stream = !(merged && Common::BbTuning::MergedNoStreamSources());
     struct Batch {
         u32 start, end;

@@ -175,7 +175,6 @@ private:
     bool bbStreamingSetting;
     bool bbMergedCopiesSetting;
     bool bbMergedNoStreamSourcesSetting;
-    bool bbMergedLargeBatchesSetting;
     bool bbFastLocksSetting;
     bool bbFlipWhenReadySetting;
     bool bbVramReclaimSetting;

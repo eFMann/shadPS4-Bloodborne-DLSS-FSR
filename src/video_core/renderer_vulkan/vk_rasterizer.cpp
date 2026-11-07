@@ -1947,8 +1947,6 @@ void Rasterizer::OnSubmit() {
                                 std::memory_order_relaxed);
         BB::merged_no_stream_sources.store(EmulatorSettings.IsBbMergedNoStreamSources(),
                                            std::memory_order_relaxed);
-        BB::merged_large_batches.store(EmulatorSettings.IsBbMergedLargeBatches(),
-                                       std::memory_order_relaxed);
         BB::readback_queue.store(pipe_enabled && EmulatorSettings.IsBbReadbackQueue(),
                                  std::memory_order_relaxed);
         // Its copies back to guest memory run only on the readback queue: without it (the setting

@@ -784,11 +784,10 @@ struct VulkanSettings {
     // Bloodborne's frame rate set free by hooks in the game's code instead of the
     // frame rate patches, which must be off then. Applies at the next start. Global only.
     Setting<bool> bb_frame_hooks{true};
-    // Tests (issue #25, white dots), with merged copy shaders: the copies' sources never
+    // Test (issue #25, white dots), with merged copy shaders: the copies' sources never
     // snapshotted from game memory into the stream buffer (read from the buffer cache, as with
-    // merged copies off), and the old 64 MiB batches instead of 64 KiB ones.
+    // merged copies off).
     Setting<bool> bb_merged_no_stream_sources{false};
-    Setting<bool> bb_merged_large_batches{false};
     // The frame rate limit with the frame rate hooks (30..480; 0: none), changed while the game
     // runs. Global only.
     Setting<int> bb_fps_limit{0};
@@ -888,8 +887,6 @@ struct VulkanSettings {
                                           &VulkanSettings::bb_clear_one_layer),
             make_override<VulkanSettings>("bb_merged_no_stream_sources",
                                           &VulkanSettings::bb_merged_no_stream_sources),
-            make_override<VulkanSettings>("bb_merged_large_batches",
-                                          &VulkanSettings::bb_merged_large_batches),
         };
     }
 };
@@ -907,7 +904,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_perf_meter, bb_gx_observe,
     bb_gx_pipelines, bb_recorder_census, bb_draw_finisher, bb_async_submit, bb_vram_upload_staging,
     bb_render_threads_off_core0, bb_even_capped_flips, bb_merged_no_stream_sources,
-    bb_merged_large_batches, bb_ssr_check_patch_file)
+    bb_ssr_check_patch_file)
 
 // -------------------------------
 // Main manager
@@ -1292,7 +1289,6 @@ public:
     SETTING_FORWARD(m_vulkan, BbCounterCorner, bb_counter_corner)
     SETTING_FORWARD_BOOL(m_vulkan, BbEvenCappedFlips, bb_even_capped_flips)
     SETTING_FORWARD_BOOL(m_vulkan, BbMergedNoStreamSources, bb_merged_no_stream_sources)
-    SETTING_FORWARD_BOOL(m_vulkan, BbMergedLargeBatches, bb_merged_large_batches)
     SETTING_FORWARD_BOOL(m_gpu, BbSpreadLoads, bb_spread_loads)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)

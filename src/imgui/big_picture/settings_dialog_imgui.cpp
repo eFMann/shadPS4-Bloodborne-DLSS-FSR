@@ -89,7 +89,6 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbStreamingSetting = EmulatorSettings.IsBbStreaming();
     bbMergedCopiesSetting = EmulatorSettings.IsBbMergedCopies();
     bbMergedNoStreamSourcesSetting = EmulatorSettings.IsBbMergedNoStreamSources();
-    bbMergedLargeBatchesSetting = EmulatorSettings.IsBbMergedLargeBatches();
     bbFastLocksSetting = EmulatorSettings.IsBbFastLocks();
     bbFlipWhenReadySetting = EmulatorSettings.IsBbFlipWhenReady();
     bbVramReclaimSetting = EmulatorSettings.IsBbVramReclaim();
@@ -235,7 +234,6 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbStreaming(bbStreamingSetting, isSpecific);
     EmulatorSettings.SetBbMergedCopies(bbMergedCopiesSetting, isSpecific);
     EmulatorSettings.SetBbMergedNoStreamSources(bbMergedNoStreamSourcesSetting, isSpecific);
-    EmulatorSettings.SetBbMergedLargeBatches(bbMergedLargeBatchesSetting, isSpecific);
     EmulatorSettings.SetBbFastLocks(bbFastLocksSetting, isSpecific);
     EmulatorSettings.SetBbFlipWhenReady(bbFlipWhenReadySetting, isSpecific);
     EmulatorSettings.SetBbVramReclaim(bbVramReclaimSetting, isSpecific);
@@ -1162,8 +1160,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                        bbMergedNoStreamSourcesSetting,
                                        "Flicker test: small copy sources not snapshotted from "
                                        "game memory");
-                    AddSettingCheckbox("    Large batches", bbMergedLargeBatchesSetting,
-                                       "Flicker test: the old 64 MB batches instead of 64 KB");
                 }
             }
             if (tr && advanced) {
