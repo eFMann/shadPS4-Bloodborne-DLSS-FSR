@@ -562,7 +562,7 @@ Its model files are `fsr4_model_v07_i8_*`, `rcas.spv` and `spd_auto_exposure.spv
 
 The NR add-on is built with mingw-w64 (posix threads) from a
 [DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD) v0.0.8.2 checkout, the way that project
-builds its Windows DLLs:
+builds its Windows DLLs, with the fixes in `dlssnr_addon/patches` applied to it first:
 
 ```
 bash dlssnr_addon/build.sh <path to DLSSNR-AMD> build-nr

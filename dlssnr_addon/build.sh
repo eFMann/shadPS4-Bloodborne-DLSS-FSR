@@ -6,7 +6,8 @@
 # from a DLSSNR-AMD tree (gitlab.com/mochizuki0323/DLSSNR-AMD, MIT) at tag v0.0.8.2. The model's
 # objects are compiled exactly as that tree's windows/build/build_asi.sh compiles them (same flags,
 # same network constants as the shaders its package installs); only the plugin's own units are left
-# out and shadps4_nr.cpp takes their place. Bash, not sh: it sources that tree's bash scripts.
+# out and shadps4_nr.cpp takes their place, and patches/ is applied first. Bash, not sh: it sources
+# that tree's bash scripts.
 set -euo pipefail
 
 usage() {
@@ -33,6 +34,10 @@ for cmd in "$cxx" "$cc" "$objdump" python3 git curl; do need_cmd "$cmd"; done
 
 cd -- "$src"
 [ -f windows/src/pe/nr_dlssnr_model.cpp ] || die "Not a DLSSNR-AMD tree: $src"
+# Fixes to the pinned tree, each explained in its patch; skipped when already applied.
+for patch in "$addon"/patches/*.patch; do
+    git apply --reverse --check "$patch" 2>/dev/null || git apply "$patch" || die "Patch does not apply: $patch"
+done
 bash fetch_deps.sh >/dev/null
 minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 imgui=toolchain/imgui-nr
