@@ -679,6 +679,32 @@ void Rasterizer::BetterSsrAfterDraw(const GraphicsPipeline* pipeline) {
     }
 }
 
+void Rasterizer::SsgiAfterDraw(const GraphicsPipeline* pipeline) {
+    BB_STAGE_CENSUS("SSGI after the draw", Features);
+    const auto* ps = pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Fragment)];
+    if (!ps || !EmulatorSettings.IsBbSsgi() ||
+        std::popcount(pipeline->GetGraphicsKey().mrt_mask) < 1) {
+        return;
+    }
+    switch (ps->pgm_hash) {
+    case BbSsgi::AoCompositeShader:
+        ssgi->OnAoComposite(cb_descs[0].image_id);
+        break;
+    case BbSsgi::LightingShader:
+        ssgi->OnLighting(cb_descs[0].image_id, cb_descs[0].desc.view_info.format);
+        break;
+    case BbSsgi::DiffuseAlbedoShader:
+        ssgi->OnDiffuseAlbedo(cb_descs[0].image_id);
+        break;
+    case BbSsgi::SceneCompositeShader:
+        ssgi->OnSceneComposite(cb_descs[0].image_id,
+                               ps->images.size() > 5 ? stage_textures[5] : VideoCore::ImageId{});
+        break;
+    default:
+        break;
+    }
+}
+
 // Fills color target 0 with a copy of another image of the same size and format, with the same
 // bookkeeping a draw into it gets.
 void Rasterizer::CopyInsteadOfDraw(const BbTemporalDlss::DrawReplacement& replacement) {
@@ -852,6 +878,9 @@ u8 Rasterizer::DrawFeatures(const GraphicsPipeline* pipeline) const {
         if (hash == BbVbao::SsaoShader || BbVbao::AoShader(hash)) {
             features |= VbaoAfter;
         }
+    }
+    if (ssgi && EmulatorSettings.IsBbSsgi() && BbSsgi::UsesShader(hash)) {
+        features |= SsgiAfter;
     }
     return features;
 }
@@ -1399,6 +1428,9 @@ void Rasterizer::FinishDraw(FinishEntry& e) {
     }
     if (features & SsrAfter) {
         BetterSsrAfterDraw(pipeline);
+    }
+    if (features & SsgiAfter) {
+        SsgiAfterDraw(pipeline);
     }
     DebugState.IncDrawCall();
     FinLap(Section::Record);
@@ -2692,6 +2724,18 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (ssr && gbuffer_draw) {
         ssr->OnGBufferDraw(db_desc.image_id);
     }
+    if (EmulatorSettings.IsBbSsgi() && !ssgi) {
+        ssgi = std::make_unique<BbSsgi>(instance, scheduler, runtime, texture_cache);
+    }
+    if (ssgi) {
+        if (gbuffer_draw && EmulatorSettings.IsBbSsgi()) {
+            const auto& vp = Regs().viewports[0];
+            ssgi->OnGBufferDraw(db_desc.image_id, cb_descs[0].image_id,
+                                vp.xscale < 0.0f ? -1.0f : 1.0f, vp.yscale < 0.0f ? -1.0f : 1.0f);
+        } else {
+            ssgi->OnOtherDraw();
+        }
+    }
     if (vbao) {
         if (gbuffer_draw && EmulatorSettings.IsBbVbao()) {
             const auto& vp = Regs().viewports[0];
@@ -3967,6 +4011,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (vbao) {
                     vbao->ObserveSceneConstants(stage.FlatUserData().data(), size);
                 }
+                if (ssgi) {
+                    ssgi->ObserveSceneConstants(stage.FlatUserData().data(), size);
+                }
                 temporal_dlss.ObserveBlurInputs(stage.FlatUserData().data(), size, stage.pgm_hash,
                                                 binding.unified);
             } else {
@@ -3977,6 +4024,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const bool scene = (prefetched->flags & PrefetchScene) != 0;
                 if (vbao && scene) {
                     vbao->ObserveSceneConstants(
+                        reinterpret_cast<const void*>(desc.GetSharp(stage).base_address), size);
+                }
+                if (ssgi && scene) {
+                    ssgi->ObserveSceneConstants(
                         reinterpret_cast<const void*>(desc.GetSharp(stage).base_address), size);
                 }
                 if (temporal_dlss.Requested()) {
@@ -4019,6 +4070,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 temporal_dlss.ObserveSceneConstants(flat_ud.data(), ubo_size);
                 if (vbao) {
                     vbao->ObserveSceneConstants(flat_ud.data(), ubo_size);
+                }
+                if (ssgi) {
+                    ssgi->ObserveSceneConstants(flat_ud.data(), ubo_size);
                 }
                 temporal_dlss.ObserveBlurInputs(flat_ud.data(), ubo_size, stage.pgm_hash,
                                                 binding.unified);
@@ -4106,6 +4160,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto observe_start = RecMark();
                 if (!desc.is_written && vbao) {
                     vbao->ObserveSceneConstants(reinterpret_cast<const void*>(vsharp.base_address),
+                                                size);
+                }
+                if (!desc.is_written && ssgi) {
+                    ssgi->ObserveSceneConstants(reinterpret_cast<const void*>(vsharp.base_address),
                                                 size);
                 }
                 if (!desc.is_written && temporal_dlss.Requested()) {

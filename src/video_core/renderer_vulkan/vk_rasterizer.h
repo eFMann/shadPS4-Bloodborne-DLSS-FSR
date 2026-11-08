@@ -21,6 +21,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
+#include "video_core/renderer_vulkan/vk_bb_ssgi.h"
 #include "video_core/renderer_vulkan/vk_bb_ssr.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_bb_vbao.h"
@@ -536,6 +537,7 @@ private:
         SsrAfter = 1 << 1,      ///< an input of the better reflections (BetterSsrAfterDraw)
         VbaoLeavesOut = 1 << 2, ///< an AO draw VBAO may leave out (BetterAoLeavesOutDraw)
         VbaoAfter = 1 << 3,     ///< the game's AO passes (BetterAoAfterDraw)
+        SsgiAfter = 1 << 4,     ///< the lighting and its inputs (SsgiAfterDraw)
     };
     /// The resolve half: which of our features the draw's finish half has to run.
     u8 DrawFeatures(const GraphicsPipeline* pipeline) const;
@@ -908,7 +910,7 @@ private:
     /// The first textures of the draw's pixel shader (after BindResources). image_bindings holds
     /// the last bound stage's (the vertex shader's), and is not filled when a remembered texture
     /// set is reused.
-    std::array<VideoCore::ImageId, 3> stage_textures{};
+    std::array<VideoCore::ImageId, 6> stage_textures{};
     /// Better reflections: made when the setting is first on.
     std::unique_ptr<BbSsr> ssr;
     /// The game's reflection constants (its trace pixel shader's buffer 0), from BindBuffers.
@@ -923,6 +925,10 @@ private:
     void BetterAoAfterDraw(const GraphicsPipeline* pipeline);
     /// Before recording the draw: whether it is one of the game's AO draws VBAO replaces.
     bool BetterAoLeavesOutDraw(const GraphicsPipeline* pipeline);
+    /// Screen-space GI: made when the setting is first on.
+    std::unique_ptr<BbSsgi> ssgi;
+    /// After the lighting and the draws SSGI takes inputs from: the bounce added (when on).
+    void SsgiAfterDraw(const GraphicsPipeline* pipeline);
     u64 pipe_stats_occlusion_blips{};
     u32 occlusion_blips_logged{};
     /// Pending answers, the query pool's busy flags and its host resets: under occlusion_mutex.

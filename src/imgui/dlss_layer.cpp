@@ -1440,6 +1440,56 @@ void DlssLayer::DrawWindow() {
             EndDisabled();
         }
 
+        SeparatorText("Global illumination");
+        {
+            bool ssgi = EmulatorSettings.IsBbSsgi();
+            if (Checkbox("SSGI (screen-space global illumination)", &ssgi)) {
+                EmulatorSettings.SetBbSsgi(ssgi);
+                EmulatorSettings.Save();
+            }
+            if (IsItemHovered())
+                SetTooltip("Light bouncing between surfaces: walls and floors lit by fires, lamps, "
+                           "the moon and\nglowing windows light what is near them, with their "
+                           "colour. The game itself has only a\nflat ambient light per object.");
+            BeginDisabled(!ssgi);
+            const auto slider = [](const char* name, int value, float low, float high, auto set) {
+                float shown = float(value) * 0.01f;
+                SetNextItemWidth(Px(200.0f));
+                if (SliderFloat(name, &shown, low, high, "%.2f"))
+                    set(int(std::lround(shown * 100.0f)));
+                if (IsItemDeactivatedAfterEdit())
+                    EmulatorSettings.Save();
+            };
+            slider("Strength##ssgi", EmulatorSettings.GetBbSsgiStrength(), 0.0f, 3.0f,
+                   [](int v) { EmulatorSettings.SetBbSsgiStrength(v); });
+            if (IsItemHovered())
+                SetTooltip("How much bounced light is added (1.00 by default).");
+            slider("Reach (metres)##ssgi", EmulatorSettings.GetBbSsgiRadius(), 0.5f, 10.0f,
+                   [](int v) { EmulatorSettings.SetBbSsgiRadius(v); });
+            if (IsItemHovered())
+                SetTooltip("How far light can bounce from a surface (3.00 by default). Longer "
+                           "reaches cost more GPU time.");
+            if (EmulatorSettings.IsBbShowThreadedSettings()) {
+                static const char* const views[] = {"Off", "Bounce light only",
+                                                    "Light that bounces"};
+                int view = std::clamp(EmulatorSettings.GetBbSsgiDebugView(), 0, 2);
+                SetNextItemWidth(Px(200.0f));
+                if (Combo("Debug view##ssgi", &view, views, IM_ARRAYSIZE(views))) {
+                    EmulatorSettings.SetBbSsgiDebugView(view);
+                }
+                if (IsItemHovered())
+                    SetTooltip("For testing, the picture replaced by:\nBounce light only: the "
+                               "bounced light alone, as light (black where there is none).\n"
+                               "Light that bounces: what surfaces give off for SSGI to bounce.");
+            }
+            if (Button("Defaults##ssgi")) {
+                EmulatorSettings.SetBbSsgiStrength(100);
+                EmulatorSettings.SetBbSsgiRadius(300);
+                EmulatorSettings.Save();
+            }
+            EndDisabled();
+        }
+
         if (ShowReflections) {
             SeparatorText("Reflections");
             {

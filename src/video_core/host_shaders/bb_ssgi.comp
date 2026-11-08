@@ -1,0 +1,480 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Screen-space global illumination: one bounce of the light the screen's surfaces give off
+// diffusely, gathered with a visibility bitmask (O. Therrien, Y. Levesque, G. Gilet, "Screen Space
+// Indirect Lighting with Visibility Bitmask", 2023) and added to Bloodborne's diffuse light, before
+// its AO and base colour are applied (vk_bb_ssgi.h). The passes of this file:
+//   CAPTURE    the game's diffuse light times base colour (no specular, no fog), at half size
+//              with its view depth: the light the next frame gathers. Without its flat ambient
+//              light (SUBTRACT): only the light of the sun, moon, lamps and fires (and the bounce)
+//              bounces, so the ambient is not added again over everything. The same pass, without
+//              SUBTRACT, keeps that ambient light at the lighting pass. With SELF_LIT the light
+//              self-lit surfaces give off (the scene composite's third layer) is added.
+//   TRACE      half size: slices of the screen around each texel; a depth sample is a slab of
+//              the given thickness whose angular sectors go into a 32-bit mask. Sectors a sample
+//              covers that nearer samples did not are lit by it: last frame's light at that
+//              point, cosine weighted at the texel (the sector's weight) and at the sample.
+//   TEMPORAL   this frame's result blended with the last frames', reprojected.
+//   BLUR       a depth-aware 5x5 blur at half size.
+//   COMPOSITE  full size: depth-aware upsample, times the game's AO, added to its diffuse light;
+//              with SHOW_BOUNCE written over the finished scene instead (a debug view).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Constants {
+    vec4 proj;        // x scale, y scale, z scale, z offset; ndc +y down the screen
+    vec2 prev_proj;   // the reprojection's camera: x scale, y scale
+    vec2 size;        // scene pixels (the half size is rounded up)
+    float view3[9];   // world to view rotation, rows
+    float reproj[12]; // a past camera's view * inverse current view, rows (3x4)
+    float param0;     // TRACE: reach, view units; TEMPORAL: history weight; COMPOSITE: strength
+    float param1;     // TRACE: slab thickness, view units
+    uint flags;       // TRACE: frame in the low bits, FLAG_* above
+};
+
+const uint FLAG_LIGHT = 1u << 31;   // TRACE: last frame's light is there
+const uint FLAG_NORMALS = 1u << 30; // TRACE: G-buffer normals
+const uint FLAG_AO = 1u << 30;      // COMPOSITE: the game's AO
+const uint FLAG_SUBTRACT = 1u << 28; // CAPTURE: the ambient light kept is taken out
+const uint FLAG_SELF_LIT = 1u << 27; // CAPTURE: the self-lit layer is added
+const uint FRAME_MASK = 0xffffu;
+const float SKY_Z = 65000.0;
+
+#define half_size uvec2((uvec2(size) + 1u) / 2u)
+
+float ViewZ(float depth) {
+    // Clip z = zs * z + zo, w = z; depth = zs + zo / z.
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+// View position (+z away from the camera) of a scene pixel position at view depth z.
+vec3 ViewAt(vec2 pixel, float z) {
+    const vec2 ndc = pixel / size * 2.0 - 1.0;
+    return vec3(ndc.x * z / proj.x, ndc.y * z / proj.y, z);
+}
+
+// A view position in the past camera, and its scene pixel position there (z <= 0: behind it).
+vec3 Reproject(vec3 view) {
+    const vec4 v = vec4(view, 1.0);
+    return vec3(dot(vec4(reproj[0], reproj[1], reproj[2], reproj[3]), v),
+                dot(vec4(reproj[4], reproj[5], reproj[6], reproj[7]), v),
+                dot(vec4(reproj[8], reproj[9], reproj[10], reproj[11]), v));
+}
+
+vec2 PastPixel(vec3 past) {
+    return (past.xy * prev_proj / past.z * 0.5 + 0.5) * size;
+}
+
+#if defined(CAPTURE)
+
+layout(binding = 0) uniform texture2D light_tex; // diffuse light times base colour, scene size
+layout(binding = 1) uniform texture2D depth_tex;
+layout(binding = 2) uniform texture2D total_tex;   // SUBTRACT: the diffuse light (before colour)
+layout(binding = 4) uniform texture2D ambient_tex; // SUBTRACT: the ambient part of it, half size
+layout(binding = 5) uniform texture2D self_lit_tex; // SELF_LIT: light self-lit surfaces give off
+layout(binding = 3, rgba16f) uniform writeonly image2D out_img; // light, view z
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(texel), half_size))) {
+        return;
+    }
+    const ivec2 last = ivec2(size) - 1;
+    const ivec2 base = min(texel * 2, last);
+    const float depth = texelFetch(depth_tex, base, 0).r;
+    if (depth >= 1.0) {
+        imageStore(out_img, texel, vec4(0.0, 0.0, 0.0, SKY_Z));
+        return;
+    }
+    // The 2x2 pixels the texel stands for, those on the same surface as its first.
+    const float z = ViewZ(depth);
+    const bool subtract = (flags & FLAG_SUBTRACT) != 0u;
+    const bool self_lit = (flags & FLAG_SELF_LIT) != 0u;
+    vec3 sum = vec3(0.0);
+    vec3 total = vec3(0.0);
+    vec3 glow = vec3(0.0);
+    float count = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 p = min(base + ivec2(i & 1, i >> 1), last);
+        const float d = texelFetch(depth_tex, p, 0).r;
+        if (d < 1.0 && abs(ViewZ(d) - z) < 0.05 * z) {
+            sum += min(texelFetch(light_tex, p, 0).rgb, vec3(64.0));
+            if (subtract) {
+                total += min(texelFetch(total_tex, p, 0).rgb, vec3(64.0));
+            }
+            if (self_lit) {
+                glow += clamp(texelFetch(self_lit_tex, p, 0).rgb, vec3(0.0), vec3(64.0));
+            }
+            count += 1.0;
+        }
+    }
+    vec3 light = sum / max(count, 1.0);
+    if (subtract) {
+        // The light is the diffuse light times the base colour: the share of the diffuse light
+        // that is not the ambient one keeps that share of it.
+        total /= max(count, 1.0);
+        const vec3 ambient = texelFetch(ambient_tex, texel, 0).rgb;
+        light *= clamp((total - ambient) / max(total, vec3(1e-4)), 0.0, 1.0);
+    }
+    light += glow / max(count, 1.0);
+    imageStore(out_img, texel, vec4(light, min(z, SKY_Z)));
+}
+
+#elif defined(TRACE)
+
+layout(binding = 0) uniform texture2D depth_tex;  // scene depth
+layout(binding = 1) uniform texture2D normal_tex; // G-buffer world normals, unorm xyz
+layout(binding = 2) uniform texture2D light_tex;  // CAPTURE's, last frame
+layout(binding = 3, rgba16f) uniform writeonly image2D out_img; // indirect light, view z
+
+const float PI = 3.14159265;
+const float HALF_PI = 1.57079633;
+const uint SECTORS = 32u;
+const int SLICES = 2;
+const int STEPS = 10; // per side
+const float HORIZON_BIAS = 0.02;
+
+// Each sector's share of the cosine-weighted half circle around the normal (sum 1).
+const float SECTOR_WEIGHT[32] = float[32](
+    0.0024076, 0.0071997, 0.0119225, 0.0165304, 0.0209791, 0.0252258, 0.0292296, 0.0329518,
+    0.0363567, 0.0394115, 0.0420867, 0.0443567, 0.0461994, 0.0475972, 0.0485366, 0.0490086,
+    0.0490086, 0.0485366, 0.0475972, 0.0461994, 0.0443567, 0.0420867, 0.0394115, 0.0363567,
+    0.0329518, 0.0292296, 0.0252258, 0.0209791, 0.0165304, 0.0119225, 0.0071997, 0.0024076);
+
+float DepthAt(ivec2 pixel) {
+    return texelFetch(depth_tex, clamp(pixel, ivec2(0), ivec2(size) - 1), 0).r;
+}
+
+vec3 PixelPos(ivec2 pixel) {
+    return ViewAt(vec2(pixel) + 0.5, ViewZ(DepthAt(pixel)));
+}
+
+// The G-buffer normal in view space, or zero where there is none.
+vec3 GBufferNormal(ivec2 pixel) {
+    if ((flags & FLAG_NORMALS) == 0u) {
+        return vec3(0.0);
+    }
+    const vec3 world = texelFetch(normal_tex, pixel, 0).xyz * 2.0 - 1.0;
+    if (dot(world, world) < 0.25) {
+        return vec3(0.0);
+    }
+    return normalize(vec3(view3[0] * world.x + view3[1] * world.y + view3[2] * world.z,
+                          view3[3] * world.x + view3[4] * world.y + view3[5] * world.z,
+                          view3[6] * world.x + view3[7] * world.y + view3[8] * world.z));
+}
+
+float FastAcos(float x) {
+    const float a = abs(x);
+    const float r = (-0.156583 * a + HALF_PI) * sqrt(1.0 - a);
+    return x >= 0.0 ? r : PI - r;
+}
+
+// Interleaved gradient noise (Jimenez 2014), shifted per frame for the temporal pass.
+float Noise(vec2 texel, uint frame) {
+    texel += 5.588238 * float(frame & 63u);
+    return fract(52.9829189 * fract(dot(texel, vec2(0.06711056, 0.00583715))));
+}
+
+uint Sectors(float min_t, float max_t) {
+    min_t = clamp(min_t + HORIZON_BIAS, 0.0, 1.0);
+    max_t = clamp(max_t - HORIZON_BIAS, 0.0, 1.0);
+    const int first = int(min_t * float(SECTORS) + 0.5);
+    const int last = int(max_t * float(SECTORS) + 0.5);
+    if (last <= first || first >= int(SECTORS)) {
+        return 0u;
+    }
+    const uint count = uint(last - first);
+    const uint bits = count >= SECTORS ? 0xffffffffu : ((1u << count) - 1u);
+    return bits << uint(first);
+}
+
+float SectorWeight(uint mask) {
+    float sum = 0.0;
+    while (mask != 0u) {
+        sum += SECTOR_WEIGHT[findLSB(mask)];
+        mask &= mask - 1u;
+    }
+    return sum;
+}
+
+// Last frame's light at a view position, or a negative value where it is not known (off
+// screen then, or hidden behind something else).
+vec3 PastLight(vec3 pos) {
+    const vec3 past = Reproject(pos);
+    if (past.z <= 1e-3) {
+        return vec3(-1.0);
+    }
+    const ivec2 texel = ivec2(PastPixel(past) * 0.5);
+    if (any(lessThan(texel, ivec2(0))) || any(greaterThanEqual(uvec2(texel), half_size))) {
+        return vec3(-1.0);
+    }
+    const vec4 light = texelFetch(light_tex, texel, 0);
+    return abs(light.a - past.z) < 0.08 * past.z ? light.rgb : vec3(-1.0);
+}
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(texel), half_size))) {
+        return;
+    }
+    const ivec2 pixel = min(texel * 2, ivec2(size) - 1);
+    const float depth = DepthAt(pixel);
+    if (depth >= 1.0) {
+        imageStore(out_img, texel, vec4(0.0, 0.0, 0.0, SKY_Z));
+        return;
+    }
+    const vec3 pos = ViewAt(vec2(pixel) + 0.5, ViewZ(depth));
+    const vec3 view_dir = normalize(-pos);
+
+    // The surface's normal from the depth (the neighbour on the same surface on each axis), the
+    // G-buffer's where it agrees (normal-map detail).
+    const vec3 px0 = PixelPos(pixel - ivec2(1, 0)), px1 = PixelPos(pixel + ivec2(1, 0));
+    const vec3 py0 = PixelPos(pixel - ivec2(0, 1)), py1 = PixelPos(pixel + ivec2(0, 1));
+    const vec3 dx = abs(px1.z - pos.z) < abs(pos.z - px0.z) ? px1 - pos : pos - px0;
+    const vec3 dy = abs(py1.z - pos.z) < abs(pos.z - py0.z) ? py1 - pos : pos - py0;
+    const vec3 face = cross(dy, dx);
+    vec3 normal = dot(face, face) > 1e-24 ? normalize(face) : view_dir;
+    if (dot(normal, view_dir) < 0.0) {
+        normal = -normal;
+    }
+    vec3 detail = GBufferNormal(pixel);
+    if (dot(detail, view_dir) < 0.0 && dot(detail, normal) < 0.0) {
+        detail = -detail; // a two-sided surface seen from behind
+    }
+    if (dot(detail, normal) > 0.25) {
+        normal = detail;
+    }
+
+    const float reach = param0;
+    const float thickness = param1;
+    const float radius_px = min(reach * abs(proj.x) * 0.5 * size.x / pos.z, 0.25 * size.y);
+    if (radius_px < 2.0 || (flags & FLAG_LIGHT) == 0u) {
+        imageStore(out_img, texel, vec4(0.0, 0.0, 0.0, min(pos.z, SKY_Z)));
+        return;
+    }
+    const uint frame = flags & FRAME_MASK;
+    const float noise = Noise(vec2(texel), frame);
+    const float step_noise = fract(noise + 0.618034 * float(frame & 7u));
+
+    vec3 light = vec3(0.0);
+    float weight = 0.0;
+    for (int slice = 0; slice < SLICES; ++slice) {
+        const float phi = (float(slice) + noise) * PI / float(SLICES);
+        const vec2 omega = vec2(cos(phi), sin(phi));
+        const vec3 direction = normalize(ViewAt(vec2(pixel) + 0.5 + omega, pos.z) - pos);
+        const vec3 ortho = normalize(direction - dot(direction, view_dir) * view_dir);
+        const vec3 axis = cross(ortho, view_dir);
+        const vec3 proj_normal = normal - axis * dot(normal, axis);
+        const float proj_length = length(proj_normal);
+        if (proj_length < 1e-4) {
+            continue;
+        }
+        // Angles in the slice from the view direction, positive towards `ortho`.
+        const float n = sign(dot(ortho, proj_normal)) *
+                        FastAcos(clamp(dot(proj_normal, view_dir) / proj_length, -1.0, 1.0));
+        uint occluded = 0u;
+        vec3 slice_light = vec3(0.0);
+        for (int side = 0; side < 2; ++side) {
+            const float s = side == 0 ? 1.0 : -1.0;
+            for (int i = 0; i < STEPS; ++i) {
+                // Quadratic spacing: more samples close to the texel.
+                float t = (float(i) + step_noise) / float(STEPS);
+                t = t * t;
+                const float dist = max(t * radius_px, 2.0 * float(i + 1));
+                if (dist > radius_px + 2.0) {
+                    break;
+                }
+                const ivec2 sample_pixel = ivec2(vec2(pixel) + 0.5 + s * omega * dist);
+                if (any(lessThan(sample_pixel, ivec2(0))) ||
+                    any(greaterThanEqual(sample_pixel, ivec2(size)))) {
+                    break;
+                }
+                const float sample_depth = DepthAt(sample_pixel);
+                if (sample_depth >= 1.0) {
+                    continue;
+                }
+                const vec3 sample_pos = ViewAt(vec2(sample_pixel) + 0.5, ViewZ(sample_depth));
+                const vec3 delta = sample_pos - pos;
+                const float len = length(delta);
+                if (len < 1e-4) {
+                    continue;
+                }
+                const vec3 back = delta - view_dir * thickness;
+                const float front_angle =
+                    s * FastAcos(clamp(dot(delta / len, view_dir), -1.0, 1.0));
+                const float back_angle =
+                    s * FastAcos(clamp(dot(normalize(back), view_dir), -1.0, 1.0));
+                // Hemisphere around the projected normal: [n - pi/2, n + pi/2] -> [0, 1].
+                const float a = (min(front_angle, back_angle) - n + HALF_PI) / PI;
+                const float b = (max(front_angle, back_angle) - n + HALF_PI) / PI;
+                const uint covered = Sectors(a, b);
+                const uint lit = covered & ~occluded;
+                occluded |= covered;
+                if (lit == 0u) {
+                    continue;
+                }
+                const vec3 sample_light = PastLight(sample_pos);
+                if (sample_light.r < 0.0) {
+                    continue;
+                }
+                // The sample's surface gives off light towards the texel: none from its back.
+                float emit = 1.0;
+                const vec3 sample_normal = GBufferNormal(sample_pixel);
+                if (dot(sample_normal, sample_normal) > 0.0) {
+                    emit = clamp(dot(sample_normal, -delta / len) * 2.0, 0.0, 1.0);
+                }
+                slice_light += sample_light * (SectorWeight(lit) * emit);
+            }
+        }
+        light += slice_light * proj_length;
+        weight += proj_length;
+    }
+    light = weight > 0.0 ? light / weight : vec3(0.0);
+    imageStore(out_img, texel, vec4(light, min(pos.z, SKY_Z)));
+}
+
+#elif defined(TEMPORAL)
+
+layout(binding = 0) uniform texture2D raw_tex;     // this frame's
+layout(binding = 2) uniform texture2D history_tex; // accumulated, last frame
+layout(binding = 3, rgba16f) uniform writeonly image2D out_img; // accumulated, this frame
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(texel), half_size))) {
+        return;
+    }
+    const vec4 current = texelFetch(raw_tex, texel, 0);
+    const float blend = param0;
+    if (blend <= 0.0 || current.a >= SKY_Z) {
+        imageStore(out_img, texel, current);
+        return;
+    }
+    const vec2 pixel = vec2(min(texel * 2, ivec2(size) - 1)) + 0.5;
+    const vec3 past = Reproject(ViewAt(pixel, current.a));
+    if (past.z <= 1e-3) {
+        imageStore(out_img, texel, current);
+        return;
+    }
+    // Bilinear over the past texels, each only where its depth is the reprojected point's.
+    const vec2 at = (PastPixel(past) - 0.5) * 0.5;
+    const ivec2 base = ivec2(floor(at));
+    const vec2 f = at - vec2(base);
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 offset = ivec2(i & 1, i >> 1);
+        const ivec2 p = base + offset;
+        if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(uvec2(p), half_size))) {
+            continue;
+        }
+        const vec4 h = texelFetch(history_tex, p, 0);
+        if (abs(h.a - past.z) > 0.05 * past.z) {
+            continue;
+        }
+        const float w = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y);
+        sum += h.rgb * w;
+        weight += w;
+    }
+    if (weight < 0.25) {
+        imageStore(out_img, texel, current); // mostly newly seen
+        return;
+    }
+    const vec3 light = mix(current.rgb, sum / weight, blend * min(weight, 1.0));
+    imageStore(out_img, texel, vec4(light, current.a));
+}
+
+#elif defined(BLUR)
+
+layout(binding = 0) uniform texture2D in_tex;
+layout(binding = 3, rgba16f) uniform writeonly image2D out_img;
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(texel), half_size))) {
+        return;
+    }
+    const vec4 centre = texelFetch(in_tex, texel, 0);
+    if (centre.a >= SKY_Z) {
+        imageStore(out_img, texel, centre);
+        return;
+    }
+    const ivec2 last = ivec2(half_size) - 1;
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            const vec4 tap = texelFetch(in_tex, clamp(texel + ivec2(x, y), ivec2(0), last), 0);
+            const float w = exp(-0.25 * float(x * x + y * y)) *
+                            exp(-abs(tap.a - centre.a) / (0.03 * centre.a));
+            sum += tap.rgb * w;
+            weight += w;
+        }
+    }
+    imageStore(out_img, texel, vec4(sum / weight, centre.a));
+}
+
+#elif defined(COMPOSITE)
+
+layout(binding = 0) uniform texture2D depth_tex;
+layout(binding = 1) uniform texture2D gi_tex; // BLUR's, half size
+layout(binding = 2) uniform texture2D ao_tex; // the game's AO at the scene size (red x green)
+#ifdef SHOW_BOUNCE
+layout(binding = 3, rgba16f) uniform image2D out_img; // the scene's colour
+#else
+layout(binding = 3, r11f_g11f_b10f) uniform image2D out_img; // the game's diffuse light
+#endif
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(size)))) {
+        return;
+    }
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    if (depth >= 1.0) {
+        return;
+    }
+    const float z = ViewZ(depth);
+    // The half-size texels around the pixel (texel t stands for pixel 2t), weighted by distance
+    // and by how close their depth is to the pixel's.
+    const vec2 at = vec2(pixel) * 0.5;
+    const ivec2 base = ivec2(floor(at));
+    const vec2 f = at - vec2(base);
+    const ivec2 last = ivec2(half_size) - 1;
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 offset = ivec2(i & 1, i >> 1);
+        const vec4 gi = texelFetch(gi_tex, min(base + offset, last), 0);
+        if (gi.a >= SKY_Z) {
+            continue;
+        }
+        const float w = ((offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y) +
+                         1e-3) *
+                        exp(-abs(gi.a - z) / (0.03 * z));
+        sum += gi.rgb * w;
+        weight += w;
+    }
+    if (weight < 1e-4) {
+#ifdef SHOW_BOUNCE
+        imageStore(out_img, pixel, vec4(0.0, 0.0, 0.0, imageLoad(out_img, pixel).a));
+#endif
+        return;
+    }
+    float occlusion = 1.0;
+    if ((flags & FLAG_AO) != 0u) {
+        const vec4 ao = texelFetch(ao_tex, pixel, 0);
+        occlusion = ao.r * ao.g;
+    }
+    const vec3 add = sum / weight * (param0 * occlusion);
+    const vec4 current = imageLoad(out_img, pixel);
+#ifdef SHOW_BOUNCE
+    imageStore(out_img, pixel, vec4(add, current.a));
+#else
+    imageStore(out_img, pixel, vec4(current.rgb + add, 1.0));
+#endif
+}
+
+#endif

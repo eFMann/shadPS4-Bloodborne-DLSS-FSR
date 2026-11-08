@@ -1257,6 +1257,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_bb_object_motion.h
                src/video_core/renderer_vulkan/vk_bb_velocity_mirror.cpp
                src/video_core/renderer_vulkan/vk_bb_velocity_mirror.h
+               src/video_core/renderer_vulkan/vk_bb_ssgi.cpp
+               src/video_core/renderer_vulkan/vk_bb_ssgi.h
                src/video_core/renderer_vulkan/vk_bb_ssr.cpp
                src/video_core/renderer_vulkan/vk_bb_ssr.h
                src/video_core/renderer_vulkan/vk_bb_perf_meter.cpp
