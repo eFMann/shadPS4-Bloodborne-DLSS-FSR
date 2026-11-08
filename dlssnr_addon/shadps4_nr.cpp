@@ -136,6 +136,9 @@ SHADPS4_NR_API VkResult shadps4_nr_create_device(PFN_vkCreateDevice create,
                                                  VkDevice* out, uint32_t* features_added) {
     return Guarded("shadps4_nr_create_device", VK_ERROR_INITIALIZATION_FAILED, [&]() -> VkResult {
         nr_vk_load();
+        // ACO Mode, as every entry of the model sets it before a device is made: without it the
+        // device gets no pipeline-binary features and the network runs the driver's own shaders.
+        nr::pe::configure_network(nr::pe::module_folder());
         bool added = false;
         const VkResult result =
             nr::pe::vkdevice::create_with_network(create, physical, info, allocator, out, &added);
