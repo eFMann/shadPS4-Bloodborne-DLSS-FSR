@@ -27,16 +27,13 @@ public:
     static std::unique_ptr<BbNeuralRendering> Load();
     ~BbNeuralRendering();
 
-    const char* Name() const {
-        return info.name;
-    }
     // upscaler: a SHADNR_BEFORE_* bit.
     bool RunsBefore(u32 upscaler) const {
         return (info.upscalers & upscaler) != 0;
     }
 
-    vk::Result CreateDevice(vk::PhysicalDevice physical, const vk::DeviceCreateInfo& info,
-                            vk::Device& out);
+    vk::ResultValue<vk::UniqueDevice> CreateDevice(vk::PhysicalDevice physical,
+                                                   const vk::DeviceCreateInfo& info);
     bool Init(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device,
               u32 queue_family);
     // False: the network failed; the caller stops using the add-on.
@@ -46,9 +43,17 @@ public:
 
 private:
     BbNeuralRendering() = default;
-    struct Api;
+    struct Api {
+        decltype(&shadps4_nr_abi_version) abi_version;
+        decltype(&shadps4_nr_info) info;
+        decltype(&shadps4_nr_create_device) create_device;
+        decltype(&shadps4_nr_init) init;
+        decltype(&shadps4_nr_evaluate) evaluate;
+        decltype(&shadps4_nr_status) status;
+        decltype(&shadps4_nr_shutdown) shutdown;
+    };
     void* module{};
-    std::unique_ptr<Api> api;
+    Api api{};
     ShadNrInfo info{};
     bool device_made{};
 };

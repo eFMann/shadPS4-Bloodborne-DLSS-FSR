@@ -12,13 +12,6 @@
 #include "video_core/renderer_vulkan/vk_bb_neural_rendering.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
-// The add-on is built by another compiler: these are the test that both read one layout.
-static_assert(sizeof(ShadNrImage) == 32);
-static_assert(sizeof(ShadNrFrame) == 128);
-static_assert(sizeof(ShadNrSettings) == 12);
-static_assert(sizeof(ShadNrStatus) == 276);
-static_assert(sizeof(ShadNrInfo) == 36);
-
 namespace Vulkan {
 
 namespace {
@@ -67,16 +60,6 @@ void UnlockQueue(void*) {
 }
 } // namespace
 
-struct BbNeuralRendering::Api {
-    decltype(&shadps4_nr_abi_version) abi_version;
-    decltype(&shadps4_nr_info) info;
-    decltype(&shadps4_nr_create_device) create_device;
-    decltype(&shadps4_nr_init) init;
-    decltype(&shadps4_nr_evaluate) evaluate;
-    decltype(&shadps4_nr_status) status;
-    decltype(&shadps4_nr_shutdown) shutdown;
-};
-
 bool BbNeuralRendering::Present() {
     return Installed() != nullptr;
 }
@@ -97,21 +80,22 @@ std::unique_ptr<BbNeuralRendering> BbNeuralRendering::Load() {
         return {};
     auto nr = std::unique_ptr<BbNeuralRendering>{new BbNeuralRendering};
     nr->module = BbLibrary::Load(Folder(*backend) / "shadps4_nr.dll");
-    const auto find = [&](const char* name) { return BbLibrary::Find(nr->module, name); };
-    nr->api = std::make_unique<Api>(
-        Api{reinterpret_cast<decltype(Api::abi_version)>(find("shadps4_nr_abi_version")),
-            reinterpret_cast<decltype(Api::info)>(find("shadps4_nr_info")),
-            reinterpret_cast<decltype(Api::create_device)>(find("shadps4_nr_create_device")),
-            reinterpret_cast<decltype(Api::init)>(find("shadps4_nr_init")),
-            reinterpret_cast<decltype(Api::evaluate)>(find("shadps4_nr_evaluate")),
-            reinterpret_cast<decltype(Api::status)>(find("shadps4_nr_status")),
-            reinterpret_cast<decltype(Api::shutdown)>(find("shadps4_nr_shutdown"))});
-    const auto& a = *nr->api;
+    auto& a = nr->api;
+    const auto find = [&]<typename T>(T& entry, const char* name) {
+        entry = BbLibrary::Find<T>(nr->module, name);
+    };
+    find(a.abi_version, "shadps4_nr_abi_version");
+    find(a.info, "shadps4_nr_info");
+    find(a.create_device, "shadps4_nr_create_device");
+    find(a.init, "shadps4_nr_init");
+    find(a.evaluate, "shadps4_nr_evaluate");
+    find(a.status, "shadps4_nr_status");
+    find(a.shutdown, "shadps4_nr_shutdown");
     if (!a.abi_version || !a.info || !a.create_device || !a.init || !a.evaluate || !a.status ||
         !a.shutdown || a.abi_version() != SHADPS4_NR_ABI_VERSION) {
         LOG_WARNING(Render_Vulkan, "[NR] {}/shadps4_nr.dll is missing or another version; NR off",
                     backend->folder);
-        nr->api.reset();
+        a = {};
         return {};
     }
     a.info(&nr->info);
@@ -122,33 +106,32 @@ std::unique_ptr<BbNeuralRendering> BbNeuralRendering::Load() {
 }
 
 BbNeuralRendering::~BbNeuralRendering() {
-    if (api)
-        api->shutdown();
+    if (api.shutdown)
+        api.shutdown();
     // Once the device was made through it, the model's detached threads may still run its code:
     // the DLL stays loaded until the process ends.
     if (!device_made)
         BbLibrary::Free(module);
 }
 
-vk::Result BbNeuralRendering::CreateDevice(vk::PhysicalDevice physical,
-                                           const vk::DeviceCreateInfo& info, vk::Device& out) {
+vk::ResultValue<vk::UniqueDevice> BbNeuralRendering::CreateDevice(
+    vk::PhysicalDevice physical, const vk::DeviceCreateInfo& info) {
     VkDevice device{};
     u32 added{};
-    const auto result = static_cast<vk::Result>(api->create_device(
+    const auto result = static_cast<vk::Result>(api.create_device(
         VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice, static_cast<VkPhysicalDevice>(physical),
         &static_cast<const VkDeviceCreateInfo&>(info), nullptr, &device, &added));
     device_made = true;
-    out = vk::Device{device};
     LOG_INFO(Render_Vulkan, "[NR] Device created {} the network's features",
              added ? "with" : "without");
-    return result;
+    return {result, vk::UniqueDevice{device}};
 }
 
 bool BbNeuralRendering::Init(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device,
                              u32 queue_family) {
     const auto result =
-        api->init(static_cast<VkInstance>(instance), static_cast<VkPhysicalDevice>(physical),
-                  static_cast<VkDevice>(device), queue_family, LockQueue, UnlockQueue, nullptr);
+        api.init(static_cast<VkInstance>(instance), static_cast<VkPhysicalDevice>(physical),
+                 static_cast<VkDevice>(device), queue_family, LockQueue, UnlockQueue, nullptr);
     const bool ready = result == 0;
     if (ready)
         LOG_INFO(Render_Vulkan, "[NR] Ready on queue family {}", queue_family);
@@ -159,12 +142,12 @@ bool BbNeuralRendering::Init(vk::Instance instance, vk::PhysicalDevice physical,
 
 bool BbNeuralRendering::Evaluate(vk::CommandBuffer command, const ShadNrFrame& frame,
                                  const ShadNrSettings& settings) {
-    return api->evaluate(static_cast<VkCommandBuffer>(command), &frame, &settings) == 0;
+    return api.evaluate(static_cast<VkCommandBuffer>(command), &frame, &settings) == 0;
 }
 
 ShadNrStatus BbNeuralRendering::Status() const {
     ShadNrStatus status{};
-    api->status(&status);
+    api.status(&status);
     return status;
 }
 

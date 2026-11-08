@@ -721,6 +721,8 @@ struct BbTemporalDlss::Impl {
                 continue;
             if (key == "enabled")
                 next.enabled = number != 0;
+            else if (key == "nr")
+                next.nr.enabled = number != 0;
             else if (key == "jitter")
                 next.jitter = number != 0;
             else if (key == "jitter_small")
@@ -1985,8 +1987,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     // what the upscaler sees, so its history starts again.
     // nr_color has the scene's format: a linear FSR 4 input (RGBA16F) can't be copied into it.
     auto* const neural = instance.GetNeuralRendering();
-    const bool nr_input_matches =
-        nr_color && nr_color->format == (linear ? linear_color : snapshot)->format;
+    OwnedImage& upscaler_input = *(linear ? linear_color : snapshot);
+    const bool nr_input_matches = nr_color && nr_color->format == upscaler_input.format;
     const bool nr_active = tune.nr.enabled && neural && neural->RunsBefore(NrUpscaler(backend)) &&
                            nr_input_matches && !nr_failed;
     if (nr_active != nr_was_active)
@@ -2002,7 +2004,6 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         // next evaluation (stock rendering from then on, as before). Neural rendering goes in the
         // same recorded step, so a failed network still leaves DLSS the original input; no
         // backend runs before DLSS yet, so this part is untested.
-        OwnedImage& upscaler_input = *(linear ? linear_color : snapshot);
         const ShadNrFrame nr_frame =
             nr_active ? PrepareNeuralRendering(command, upscaler_input, depth_resource, out, reset)
                       : ShadNrFrame{};
@@ -2048,7 +2049,6 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     } else {
         // FSR 4 waits for and tracks its own submissions through the scheduler: recorded here.
         const auto direct = scheduler.CommandBuffer();
-        OwnedImage& upscaler_input = *(linear ? linear_color : snapshot);
         const bool nr_ran = nr_active && RunNeuralRendering(*neural, direct, upscaler_input,
                                                             depth_resource, out, reset);
         const auto input = (nr_ran ? *nr_color : upscaler_input).Resource();
@@ -2150,6 +2150,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     dlss_pre_hud = pre_hud;
     evaluated_since_copy = true;
     history_valid = true;
+    // Asks the add-on, so not under status_mutex, which F1 takes every frame.
+    std::string nr_state = NrState(neural, nr_input_matches);
     {
         std::scoped_lock lock{status_mutex};
         last_evaluation = std::chrono::steady_clock::now();
@@ -2160,7 +2162,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         status.backend = BackendName(backend);
         status.preset = backend == Backend::Dlss ? tune.preset : 0;
         status.decoupled = upscale_to.has_value();
-        status.nr_state = NrState(neural, nr_input_matches);
+        status.nr_state = std::move(nr_state);
         status.reason.clear();
     }
     {

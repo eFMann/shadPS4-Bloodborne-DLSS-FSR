@@ -782,25 +782,14 @@ bool Instance::CreateDevice() {
     }
 
     neural_rendering = BbNeuralRendering::Load();
-    if (neural_rendering) {
-        vk::Device created{};
-        const auto device_result =
-            neural_rendering->CreateDevice(physical_device, device_chain.get(), created);
-        if (device_result != vk::Result::eSuccess) {
-            LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}",
-                         vk::to_string(device_result));
-            return false;
-        }
-        device = vk::UniqueDevice{created};
-    } else {
-        auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
-        if (device_result != vk::Result::eSuccess) {
-            LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}",
-                         vk::to_string(device_result));
-            return false;
-        }
-        device = std::move(dev);
+    auto [device_result, dev] =
+        neural_rendering ? neural_rendering->CreateDevice(physical_device, device_chain.get())
+                         : physical_device.createDeviceUnique(device_chain.get());
+    if (device_result != vk::Result::eSuccess) {
+        LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
+        return false;
     }
+    device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
