@@ -111,7 +111,6 @@ BbDlssStatus BbTemporalDlssStatus() {
     copy.fsr4_installed = Fsr4Addon::Present();
     copy.amd_fsr_label = AmdFsrLabel();
     copy.nr_installed = BbNeuralRendering::Present();
-    copy.nr_small_model = BbNeuralRendering::SmallModelPresent();
     if (!BbTemporalDlssRequested())
         copy.reason =
             "No upscaler files were found next to " BB_LIBRARY_NAME("shadPS4.exe", "shadps4") ".";
@@ -445,8 +444,8 @@ upscaler=auto
 
 # DLSS 5 neural rendering before the upscaler, from a backend folder next to shadPS4.exe
 # (dlssnr-amd: RX 9000, before AMD FSR 4.1):
-# 1 = on; network auto, silver or small; scale 0.33 to 1 (the network's resolution);
-# intensity 0 to 2
+# 1 = on; network auto or one F1 lists (e.g. CC_SMALL_FP8); scale 0.33 to 1 (the network's
+# resolution); intensity 0 to 2
 nr=0
 nr_network=auto
 nr_scale=0.67
@@ -859,8 +858,7 @@ struct BbTemporalDlss::Impl {
     }
 
     ShadNrSettings NrSettings() const {
-        return {BbNrNetwork(tune.nr, BbNeuralRendering::SmallModelPresent()), tune.nr.scale,
-                tune.nr.intensity};
+        return {BbNeuralRendering::NetworkIndex(tune.nr.network), tune.nr.scale, tune.nr.intensity};
     }
 
     void StopNeuralRendering(BbNeuralRendering& neural) {
@@ -900,8 +898,6 @@ struct BbTemporalDlss::Impl {
         case SHADNR_RUNNING:
             return fmt::format("{} {}x{}, {:.1f} ms", static_cast<const char*>(nr.network),
                                nr.width, nr.height, nr.network_ms);
-        case SHADNR_BUILDING:
-            return "building (about 80 s the first time)";
         case SHADNR_FAILED:
             return fmt::format("failed: {}", static_cast<const char*>(nr.message));
         default:

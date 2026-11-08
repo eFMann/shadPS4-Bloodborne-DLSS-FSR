@@ -21,7 +21,7 @@
 #define SHADPS4_NR_API
 #endif
 
-#define SHADPS4_NR_ABI_VERSION 2u
+#define SHADPS4_NR_ABI_VERSION 3u
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,7 +43,7 @@ typedef struct ShadNrFrame {
 } ShadNrFrame;
 
 typedef struct ShadNrSettings {
-    int32_t network; // 0 CC_SMALL_FP8, 1 CC_SILVER_AARDWOLD
+    int32_t network; // index into ShadNrInfo.networks; -1 automatic (the first)
     float scale;     // the network's resolution, 0.33 to 1 of the frame
     float intensity; // 0 to 2
 } ShadNrSettings;
@@ -58,9 +58,15 @@ enum {
     SHADNR_BEFORE_AMD_FSR = 8,
 };
 
+#define SHADNR_MAX_NETWORKS 8
+
 typedef struct ShadNrInfo {
     char name[32];      // for the log, e.g. "DLSSNR-AMD"
     uint32_t upscalers; // SHADNR_BEFORE_* bits
+    // The installed networks by name (what F1 lists and dlss.ini's nr_network holds), in the order
+    // automatic tries them.
+    uint32_t network_count;
+    char networks[SHADNR_MAX_NETWORKS][32];
 } ShadNrInfo;
 
 typedef struct ShadNrStatus {
@@ -102,5 +108,5 @@ static_assert(sizeof(ShadNrImage) == 32, "ShadNrImage layout");
 static_assert(sizeof(ShadNrFrame) == 128, "ShadNrFrame layout");
 static_assert(sizeof(ShadNrSettings) == 12, "ShadNrSettings layout");
 static_assert(sizeof(ShadNrStatus) == 276, "ShadNrStatus layout");
-static_assert(sizeof(ShadNrInfo) == 36, "ShadNrInfo layout");
+static_assert(sizeof(ShadNrInfo) == 296, "ShadNrInfo layout");
 #endif

@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Robert Bopko
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <string_view>
+
+#include <fmt/ranges.h>
 
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_bb_library.h"
@@ -19,10 +23,11 @@ namespace {
 // Another one (NVIDIA's NR through NGX, say) is a line here.
 struct BackendFiles {
     const char* folder;
-    const char* model;         // needed beside shadps4_nr.dll; null: nothing else
-    const char* small_network; // offers CC_SMALL_FP8 when present; null: always offered
+    const char* model; // needed beside shadps4_nr.dll; null: nothing else
 };
-constexpr std::array Backends{BackendFiles{"dlssnr-amd", "dlssnr.bin", "dlssnr-small.bin"}};
+constexpr std::array Backends{BackendFiles{"dlssnr-amd", "dlssnr.bin"}};
+
+std::vector<std::string> loaded_networks;
 
 std::filesystem::path Folder(const BackendFiles& backend) {
     return BbLibrary::ExecutableDirectory() / backend.folder;
@@ -64,14 +69,19 @@ bool BbNeuralRendering::Present() {
     return Installed() != nullptr;
 }
 
-bool BbNeuralRendering::SmallModelPresent() {
-    static const bool present = [] {
-        const BackendFiles* backend = Installed();
-        if (!backend || !backend->small_network)
-            return backend != nullptr;
-        return std::filesystem::is_regular_file(Folder(*backend) / backend->small_network);
-    }();
-    return present;
+const std::vector<std::string>& BbNeuralRendering::Networks() {
+    return loaded_networks;
+}
+
+int BbNeuralRendering::NetworkIndex(std::string_view name) {
+    const auto same = [name](const std::string& network) {
+        return std::ranges::equal(name, network, [](char a, char b) {
+            return std::toupper(static_cast<unsigned char>(a)) ==
+                   std::toupper(static_cast<unsigned char>(b));
+        });
+    };
+    const auto it = std::ranges::find_if(loaded_networks, same);
+    return it == loaded_networks.end() ? -1 : int(it - loaded_networks.begin());
 }
 
 std::unique_ptr<BbNeuralRendering> BbNeuralRendering::Load() {
@@ -100,8 +110,14 @@ std::unique_ptr<BbNeuralRendering> BbNeuralRendering::Load() {
     }
     a.info(&nr->info);
     nr->info.name[sizeof nr->info.name - 1] = '\0';
-    LOG_INFO(Render_Vulkan, "[NR] {} loaded from {}/shadps4_nr.dll", nr->info.name,
-             backend->folder);
+    loaded_networks.clear();
+    for (u32 i = 0; i < std::min<u32>(nr->info.network_count, SHADNR_MAX_NETWORKS); ++i) {
+        auto& network = nr->info.networks[i];
+        network[sizeof network - 1] = '\0';
+        loaded_networks.emplace_back(network);
+    }
+    LOG_INFO(Render_Vulkan, "[NR] {} loaded from {}/shadps4_nr.dll, networks: {}", nr->info.name,
+             backend->folder, fmt::join(loaded_networks, ", "));
     return nr;
 }
 

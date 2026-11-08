@@ -36,6 +36,8 @@
 #include "input/controller.h"
 #include "input/input_mouse.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_bb_neural_rendering.h"
+#include "video_core/renderer_vulkan/vk_bb_nr_settings.h"
 #include "video_core/renderer_vulkan/vk_bb_perf_meter.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
@@ -920,24 +922,26 @@ void DlssLayer::DrawWindow() {
             bool nr = settings.Get("nr", "0") != "0";
             if (Checkbox("Neural rendering", &nr))
                 settings.Set("nr", nr ? "1" : "0");
-            // CC_SMALL_FP8 is listed only when its model is installed.
-            static constexpr std::array NetworkNames{"Automatic", "CC_SILVER_AARDWOLD",
-                                                     "CC_SMALL_FP8"};
-            static constexpr std::array NetworkValues{"auto", "silver", "small"};
-            const auto network = settings.Get("nr_network", "auto");
-            int network_index = 0;
-            for (size_t i = 0; i < NetworkValues.size(); ++i)
-                if (network.starts_with(NetworkValues[i]))
-                    network_index = int(i);
-            const int network_count = status.nr_small_model ? 3 : 2;
-            if (Combo("Network", &network_index, NetworkNames.data(), network_count))
-                settings.Set("nr_network", NetworkValues[network_index]);
-            float nr_scale = float(std::atof(settings.Get("nr_scale", "0.67").c_str()));
-            if (SliderFloat("Network resolution", &nr_scale, 0.33f, 1.0f, "%.2f",
-                            ImGuiSliderFlags_AlwaysClamp))
+            Vulkan::BbNrSettings nr_settings;
+            for (const char* key : {"nr_network", "nr_scale", "nr_intensity"})
+                Vulkan::ParseBbNrSetting(key, settings.Get(key, ""), nr_settings);
+            // The backend's installed networks, as it names them.
+            const auto& networks = Vulkan::BbNeuralRendering::Networks();
+            const int network = Vulkan::BbNeuralRendering::NetworkIndex(nr_settings.network);
+            if (BeginCombo("Network", network < 0 ? "Automatic" : networks[network].c_str())) {
+                if (Selectable("Automatic", network < 0))
+                    settings.Set("nr_network", "auto");
+                for (int i = 0; i < int(networks.size()); ++i)
+                    if (Selectable(networks[i].c_str(), i == network))
+                        settings.Set("nr_network", networks[i]);
+                EndCombo();
+            }
+            float nr_scale = nr_settings.scale;
+            if (SliderFloat("Network resolution", &nr_scale, Vulkan::BbNrScaleMin,
+                            Vulkan::BbNrScaleMax, "%.2f", ImGuiSliderFlags_AlwaysClamp))
                 settings.Set("nr_scale", fmt::format("{:.2f}", nr_scale));
-            float nr_intensity = float(std::atof(settings.Get("nr_intensity", "1").c_str()));
-            if (SliderFloat("Intensity", &nr_intensity, 0.0f, 2.0f, "%.2f",
+            float nr_intensity = nr_settings.intensity;
+            if (SliderFloat("Intensity", &nr_intensity, 0.0f, Vulkan::BbNrIntensityMax, "%.2f",
                             ImGuiSliderFlags_AlwaysClamp))
                 settings.Set("nr_intensity", fmt::format("{:.2f}", nr_intensity));
             // Wrapped: the add-on's messages run longer than the window is wide.

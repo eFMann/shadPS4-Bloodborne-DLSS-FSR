@@ -4,98 +4,41 @@
 #pragma once
 
 #include <algorithm>
+#include <string>
 #include <string_view>
+
+#include "video_core/renderer_vulkan/vk_retro_hdr.h"
 
 namespace Vulkan {
 
-// dlss.ini's neural rendering keys (nr, nr_network, nr_scale, nr_intensity).
+constexpr float BbNrScaleMin = 0.33f;
+constexpr float BbNrScaleMax = 1.0f;
+constexpr float BbNrIntensityMax = 2.0f;
+
+// dlss.ini's neural rendering keys (nr, nr_network, nr_scale, nr_intensity), read the same way by
+// the renderer and by F1.
 struct BbNrSettings {
     bool enabled = false;
-    int network = -1; // -1 automatic, 0 CC_SMALL_FP8, 1 CC_SILVER_AARDWOLD
+    std::string network = "auto"; // a name of BbNeuralRendering::Networks(), or automatic
     float scale = 0.67f;
     float intensity = 1.0f;
 };
 
-// A plain decimal ("0.67", "2"); false for anything else.
-constexpr bool ParseBbNrDecimal(std::string_view text, float& out) {
-    float value = 0.f, unit = 1.f;
-    bool digits = false, fraction = false;
-    for (const char c : text) {
-        if (c == '.' && !fraction) {
-            fraction = true;
-        } else if (c >= '0' && c <= '9') {
-            digits = true;
-            if (fraction) {
-                unit /= 10.f;
-                value += float(c - '0') * unit;
-            } else {
-                value = value * 10.f + float(c - '0');
-            }
-        } else {
-            return false;
-        }
-    }
-    if (digits)
-        out = value;
-    return digits;
-}
-
 // True when key is one of nr_network, nr_scale and nr_intensity (nr is read with dlss.ini's other
 // switches); values out of range are clamped, unreadable ones keep the current value.
-constexpr bool ParseBbNrSetting(std::string_view key, std::string_view value, BbNrSettings& out) {
-    float number{};
+inline bool ParseBbNrSetting(std::string_view key, std::string_view value, BbNrSettings& out) {
     if (key == "nr_network") {
-        out.network = value.starts_with("small") ? 0 : value.starts_with("silver") ? 1 : -1;
+        const auto end = value.find_last_not_of(" \t\r");
+        out.network = value.substr(0, end == std::string_view::npos ? 0 : end + 1);
     } else if (key == "nr_scale") {
-        if (ParseBbNrDecimal(value, number))
-            out.scale = std::clamp(number, 0.33f, 1.f);
+        out.scale = std::clamp(RetroHdr::ParseFloat(value, out.scale), BbNrScaleMin, BbNrScaleMax);
     } else if (key == "nr_intensity") {
-        if (ParseBbNrDecimal(value, number))
-            out.intensity = std::clamp(number, 0.f, 2.f);
+        out.intensity =
+            std::clamp(RetroHdr::ParseFloat(value, out.intensity), 0.0f, BbNrIntensityMax);
     } else {
         return false;
     }
     return true;
 }
-
-// The network to run: CC_SMALL_FP8 only when its model is installed.
-constexpr int BbNrNetwork(const BbNrSettings& settings, bool small_present) {
-    return settings.network == 1 || !small_present ? 1 : 0;
-}
-
-static_assert([] {
-    BbNrSettings s;
-    return ParseBbNrSetting("nr_scale", "0.1", s) && s.scale == 0.33f;
-}());
-static_assert([] {
-    BbNrSettings s;
-    return ParseBbNrSetting("nr_scale", "1.5", s) && s.scale == 1.0f;
-}());
-static_assert([] {
-    BbNrSettings s;
-    return ParseBbNrSetting("nr_scale", "0.50", s) && s.scale == 0.5f;
-}());
-static_assert([] {
-    BbNrSettings s;
-    return ParseBbNrSetting("nr_scale", "abc", s) && s.scale == 0.67f;
-}());
-static_assert([] {
-    BbNrSettings s;
-    return ParseBbNrSetting("nr_intensity", "3", s) && s.intensity == 2.0f;
-}());
-static_assert([] {
-    BbNrSettings s;
-    return ParseBbNrSetting("nr_network", "small", s) && s.network == 0;
-}());
-static_assert([] {
-    BbNrSettings s;
-    return ParseBbNrSetting("nr_network", "silver", s) && s.network == 1;
-}());
-static_assert([] {
-    BbNrSettings s;
-    return !ParseBbNrSetting("upscaler", "amdfsr", s);
-}());
-static_assert(BbNrNetwork(BbNrSettings{}, true) == 0 && BbNrNetwork(BbNrSettings{}, false) == 1);
-static_assert(BbNrNetwork(BbNrSettings{.network = 0}, false) == 1); // small asked, not installed
 
 } // namespace Vulkan

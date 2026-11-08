@@ -4,6 +4,9 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -21,8 +24,11 @@ class BbNeuralRendering {
 public:
     // A backend's files are present and SHADPS4_NR is not "0"; Windows only.
     static bool Present();
-    // CC_SMALL_FP8 can be offered (dlssnr-amd: dlssnr-small.bin is installed).
-    static bool SmallModelPresent();
+    // The loaded backend's installed networks, in the order automatic tries them; empty until
+    // Load has run.
+    static const std::vector<std::string>& Networks();
+    // name's index in Networks() (case does not matter); -1 for automatic or an unknown name.
+    static int NetworkIndex(std::string_view name);
     // Null when the backend cannot be loaded or speaks another ABI version.
     static std::unique_ptr<BbNeuralRendering> Load();
     ~BbNeuralRendering();
