@@ -167,6 +167,23 @@ inline OverrideItem make_override(const char* key, Setting<T> Struct::* member) 
         }};
 }
 
+// A settings section's JSON, as NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE makes it (each field under its
+// own name), for sections with more fields than that macro takes (63): `FIELDS(X)` lists them,
+// calling X for each.
+#define SETTINGS_DEFINE_JSON(Type, FIELDS)                                                         \
+    template <typename BasicJsonType,                                                              \
+              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, \
+                                            int> = 0>                                              \
+    void to_json(BasicJsonType& nlohmann_json_j, const Type& nlohmann_json_t) {                    \
+        FIELDS(NLOHMANN_JSON_TO)                                                                   \
+    }                                                                                              \
+    template <typename BasicJsonType,                                                              \
+              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, \
+                                            int> = 0>                                              \
+    void from_json(const BasicJsonType& nlohmann_json_j, Type& nlohmann_json_t) {                  \
+        FIELDS(NLOHMANN_JSON_FROM)                                                                 \
+    }
+
 // -------------------------------
 // Support types
 // -------------------------------
@@ -661,22 +678,71 @@ struct GPUSettings {
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
-    GPUSettings, window_width, window_height, internal_screen_width, internal_screen_height,
-    null_gpu, copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,
-    direct_memory_access_enabled, dump_shaders, patch_shaders, vblank_frequency, full_screen,
-    full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-    userfaultfd, inline_fetch_shader, threaded_renderer, threaded_renderer_diagnostics,
-    threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
-    bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
-    bb_load_screen_cleanup, bb_more_vram, bb_vram_past_budget, bb_texture_quality,
-    bb_ignore_display_scale, bb_vram_budget_test_mb, bb_background_texture_copies,
-    bb_geometry_in_place, bb_skip_empty_draws, bb_background_pipelines, bb_anisotropy,
-    bb_exact_protection, bb_batched_uploads, bb_texture_set_memo, bb_ring_geometry,
-    bb_submit_overlap, bb_overlap_frames, bb_early_writeback, bb_stutter_detail, bb_defaults,
-    bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait, bb_hardware_interpolation,
-    bb_real_occlusion, bb_copy_thread, bb_spread_loads, bb_render_during_present,
-    bb_skip_left_out_levels, bb_direct_texture_copies, fast_shader_math)
+#define GPU_SETTINGS_FIELDS(X)                                                                     \
+    X(window_width)                                                                                \
+    X(window_height)                                                                               \
+    X(internal_screen_width)                                                                       \
+    X(internal_screen_height)                                                                      \
+    X(null_gpu)                                                                                    \
+    X(copy_gpu_buffers)                                                                            \
+    X(readbacks_mode)                                                                              \
+    X(readback_linear_images_enabled)                                                              \
+    X(direct_memory_access_enabled)                                                                \
+    X(dump_shaders)                                                                                \
+    X(patch_shaders)                                                                               \
+    X(vblank_frequency)                                                                            \
+    X(full_screen)                                                                                 \
+    X(full_screen_mode)                                                                            \
+    X(present_mode)                                                                                \
+    X(hdr_allowed)                                                                                 \
+    X(fsr_enabled)                                                                                 \
+    X(rcas_enabled)                                                                                \
+    X(rcas_attenuation)                                                                            \
+    X(userfaultfd)                                                                                 \
+    X(inline_fetch_shader)                                                                         \
+    X(threaded_renderer)                                                                           \
+    X(threaded_renderer_diagnostics)                                                               \
+    X(threaded_renderer_gpu_profile)                                                               \
+    X(bb_object_motion)                                                                            \
+    X(bb_readback_queue)                                                                           \
+    X(bb_streaming)                                                                                \
+    X(bb_merged_copies)                                                                            \
+    X(bb_fast_locks)                                                                               \
+    X(bb_flip_when_ready)                                                                          \
+    X(bb_vram_reclaim)                                                                             \
+    X(bb_buffer_eviction)                                                                          \
+    X(bb_load_screen_cleanup)                                                                      \
+    X(bb_more_vram)                                                                                \
+    X(bb_vram_past_budget)                                                                         \
+    X(bb_texture_quality)                                                                          \
+    X(bb_ignore_display_scale)                                                                     \
+    X(bb_vram_budget_test_mb)                                                                      \
+    X(bb_background_texture_copies)                                                                \
+    X(bb_geometry_in_place)                                                                        \
+    X(bb_skip_empty_draws)                                                                         \
+    X(bb_background_pipelines)                                                                     \
+    X(bb_anisotropy)                                                                               \
+    X(bb_exact_protection)                                                                         \
+    X(bb_batched_uploads)                                                                          \
+    X(bb_texture_set_memo)                                                                         \
+    X(bb_ring_geometry)                                                                            \
+    X(bb_submit_overlap)                                                                           \
+    X(bb_overlap_frames)                                                                           \
+    X(bb_early_writeback)                                                                          \
+    X(bb_stutter_detail)                                                                           \
+    X(bb_defaults)                                                                                 \
+    X(bb_occlusion_in_order)                                                                       \
+    X(bb_fast_pixel_math)                                                                          \
+    X(bb_constants_no_wait)                                                                        \
+    X(bb_hardware_interpolation)                                                                   \
+    X(bb_real_occlusion)                                                                           \
+    X(bb_copy_thread)                                                                              \
+    X(bb_spread_loads)                                                                             \
+    X(bb_render_during_present)                                                                    \
+    X(bb_skip_left_out_levels)                                                                     \
+    X(bb_direct_texture_copies)                                                                    \
+    X(fast_shader_math)
+SETTINGS_DEFINE_JSON(GPUSettings, GPU_SETTINGS_FIELDS)
 
 // -------------------------------
 // Vulkan settings
@@ -693,7 +759,7 @@ struct VulkanSettings {
     Setting<bool> vkguest_markers{false};
     Setting<bool> pipeline_cache_enabled{true};
     Setting<bool> pipeline_cache_archived{false};
-    // Bloodborne threaded renderer (here: GPUSettings' JSON field list is at its 64 limit).
+    // Bloodborne threaded renderer.
     // Copy threads for texture and buffer data (0 = auto: half the logical cores, 2 to 8;
     // otherwise this many, leaving two cores); applies after a restart. Traversal bursts of new
     // textures copy 200-440 MiB in one frame: ~7 GB/s on 4 threads, ~10 GB/s on 8.
@@ -906,22 +972,71 @@ struct VulkanSettings {
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
-    VulkanSettings, gpu_id, renderdoc_enabled, vkvalidation_enabled, vkvalidation_core_enabled,
-    vkvalidation_sync_enabled, vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled, vkhost_markers,
-    vkguest_markers, pipeline_cache_enabled, pipeline_cache_archived, bb_copy_threads,
-    bb_cached_texture_staging, bb_lower_detail_first, bb_clear_shader_written,
-    bb_ce_skip_huge_writes, bb_evict_keep_protection, bb_evict_keep_returning,
-    bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same, bb_clear_one_layer,
-    bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius, bb_vbao_half_res, bb_ssgi,
-    bb_ssgi_strength, bb_ssgi_radius, bb_light_shadows, bb_light_shadows_strength, bb_player_light,
-    bb_ssr_mode, bb_ssr_full_res, bb_ssr_rough_rays, bb_ssr_min_gloss, bb_ssr_sharp_frames,
-    bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_f1_scale, bb_f1_pos_x, bb_f1_pos_y,
-    bb_counter_fps, bb_counter_ms, bb_counter_upscaler, bb_counter_preset, bb_counter_mode,
-    bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_perf_meter, bb_gx_observe,
-    bb_gx_pipelines, bb_recorder_census, bb_draw_finisher, bb_async_submit, bb_vram_upload_staging,
-    bb_render_threads_off_core0, bb_even_capped_flips, bb_merged_no_stream_sources,
-    bb_ssr_check_patch_file)
+#define VULKAN_SETTINGS_FIELDS(X)                                                                  \
+    X(gpu_id)                                                                                      \
+    X(renderdoc_enabled)                                                                           \
+    X(vkvalidation_enabled)                                                                        \
+    X(vkvalidation_core_enabled)                                                                   \
+    X(vkvalidation_sync_enabled)                                                                   \
+    X(vkvalidation_gpu_enabled)                                                                    \
+    X(vkcrash_diagnostic_enabled)                                                                  \
+    X(vkhost_markers)                                                                              \
+    X(vkguest_markers)                                                                             \
+    X(pipeline_cache_enabled)                                                                      \
+    X(pipeline_cache_archived)                                                                     \
+    X(bb_copy_threads)                                                                             \
+    X(bb_cached_texture_staging)                                                                   \
+    X(bb_lower_detail_first)                                                                       \
+    X(bb_clear_shader_written)                                                                     \
+    X(bb_ce_skip_huge_writes)                                                                      \
+    X(bb_evict_keep_protection)                                                                    \
+    X(bb_evict_keep_returning)                                                                     \
+    X(bb_protect_helper_thread)                                                                    \
+    X(bb_cpu_copy_shader)                                                                          \
+    X(bb_copy_skip_same)                                                                           \
+    X(bb_clear_one_layer)                                                                          \
+    X(bb_rdoc_capture_frames)                                                                      \
+    X(bb_vbao)                                                                                     \
+    X(bb_vbao_strength)                                                                            \
+    X(bb_vbao_radius)                                                                              \
+    X(bb_vbao_half_res)                                                                            \
+    X(bb_ssgi)                                                                                     \
+    X(bb_ssgi_strength)                                                                            \
+    X(bb_ssgi_radius)                                                                              \
+    X(bb_light_shadows)                                                                            \
+    X(bb_light_shadows_strength)                                                                   \
+    X(bb_player_light)                                                                             \
+    X(bb_ssr_mode)                                                                                 \
+    X(bb_ssr_full_res)                                                                             \
+    X(bb_ssr_rough_rays)                                                                           \
+    X(bb_ssr_min_gloss)                                                                            \
+    X(bb_ssr_sharp_frames)                                                                         \
+    X(bb_show_threaded_settings)                                                                   \
+    X(bb_frame_hooks)                                                                              \
+    X(bb_fps_limit)                                                                                \
+    X(bb_f1_scale)                                                                                 \
+    X(bb_f1_pos_x)                                                                                 \
+    X(bb_f1_pos_y)                                                                                 \
+    X(bb_counter_fps)                                                                              \
+    X(bb_counter_ms)                                                                               \
+    X(bb_counter_upscaler)                                                                         \
+    X(bb_counter_preset)                                                                           \
+    X(bb_counter_mode)                                                                             \
+    X(bb_counter_resolution)                                                                       \
+    X(bb_counter_graph)                                                                            \
+    X(bb_counter_corner)                                                                           \
+    X(bb_perf_meter)                                                                               \
+    X(bb_gx_observe)                                                                               \
+    X(bb_gx_pipelines)                                                                             \
+    X(bb_recorder_census)                                                                          \
+    X(bb_draw_finisher)                                                                            \
+    X(bb_async_submit)                                                                             \
+    X(bb_vram_upload_staging)                                                                      \
+    X(bb_render_threads_off_core0)                                                                 \
+    X(bb_even_capped_flips)                                                                        \
+    X(bb_merged_no_stream_sources)                                                                 \
+    X(bb_ssr_check_patch_file)
+SETTINGS_DEFINE_JSON(VulkanSettings, VULKAN_SETTINGS_FIELDS)
 
 // -------------------------------
 // Main manager
