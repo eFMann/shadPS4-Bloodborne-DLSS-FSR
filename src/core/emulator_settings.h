@@ -765,6 +765,14 @@ struct VulkanSettings {
     Setting<int> bb_ssgi_radius{300};
     // Debugging: the bounce alone in place of the game's diffuse light (F1, not saved).
     Setting<int> bb_ssgi_debug_view{0}; // 1: the bounce alone, 2: the light that bounces
+    // Light shadows: screen-space shadows for the lamps, fires, candles and torch (they cast
+    // none in the game), and their strength (x100). Global only.
+    Setting<bool> bb_light_shadows{false};
+    Setting<int> bb_light_shadows_strength{100};
+    // The soft light the game keeps around the player character (off: taken out of the lighting).
+    Setting<bool> bb_player_light{true};
+    // Debugging: the shadows worked out, over the picture (F1, not saved).
+    Setting<bool> bb_light_shadows_debug{false};
     // Screen-space reflections (with the game's "Enable Screen Space Reflections" patch):
     // 0 the game's, 1 better (traced through a depth pyramid with the game's own inputs, and
     // denoised), 2 off (none at all). The patch is built in (installed at a start when this
@@ -906,13 +914,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_ce_skip_huge_writes, bb_evict_keep_protection, bb_evict_keep_returning,
     bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same, bb_clear_one_layer,
     bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius, bb_vbao_half_res, bb_ssgi,
-    bb_ssgi_strength, bb_ssgi_radius, bb_ssr_mode, bb_ssr_full_res, bb_ssr_rough_rays,
-    bb_ssr_min_gloss, bb_ssr_sharp_frames, bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit,
-    bb_f1_scale, bb_f1_pos_x, bb_f1_pos_y, bb_counter_fps, bb_counter_ms, bb_counter_upscaler,
-    bb_counter_preset, bb_counter_mode, bb_counter_resolution, bb_counter_graph, bb_counter_corner,
-    bb_perf_meter, bb_gx_observe, bb_gx_pipelines, bb_recorder_census, bb_draw_finisher,
-    bb_async_submit, bb_vram_upload_staging, bb_render_threads_off_core0, bb_even_capped_flips,
-    bb_merged_no_stream_sources, bb_ssr_check_patch_file)
+    bb_ssgi_strength, bb_ssgi_radius, bb_light_shadows, bb_light_shadows_strength, bb_player_light,
+    bb_ssr_mode, bb_ssr_full_res, bb_ssr_rough_rays, bb_ssr_min_gloss, bb_ssr_sharp_frames,
+    bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit, bb_f1_scale, bb_f1_pos_x, bb_f1_pos_y,
+    bb_counter_fps, bb_counter_ms, bb_counter_upscaler, bb_counter_preset, bb_counter_mode,
+    bb_counter_resolution, bb_counter_graph, bb_counter_corner, bb_perf_meter, bb_gx_observe,
+    bb_gx_pipelines, bb_recorder_census, bb_draw_finisher, bb_async_submit, bb_vram_upload_staging,
+    bb_render_threads_off_core0, bb_even_capped_flips, bb_merged_no_stream_sources,
+    bb_ssr_check_patch_file)
 
 // -------------------------------
 // Main manager
@@ -1270,6 +1279,10 @@ public:
     SETTING_FORWARD(m_vulkan, BbSsgiStrength, bb_ssgi_strength)
     SETTING_FORWARD(m_vulkan, BbSsgiRadius, bb_ssgi_radius)
     SETTING_FORWARD(m_vulkan, BbSsgiDebugView, bb_ssgi_debug_view)
+    SETTING_FORWARD_BOOL(m_vulkan, BbLightShadows, bb_light_shadows)
+    SETTING_FORWARD(m_vulkan, BbLightShadowsStrength, bb_light_shadows_strength)
+    SETTING_FORWARD_BOOL(m_vulkan, BbLightShadowsDebug, bb_light_shadows_debug)
+    SETTING_FORWARD_BOOL(m_vulkan, BbPlayerLight, bb_player_light)
     SETTING_FORWARD(m_vulkan, BbSsrMode, bb_ssr_mode)
     SETTING_FORWARD_BOOL(m_vulkan, BbSsrCheckPatchFile, bb_ssr_check_patch_file)
     SETTING_FORWARD_BOOL(m_vulkan, BbSsrFullRes, bb_ssr_full_res)

@@ -20,6 +20,7 @@
 #include "video_core/amdgpu/regs.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bb_light_shadows.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_ssgi.h"
 #include "video_core/renderer_vulkan/vk_bb_ssr.h"
@@ -531,13 +532,17 @@ private:
         /// textures and targets, and the features use the caches as well as commands.
         u8 features = 0;
         std::optional<BbTemporalDlss::DisplayCopyReplay> display_copy;
+        /// A light draw's ticket for its shadows (LightShadowsBefore; BbLightShadows::RunPending).
+        u64 light_shadow_id = 0;
     };
     enum DrawFeature : u8 {
-        SsrReplaces = 1 << 0,   ///< the game's reflection trace (BetterSsrReplacesDraw)
-        SsrAfter = 1 << 1,      ///< an input of the better reflections (BetterSsrAfterDraw)
-        VbaoLeavesOut = 1 << 2, ///< an AO draw VBAO may leave out (BetterAoLeavesOutDraw)
-        VbaoAfter = 1 << 3,     ///< the game's AO passes (BetterAoAfterDraw)
-        SsgiAfter = 1 << 4,     ///< the lighting and its inputs (SsgiAfterDraw)
+        SsrReplaces = 1 << 0,        ///< the game's reflection trace (BetterSsrReplacesDraw)
+        SsrAfter = 1 << 1,           ///< an input of the better reflections (BetterSsrAfterDraw)
+        VbaoLeavesOut = 1 << 2,      ///< an AO draw VBAO may leave out (BetterAoLeavesOutDraw)
+        VbaoAfter = 1 << 3,          ///< the game's AO passes (BetterAoAfterDraw)
+        SsgiAfter = 1 << 4,          ///< the lighting and its inputs (SsgiAfterDraw)
+        LightShadowsBefore = 1 << 5, ///< a light draw whose shadows are written before it
+        LightShadowsShow = 1 << 6,   ///< the scene's composite: the light shadows' debug view
     };
     /// The resolve half: which of our features the draw's finish half has to run.
     u8 DrawFeatures(const GraphicsPipeline* pipeline) const;
@@ -927,6 +932,20 @@ private:
     bool BetterAoLeavesOutDraw(const GraphicsPipeline* pipeline);
     /// Screen-space GI: made when the setting is first on.
     std::unique_ptr<BbSsgi> ssgi;
+    /// Light shadows: made when the setting is first on.
+    std::unique_ptr<BbLightShadows> light_shadows;
+    /// The pixel shader's buffers 0 and 1 (BindBuffers), for light shadows.
+    std::array<BbLightShadows::Buffer, 2> light_shadow_buffers{};
+    /// The draw whose resources are being bound (DrawRecord), for the light shadows to read
+    /// a light draw's quad: its pipeline, whether it is indexed, its first index.
+    const GraphicsPipeline* light_draw_pipeline{};
+    bool light_draw_indexed{};
+    u32 light_draw_index_offset{};
+    /// The ndc bounds (x, y least, then most) of that draw's vertex positions (its first vertex
+    /// input), when they can be read.
+    std::optional<std::array<float, 4>> LightDrawBounds() const;
+    /// Where that draw draws: its scissor, and its quad's bounds in pixels.
+    BbLightShadows::DrawArea LightDrawArea() const;
     /// After the lighting and the draws SSGI takes inputs from: the bounce added (when on).
     void SsgiAfterDraw(const GraphicsPipeline* pipeline);
     u64 pipe_stats_occlusion_blips{};

@@ -1,0 +1,318 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Screen-space shadows for Bloodborne's lamps, fires, candles and torch, which cast none (its
+// light draws read no shadow map). The game lights the screen in tiles, a light draw for each
+// with the lights that reach it, so one light is in many draws (vk_bb_light_shadows.h).
+// TRACE: once a frame for each of the few lights that matter most, where it reaches, a short
+// ray from the surface towards the light through the depth buffer; something on screen in front
+// of the ray within a slab's thickness shadows it. The result is the light's layer of `vis`.
+// Default (before a batch of light draws with such lights, each over the rectangle it covers,
+// in one dispatch: a workgroup layer for each): the draw's lights' shadows blended by how much each lights the pixel (the lights not traced count as unshadowed), times the draw's own
+// mask (its texture 4, which multiplies all it adds), into the image the draw reads as its
+// texture 4 instead. With `debug` on, the darkest blend of the frame and where one ran are kept
+// too, with the layer of the light that shadows the pixel most, and SHOW writes them over the
+// finished scene: grey where lit, the light's layer's colour where shadowed (the stronger the
+// darker the shadow), dark red where no blend ran.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#ifndef SHOW
+layout(push_constant) uniform Constants {
+    vec4 to_clip[4]; // the light draws' view space to (ndc.x, ndc.y, depth, 1) times w, rows
+    vec4 viewport;   // x scale, x offset, y scale, y offset: pixel = ndc * scale + offset
+    uint frame;
+    float strength;
+    uint debug;
+    uint trace;  // TRACE: its light draw in the batch (high 16 bits), light (next byte), layer
+    uvec2 fades; // each layer's light's share of its shadows, a byte each (fading in or out)
+    uint origin; // TRACE: the first pixel worked out (x low 16 bits, y high): the rest follow
+};
+
+#endif
+
+#ifdef SHOW
+
+// Where each layer's light is on screen (debug image pixels; w: its layer, or below 0: none).
+layout(push_constant) uniform Markers {
+    vec4 markers[6];
+};
+
+layout(binding = 3, rgba16f) uniform image2D scene_img;
+layout(binding = 6, rgba8) uniform readonly image2D debug_img;
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(scene_img))) ||
+        any(greaterThanEqual(pixel, imageSize(debug_img)))) {
+        return;
+    }
+    // Each layer's colour: blue, green, yellow, magenta, cyan, orange.
+    const vec3 colours[6] = vec3[6](vec3(0.1, 0.3, 1.0), vec3(0.1, 0.9, 0.1), vec3(1.0, 0.9, 0.1),
+                                    vec3(1.0, 0.1, 0.9), vec3(0.1, 0.9, 1.0), vec3(1.0, 0.5, 0.0));
+    const vec4 d = imageLoad(debug_img, pixel);
+    const uint layer = min(uint(round(d.b * 255.0)), 5u);
+    vec3 shown = d.g < 0.5 ? vec3(0.25, 0.0, 0.0) : mix(colours[layer] * 0.3, vec3(0.3), d.r);
+    // The lights: a disc of their layer's colour with a black ring.
+    const vec2 at = (vec2(pixel) + 0.5) * vec2(imageSize(debug_img)) / vec2(imageSize(scene_img));
+    for (int i = 0; i < 6; ++i) {
+        if (markers[i].w < 0.0) {
+            continue;
+        }
+        const float dist = length(at - markers[i].xy);
+        if (dist < 9.0) {
+            shown = dist < 6.0 ? colours[int(markers[i].w)] : vec3(0.0);
+        }
+    }
+    imageStore(scene_img, pixel, vec4(shown, imageLoad(scene_img, pixel).a));
+}
+
+#else
+
+layout(binding = 0) uniform texture2D depth_tex;  // the game's depth copy (R32 float, 0..1)
+layout(binding = 1) uniform texture2D normal_tex; // G-buffer world normals (0.5 n + 0.5)
+layout(binding = 2) uniform texture2D mask_tex;   // the light draw's own mask (its texture 4)
+layout(binding = 3, r8) uniform writeonly image2D out_img;
+// A light draw of the batch: the rectangle it covers (first pixel, one past the last), each
+// light's layer (4 bits each, 15: not traced, 14: taken out) and how many lights it has, and
+// its lights as the game's buffer holds them (position, 1 / radius^2; colour).
+struct Draw {
+    uvec4 rect;
+    uvec4 info; // slots (2 words), light count
+    vec4 lights[24];
+};
+// The batch: the light draws' camera (as their buffer 0, rows 0..6 of 4) and the draws.
+layout(binding = 4, std430) readonly buffer Batch {
+    vec4 camera[7];
+    Draw draws[];
+};
+layout(binding = 6, rgba8) uniform image2D debug_img; // shadow, covered, game mask
+layout(binding = 7, r8) uniform writeonly image2DArray vis_img; // TRACE writes a layer
+layout(binding = 8) uniform texture2DArray vis_tex;              // the blend reads them
+
+const int STEPS = 12;
+const float MAX_LENGTH = 2.5; // the longest ray, view units (metres)
+const float THICKNESS = 0.5;  // what is behind a depth sample is solid this deep
+const uint MAX_LIGHTS = 12u;
+const uint NOT_TRACED = 15u;
+const uint REMOVED = 14u; // a light taken out (the player light, when off)
+
+uint draw_index; // the light draw of the batch being worked on
+
+float Camera(uint i) {
+    return camera[i >> 2u][i & 3u];
+}
+
+// Float `i` of the draw's lights, as the game's buffer holds them (16 a light, the first 7 kept).
+float Light(uint i) {
+    const uint light = i >> 4u;
+    const uint k = i & 15u;
+    return draws[draw_index].lights[light * 2u + (k >> 2u)][k & 3u];
+}
+
+float Fade(uint slot) {
+    const uint word = slot < 4u ? fades.x : fades.y;
+    return float((word >> ((slot & 3u) * 8u)) & 0xFFu) / 255.0;
+}
+
+uint Slot(uint light) {
+    const uvec2 slots = draws[draw_index].info.xy;
+    return ((light < 8u ? slots.x >> (light * 4u) : slots.y >> ((light - 8u) * 4u))) & 15u;
+}
+
+// The light draw's view position of a pixel's ndc and depth (camera rows 0..15, as its shader).
+vec3 ViewPos(vec2 ndc, float depth) {
+    const vec4 v = vec4(ndc, depth, 1.0);
+    const float x = dot(vec4(Camera(0), Camera(1), Camera(2), Camera(3)), v);
+    const float y = dot(vec4(Camera(4), Camera(5), Camera(6), Camera(7)), v);
+    const float z = dot(vec4(Camera(8), Camera(9), Camera(10), Camera(11)), v);
+    const float w = dot(vec4(Camera(12), Camera(13), Camera(14), Camera(15)), v);
+    return vec3(x, y, z) / w;
+}
+
+vec2 NdcOf(vec2 pixel) {
+    return (pixel - viewport.yw) / viewport.xz;
+}
+
+// A view position's pixel position (x, y) and depth (z); w <= 0 where it is behind the camera.
+vec4 ToScreen(vec3 pos) {
+    const vec4 v = vec4(pos, 1.0);
+    const vec4 clip =
+        vec4(dot(to_clip[0], v), dot(to_clip[1], v), dot(to_clip[2], v), dot(to_clip[3], v));
+    if (clip.w <= 1e-6) {
+        return vec4(0.0, 0.0, 0.0, -1.0);
+    }
+    const vec3 ndc = clip.xyz / clip.w;
+    return vec4(ndc.xy * viewport.xz + viewport.yw, ndc.z, 1.0);
+}
+
+// Interleaved gradient noise (Jimenez 2014), shifted per frame: the upscaler blends the steps.
+float Noise(vec2 pixel) {
+    pixel += 5.588238 * float(frame & 63u);
+    return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
+// 1 where nothing on screen blocks the ray from `start` along `dir` for `len`, 0 where it is.
+float Visibility(vec3 start, vec3 dir, float len, float noise, ivec2 size) {
+    const float step_len = len / float(STEPS);
+    for (int i = 0; i < STEPS; ++i) {
+        const vec3 pos = start + dir * ((float(i) + noise) * step_len);
+        const vec4 screen = ToScreen(pos);
+        if (screen.w < 0.0) {
+            return 1.0;
+        }
+        const ivec2 texel = ivec2(floor(screen.xy));
+        if (any(lessThan(texel, ivec2(0))) || any(greaterThanEqual(texel, size))) {
+            return 1.0; // off screen: unknown, lit
+        }
+        const float depth = texelFetch(depth_tex, texel, 0).r;
+        if (depth >= 1.0) {
+            continue;
+        }
+        const float scene_z = ViewPos(NdcOf(vec2(texel) + 0.5), depth).z;
+        const float behind = pos.z - scene_z;
+        if (behind > 0.01 * pos.z + 0.02 && behind < THICKNESS) {
+            return 0.0;
+        }
+    }
+    return 1.0;
+}
+
+struct Surface {
+    vec3 pos;
+    vec3 normal;
+    bool has_normal;
+};
+
+Surface SurfaceAt(ivec2 pixel, float depth) {
+    Surface s;
+    s.pos = ViewPos(NdcOf(vec2(pixel) + 0.5), depth);
+    const vec3 world_normal = texelFetch(normal_tex, pixel, 0).xyz * 2.0 - 1.0;
+    const vec3 normal = vec3(dot(vec3(Camera(16), Camera(17), Camera(18)), world_normal),
+                             dot(vec3(Camera(20), Camera(21), Camera(22)), world_normal),
+                             dot(vec3(Camera(24), Camera(25), Camera(26)), world_normal));
+    s.has_normal = dot(normal, normal) > 0.25;
+    s.normal = s.has_normal ? normalize(normal) : vec3(0.0);
+    return s;
+}
+
+ivec2 Pixel() {
+    return ivec2(gl_GlobalInvocationID.xy) + ivec2(origin & 0xFFFFu, origin >> 16u);
+}
+
+#ifdef TRACE
+
+void main() {
+    draw_index = trace >> 16u;
+    const uint trace_light = (trace >> 8u) & 0xFFu;
+    const uint trace_slot = trace & 0xFFu;
+    const ivec2 pixel = Pixel();
+    const ivec2 size = textureSize(depth_tex, 0);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    float visible = 1.0;
+    if (depth < 1.0) {
+        const Surface s = SurfaceAt(pixel, depth);
+        const uint b = trace_light * 16u;
+        const vec3 to_light = vec3(Light(b), Light(b + 1u), Light(b + 2u)) - s.pos;
+        const float dist2 = dot(to_light, to_light);
+        const float reach = Light(b + 3u); // 1 / radius^2
+        if (dist2 > 1e-6 && reach * dist2 < 1.0) {
+            const vec3 dir = to_light * inversesqrt(dist2);
+            // The ray stops short of the light (it is inside a lamp or a flame's mesh).
+            const float len = min(sqrt(dist2) - 0.15, MAX_LENGTH);
+            if (len > 0.05 && (!s.has_normal || dot(s.normal, dir) > 0.0)) {
+                // Off the surface a little (more further away, where a depth step is larger).
+                const vec3 start = s.pos + s.normal * (0.02 + 0.004 * s.pos.z);
+                visible = Visibility(start, dir, len, Noise(vec2(pixel)), size);
+            }
+        }
+    }
+    imageStore(vis_img, ivec3(pixel, int(trace_slot)), vec4(visible));
+}
+
+#else
+
+// The darkest shadow of the frame's blends at the pixel, and the layer of the light that made
+// most of it.
+void Debug(ivec2 pixel, float shadow, uint layer) {
+    if (debug != 0u) {
+        const vec4 d = imageLoad(debug_img, pixel);
+        const bool darker = d.g < 0.5 || shadow < d.r;
+        imageStore(debug_img, pixel,
+                   darker ? vec4(shadow, 1.0, float(layer) / 255.0, 1.0) : vec4(d.rgb, 1.0));
+    }
+}
+
+void main() {
+    draw_index = gl_WorkGroupID.z;
+    const uvec4 rect = draws[draw_index].rect;
+    const ivec2 pixel = ivec2(rect.xy + gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(out_img);
+    if (any(greaterThanEqual(uvec2(pixel), rect.zw)) || any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+    const float mask = texelFetch(mask_tex, pixel, 0).r;
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    if (depth >= 1.0) {
+        imageStore(out_img, pixel, vec4(mask));
+        return;
+    }
+    const Surface s = SurfaceAt(pixel, depth);
+
+    // How much each light lights the pixel, and how much of that is unshadowed.
+    float weight = 0.0;
+    float visible = 0.0;
+    float removed = 0.0; // the weight of the lights taken out
+    float most_lost = 0.0;
+    uint most_layer = 0u;
+    for (uint i = 0u; i < min(draws[draw_index].info.z, MAX_LIGHTS); ++i) {
+        const uint b = i * 16u;
+        const float reach = Light(b + 3u);
+        if (!(reach > 0.0)) {
+            continue;
+        }
+        const vec3 to_light = vec3(Light(b), Light(b + 1u), Light(b + 2u)) - s.pos;
+        const float dist2 = dot(to_light, to_light);
+        float falloff = 1.0 - sqrt(clamp(reach * dist2, 0.0, 1.0));
+        if (falloff <= 0.0 || dist2 < 1e-6) {
+            continue;
+        }
+        falloff *= falloff;
+        const vec3 dir = to_light * inversesqrt(dist2);
+        const float facing = s.has_normal ? dot(s.normal, dir) : 1.0;
+        const float brightness =
+            dot(vec3(Light(b + 4u), Light(b + 5u), Light(b + 6u)), vec3(0.3, 0.59, 0.11));
+        const float w = max(brightness, 0.0) * falloff * max(facing, 0.0);
+        if (w <= 0.0) {
+            continue;
+        }
+        const uint slot = Slot(i);
+        if (slot == REMOVED) {
+            removed += w;
+            continue;
+        }
+        weight += w;
+        const float lit = slot == NOT_TRACED
+                              ? 1.0
+                              : mix(1.0, texelFetch(vis_tex, ivec3(pixel, int(slot)), 0).r,
+                                    Fade(slot));
+        visible += w * lit;
+        if (w * (1.0 - lit) > most_lost) {
+            most_lost = w * (1.0 - lit);
+            most_layer = slot;
+        }
+    }
+    const float raw = weight > 0.0 ? visible / weight : 1.0;
+    // The lights taken out leave the others' share; the rest are shadowed by `strength`.
+    const float kept = weight + removed > 0.0 ? weight / (weight + removed) : 1.0;
+    imageStore(out_img, pixel, vec4(mask * kept * mix(1.0, raw, strength)));
+    Debug(pixel, raw, most_layer);
+}
+
+#endif // TRACE
+
+#endif // SHOW

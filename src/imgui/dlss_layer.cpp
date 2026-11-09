@@ -1440,6 +1440,48 @@ void DlssLayer::DrawWindow() {
             EndDisabled();
         }
 
+        SeparatorText("Light shadows");
+        {
+            bool shadows = EmulatorSettings.IsBbLightShadows();
+            if (Checkbox("Shadows from lamps, fires and the torch", &shadows)) {
+                EmulatorSettings.SetBbLightShadows(shadows);
+                EmulatorSettings.Save();
+            }
+            if (IsItemHovered())
+                SetTooltip("The game's lamps, fires, candles and your torch cast no shadows. "
+                           "This adds\nscreen-space shadows to them: characters, enemies and "
+                           "objects shadow what\nthe light falls on behind them.");
+            BeginDisabled(!shadows);
+            float strength = float(EmulatorSettings.GetBbLightShadowsStrength()) * 0.01f;
+            SetNextItemWidth(Px(200.0f));
+            if (SliderFloat("Strength##lightshadows", &strength, 0.0f, 1.0f, "%.2f"))
+                EmulatorSettings.SetBbLightShadowsStrength(int(std::lround(strength * 100.0f)));
+            if (IsItemDeactivatedAfterEdit())
+                EmulatorSettings.Save();
+            if (IsItemHovered())
+                SetTooltip("How dark the shadows are (1.00 by default).");
+            if (EmulatorSettings.IsBbShowThreadedSettings()) {
+                bool debug = EmulatorSettings.IsBbLightShadowsDebug();
+                if (Checkbox("Debug view##lightshadows", &debug))
+                    EmulatorSettings.SetBbLightShadowsDebug(debug);
+                if (IsItemHovered())
+                    SetTooltip("For testing, the picture replaced by the light shadows worked "
+                               "out:\ngrey where lit, the colour of the light that casts them "
+                               "where shadowed (its dot marks it), dark red where none were "
+                               "worked out.\nWhat it does goes in the log while on. Not saved.");
+            }
+            EndDisabled();
+            bool player_light = EmulatorSettings.IsBbPlayerLight();
+            if (Checkbox("Player light", &player_light)) {
+                EmulatorSettings.SetBbPlayerLight(player_light);
+                EmulatorSettings.Save();
+            }
+            if (IsItemHovered())
+                SetTooltip("The soft light the game keeps around your character so you can see "
+                           "in the dark.\nOff takes it out, as the mods that remove it do. It "
+                           "never casts shadows.");
+        }
+
         SeparatorText("Global illumination");
         {
             bool ssgi = EmulatorSettings.IsBbSsgi();

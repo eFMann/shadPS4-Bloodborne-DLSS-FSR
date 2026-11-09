@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #include "common/bb_tuning.h"
 #include "common/copy_pool.h"
@@ -412,6 +413,107 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
         }
     }
     return {vertex_offset, instance_offset};
+}
+
+BbLightShadows::DrawArea Rasterizer::LightDrawArea() const {
+    // The scissor as the draw's (UpdateViewportScissorState), and its quad through the viewport.
+    const auto& regs = Regs();
+    BbLightShadows::DrawArea area{};
+    auto scissor = regs.GetCombinedScissor();
+    if (regs.mode_control.vport_scissor_enable) {
+        scissor.top_left_x =
+            std::max(scissor.top_left_x, s16(regs.viewport_scissors[0].top_left_x));
+        scissor.top_left_y =
+            std::max(scissor.top_left_y, s16(regs.viewport_scissors[0].top_left_y));
+        scissor.bottom_right_x =
+            std::min(scissor.bottom_right_x, s16(regs.viewport_scissors[0].bottom_right_x));
+        scissor.bottom_right_y =
+            std::min(scissor.bottom_right_y, s16(regs.viewport_scissors[0].bottom_right_y));
+    }
+    area.scissor = {scissor.top_left_x, scissor.top_left_y, scissor.bottom_right_x,
+                    scissor.bottom_right_y};
+    if (const auto ndc = LightDrawBounds(); ndc && !regs.IsClipDisabled()) {
+        const auto& vp = regs.viewports[0];
+        const auto& control = regs.viewport_control;
+        const float xscale = control.xscale_enable ? vp.xscale : 1.0f;
+        const float xoffset = control.xoffset_enable ? vp.xoffset : 0.0f;
+        const float yscale = control.yscale_enable ? vp.yscale : 1.0f;
+        const float yoffset = control.yoffset_enable ? vp.yoffset : 0.0f;
+        const float ax = (*ndc)[0] * xscale + xoffset, bx = (*ndc)[2] * xscale + xoffset;
+        const float ay = (*ndc)[1] * yscale + yoffset, by = (*ndc)[3] * yscale + yoffset;
+        area.quad =
+            std::array{std::min(ax, bx), std::min(ay, by), std::max(ax, bx), std::max(ay, by)};
+    }
+    return area;
+}
+
+std::optional<std::array<float, 4>> Rasterizer::LightDrawBounds() const {
+    const auto* pipeline = light_draw_pipeline;
+    if (!pipeline) {
+        return std::nullopt;
+    }
+    const auto& regs = Regs();
+    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto& fetch = pipeline->GetFetchShader();
+    constexpr u32 MaxVertices = 6;
+    const u32 count = regs.num_indices;
+    if (fetch.Empty() || fetch.attributes.empty() || count == 0 || count > MaxVertices ||
+        regs.num_instances.NumInstances() > 1) {
+        return std::nullopt;
+    }
+    const auto buffer = fetch.attributes[0].GetSharp(vs);
+    const auto format = buffer.GetDataFmt();
+    if (!buffer.Valid() || buffer.GetNumberFmt() != AmdGpu::NumberFormat::Float ||
+        (format != AmdGpu::DataFormat::Format32_32 &&
+         format != AmdGpu::DataFormat::Format32_32_32 &&
+         format != AmdGpu::DataFormat::Format32_32_32_32)) {
+        return std::nullopt;
+    }
+    const u32 stride = buffer.GetStride();
+    const u32 vertex_offset = GetDrawOffsets(regs, vs, fetch).first;
+    const u32 index_size =
+        regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+    const VAddr index_base =
+        regs.index_base_address.Address<VAddr>() + u64(light_draw_index_offset) * index_size;
+    if (light_draw_indexed && !memory->IsValidMapping(index_base, u64(count) * index_size)) {
+        return std::nullopt;
+    }
+    std::array<float, 4> bounds{
+        std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+    for (u32 i = 0; i < count; ++i) {
+        u32 index = i;
+        if (light_draw_indexed) {
+            if (index_size == 2) {
+                u16 value;
+                std::memcpy(&value, reinterpret_cast<const void*>(index_base + i * 2), 2);
+                index = value;
+            } else {
+                std::memcpy(&index, reinterpret_cast<const void*>(index_base + u64(i) * 4), 4);
+            }
+        }
+        const u64 vertex = u64(vertex_offset) + index;
+        if (vertex >= buffer.num_records) {
+            return std::nullopt;
+        }
+        const VAddr address = buffer.base_address + vertex * stride;
+        if (!memory->IsValidMapping(address, 2 * sizeof(float))) {
+            return std::nullopt;
+        }
+        std::array<float, 2> xy;
+        std::memcpy(xy.data(), reinterpret_cast<const void*>(address), sizeof(xy));
+        if (!std::isfinite(xy[0]) || !std::isfinite(xy[1])) {
+            return std::nullopt;
+        }
+        bounds = {std::min(bounds[0], xy[0]), std::min(bounds[1], xy[1]),
+                  std::max(bounds[2], xy[0]), std::max(bounds[3], xy[1])};
+    }
+    // Only a quad on screen (in ndc) is a rectangle of pixels; anything else is left whole.
+    constexpr float Slack = 1.01f;
+    if (bounds[0] < -Slack || bounds[1] < -Slack || bounds[2] > Slack || bounds[3] > Slack) {
+        return std::nullopt;
+    }
+    return bounds;
 }
 
 Rasterizer::MotionPrep Rasterizer::ComputeMotionPrep(const GraphicsPipeline* pipeline,
@@ -882,6 +984,12 @@ u8 Rasterizer::DrawFeatures(const GraphicsPipeline* pipeline) const {
     if (ssgi && EmulatorSettings.IsBbSsgi() && BbSsgi::UsesShader(hash)) {
         features |= SsgiAfter;
     }
+    if (light_shadows && light_shadows->HasPending()) {
+        features |= LightShadowsBefore;
+    }
+    if (light_shadows && hash == BbSsgi::SceneCompositeShader) {
+        features |= LightShadowsShow;
+    }
     return features;
 }
 
@@ -1161,7 +1269,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     PrepareRenderState(pipeline);
     ProfileLap(Section::Targets);
     StageCensus::SetLabel(StageCensus::Label::Resources);
-    if (!BindResources(pipeline)) {
+    light_draw_pipeline = pipeline;
+    light_draw_indexed = is_indexed;
+    light_draw_index_offset = index_offset;
+    const bool bound = BindResources(pipeline);
+    light_draw_pipeline = nullptr;
+    if (!bound) {
         return;
     }
     StageCensus::SetLabel(StageCensus::Label::Upscaler);
@@ -1258,6 +1371,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     // draw hook above).
     StageCensus::SetLabel(StageCensus::Label::Hooks);
     rh->features = DrawFeatures(pipeline);
+    rh->light_shadow_id = (rh->features & LightShadowsBefore) ? light_shadows->PreparedId() : 0;
     StageCensus::SetLabel(StageCensus::Label::DisplayCopy);
     rh->display_copy = temporal_dlss.TakeDisplayCopyReplay();
     ProfileLap(Section::Dynamic);
@@ -1287,12 +1401,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     entry.pipeline = pipeline;
     entry.is_indexed = is_indexed;
     entry.profile = profile_draw;
-    entry.joined = rh->features != 0 || rh->display_copy.has_value();
+    // A light draw's shadows need only what it handed over (BbLightShadows queues them): the
+    // resolve half goes on, so the light draws after it are prepared in time to share its batch.
+    entry.joined = (rh->features & ~LightShadowsBefore) != 0 || rh->display_copy.has_value();
     if (entry.joined) {
         BB_STAGE_CENSUS("draw needs both halves (our features)", Features);
     }
     // The pass the draws handed over leave open: this draw's, unless our features end it.
-    memo_pass_open = !entry.joined && target_memo.valid && entry.state == target_memo.state;
+    memo_pass_open = !entry.joined && !(rh->features & LightShadowsBefore) && target_memo.valid &&
+                     entry.state == target_memo.state;
     RecAdd(RecDetail::Handoff, handoff_start);
     StageCensus::DrawDone();
     ProfileLap(Section::Reset);
@@ -1362,6 +1479,10 @@ void Rasterizer::FinishDraw(FinishEntry& e) {
     }
     FinLap(Section::Barriers);
 
+    if (h.features & LightShadowsBefore) {
+        // Its shadows, before the draw reads them (outside its render pass).
+        light_shadows->RunPending(h.light_shadow_id);
+    }
     StageCensus::SetLabel(StageCensus::Label::Descriptors);
     pipeline->BindResources(fin->set_writes, fin->push_data);
     FinLap(Section::Descriptors);
@@ -1431,6 +1552,10 @@ void Rasterizer::FinishDraw(FinishEntry& e) {
     }
     if (features & SsgiAfter) {
         SsgiAfterDraw(pipeline);
+    }
+    if (features & LightShadowsShow) {
+        // The debug view (when the frame recorded one) over the finished scene.
+        light_shadows->Show(cb_descs[0].image_id);
     }
     DebugState.IncDrawCall();
     FinLap(Section::Record);
@@ -2727,6 +2852,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (EmulatorSettings.IsBbSsgi() && !ssgi) {
         ssgi = std::make_unique<BbSsgi>(instance, scheduler, runtime, texture_cache);
     }
+    if ((EmulatorSettings.IsBbLightShadows() || !EmulatorSettings.IsBbPlayerLight()) &&
+        !light_shadows) {
+        light_shadows =
+            std::make_unique<BbLightShadows>(instance, scheduler, runtime, texture_cache);
+    }
     if (ssgi) {
         if (gbuffer_draw && EmulatorSettings.IsBbSsgi()) {
             const auto& vp = Regs().viewports[0];
@@ -3986,6 +4116,12 @@ void Rasterizer::ClearImageAs(VideoCore::Image& image, const VideoCore::Subresou
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
+    const bool light_shadow_buffers_wanted =
+        light_shadows && stage.sw_stage == Shader::SwStage::Fragment;
+    if (light_shadow_buffers_wanted) {
+        light_shadow_buffers = {};
+        light_shadows->ClearPending();
+    }
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
         const auto src_access =
@@ -4002,6 +4138,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 ssr_constants = {ring->Handle(), prefetched->offset, size, 0};
                 ssr_guest_constants =
                     reinterpret_cast<const void*>(desc.GetSharp(stage).base_address);
+            }
+            if (light_shadow_buffers_wanted && buffer_index < 2 && !desc.IsSpecial()) {
+                const auto sharp = desc.GetSharp(stage);
+                light_shadow_buffers[buffer_index] = {
+                    ring->Handle(),
+                    prefetched->offset,
+                    size,
+                    0,
+                    reinterpret_cast<const void*>(sharp.base_address),
+                    sharp.GetSize()};
             }
             const auto observe_start = RecMark();
             if (desc.IsSpecial()) {
@@ -4149,6 +4295,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                      u32(adjust / 4)};
                     ssr_guest_constants = reinterpret_cast<const void*>(vsharp.base_address);
                 }
+                if (light_shadow_buffers_wanted && buffer_index < 2 && !desc.is_written) {
+                    light_shadow_buffers[buffer_index] = {
+                        buffer->Handle(),
+                        offset_aligned,
+                        size + adjust,
+                        u32(adjust / 4),
+                        reinterpret_cast<const void*>(vsharp.base_address),
+                        size};
+                }
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
@@ -4216,6 +4371,28 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         if (const auto view = ssr->LightingReflections()) {
             res->image_infos[first_image_idx + BbSsr::LightingReflectionSlot] =
                 vk::DescriptorImageInfo{VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral};
+        }
+    };
+    // Light shadows: one of the game's light draws reads its mask with the shadows in instead.
+    const auto replace_light_mask = [&] {
+        if (!pixel_shader || !light_shadows) {
+            return;
+        }
+        if (stage.pgm_hash == BbSsr::LightingShader) {
+            light_shadows->OnLightingPass();
+            return;
+        }
+        if ((!EmulatorSettings.IsBbLightShadows() && EmulatorSettings.IsBbPlayerLight()) ||
+            stage.images.size() < 5 || res->image_infos.size() < first_image_idx + 5) {
+            return;
+        }
+        const std::span infos{res->image_infos.data() + first_image_idx, 5};
+        const std::span ids{stage_textures.data(), 5};
+        if (const auto view =
+                light_shadows->Prepare(stage.pgm_hash, infos, ids, light_shadow_buffers[0],
+                                       light_shadow_buffers[1], Regs(), LightDrawArea())) {
+            res->image_infos[first_image_idx + 4] = vk::DescriptorImageInfo{
+                res->image_infos[first_image_idx + 4].sampler, view, vk::ImageLayout::eGeneral};
         }
     };
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -4362,6 +4539,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 set_write.pImageInfo = &res->image_infos[first_image_idx + i];
             }
             replace_reflections();
+            replace_light_mask();
             RecAdd(RecDetail::TexBind, bind_start);
             ProfileLap(Section::TexSetHit);
             BindSamplers(stage, binding);
@@ -4658,6 +4836,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
     replace_reflections();
+    replace_light_mask();
     ProfileLap(Section::Textures);
     BindSamplers(stage, binding);
     ProfileLap(Section::Samplers);
