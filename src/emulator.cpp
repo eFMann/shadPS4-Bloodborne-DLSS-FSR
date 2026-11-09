@@ -93,7 +93,7 @@ namespace {
 // explosions. The setting stays the minimum; this raises it to what the launch needs, as far as
 // the PC's free commit allows (the whole guest memory is committed at start; RAM is only used as
 // the game fills it).
-void DecideExtraDmem(const std::filesystem::path& game_folder,
+void DecideExtraDmem(const std::string& serial, const std::filesystem::path& game_folder,
                      const std::filesystem::path& mods_folder) {
     const int setting = EmulatorSettings.GetExtraDmemInMBytes();
     // A texture pack: bigger map textures (in the mods folder or merged into the game folder),
@@ -142,6 +142,12 @@ void DecideExtraDmem(const std::filesystem::path& game_folder,
     const int automatic = std::min(need, room);
     const int chosen = std::max(setting, automatic);
     Common::BbTuning::extra_dmem_mb.store(chosen);
+    if (chosen > setting) {
+        // Raised: the game's setting (F3, Experimental) shows what is used from now on. It is
+        // only ever raised, so a value set higher by hand stays.
+        EmulatorSettings.SetExtraDmemInMBytes(chosen, true);
+        EmulatorSettings.Save(serial);
+    }
     LOG_INFO(Loader,
              "Extra direct memory: {} MiB ({}; scene {}p{}{}, setting {} MiB, needed {} MiB; {})",
              chosen, chosen > setting ? "raised automatically" : "the setting", height,
@@ -819,7 +825,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Before the guest memory is set up (Core::Memory::Instance below).
     Common::BbTuning::extra_dmem_mb.store(-1);
     if (IsBloodborne(id)) {
-        DecideExtraDmem(game_folder, mods_folder);
+        DecideExtraDmem(id, game_folder, mods_folder);
     }
 
 #ifdef _WIN32
