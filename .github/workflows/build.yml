@@ -196,6 +196,19 @@ jobs:
           /PrebuiltSignedDLL/amd_fidelityfx_vk.dll
           /LICENSE.txt
 
+    # AMD FSR 4.1: the FSR SDK 2.4 runtime's signed Vulkan DLLs, an optional download of their own.
+    - name: Get AMD FSR SDK
+      uses: actions/checkout@v6
+      with:
+        repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+        ref: v2.4.0
+        path: sdk/amd-fsr
+        sparse-checkout-cone-mode: false
+        sparse-checkout: |
+          /Kits/FidelityFX/signedbin/amd_fidelityfx_loader_vk.dll
+          /Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll
+          /Kits/FidelityFX/docs/license.md
+
     - name: Get FSR-Vulkan
       uses: actions/checkout@v6
       with:
@@ -251,7 +264,8 @@ jobs:
         cmake --build build-fsr4
 
     # The same files as a hand-made release: the emulator with the upscaler DLLs next to it, and
-    # the FSR 4 add-on as its own download (its fsr4 folder goes next to shadPS4.exe).
+    # the FSR 4 add-on and AMD FSR 4.1 as their own downloads (their fsr4 and amd_fsr folders go
+    # next to shadPS4.exe). AMD FSR stays optional: its folder also turns on RDNA 4 device features.
     - name: Package
       shell: pwsh
       run: |
@@ -262,7 +276,8 @@ jobs:
         if ("${{ github.ref_type }}" -eq "tag" -and $suffix -eq "-pgo") { $suffix = "" }
         $name = "shadPS4-Bloodborne-win64-$label$suffix"
         $addon = "shadPS4-Bloodborne-FSR4-addon-win64-$label$suffix"
-        New-Item -ItemType Directory -Force pkg/main/LICENSES, pkg/addon/fsr4 | Out-Null
+        $amdfsr = "shadPS4-Bloodborne-AMD-FSR-win64-$label$suffix"
+        New-Item -ItemType Directory -Force pkg/main/LICENSES, pkg/addon/fsr4, pkg/amdfsr/amd_fsr | Out-Null
         Copy-Item build/shadPS4.exe, build-dlss/shadps4_dlss.dll pkg/main/
         Copy-Item sdk/dlss/lib/Windows_x86_64/rel/nvngx_dlss.dll pkg/main/
         Copy-Item sdk/ffx/PrebuiltSignedDLL/amd_fidelityfx_vk.dll pkg/main/
@@ -287,14 +302,19 @@ jobs:
         Copy-Item "$models/fsr4_model_v07_i8_*", "$models/rcas.spv", "$models/spd_auto_exposure.spv", "$models/LICENSE-FSR4-v07.txt" pkg/addon/fsr4/
         Copy-Item sdk/fsr-vulkan/LICENSE.txt pkg/addon/fsr4/LICENSE-FSR-Vulkan.txt
         Copy-Item LICENSE pkg/addon/fsr4/LICENSE-shadps4_fsr4-GPL-2.0.txt
+        $signed = "sdk/amd-fsr/Kits/FidelityFX/signedbin"
+        Copy-Item "$signed/amd_fidelityfx_loader_vk.dll", "$signed/amd_fidelityfx_upscaler_vk.dll" pkg/amdfsr/amd_fsr/
+        Copy-Item sdk/amd-fsr/Kits/FidelityFX/docs/license.md pkg/amdfsr/amd_fsr/LICENSE-AMD-FSR-SDK.md
         # Each file's version in the log, to compare with an earlier release.
-        Get-ChildItem pkg/main -File | ForEach-Object {
+        Get-ChildItem pkg/main, pkg/amdfsr/amd_fsr -File | ForEach-Object {
           "{0,-24} {1,12:N0} bytes  {2}" -f $_.Name, $_.Length, $_.VersionInfo.FileVersion
         }
         Compress-Archive -Path pkg/main/* -DestinationPath "$name.zip"
         Compress-Archive -Path pkg/addon/fsr4 -DestinationPath "$addon.zip"
+        Compress-Archive -Path pkg/amdfsr/amd_fsr -DestinationPath "$amdfsr.zip"
         "name=$name" >> $env:GITHUB_ENV
         "addon=$addon" >> $env:GITHUB_ENV
+        "amdfsr=$amdfsr" >> $env:GITHUB_ENV
 
     # Records that these files were built by this workflow from this commit, which anyone can
     # check with: gh attestation verify <file> --repo <owner>/<repo>
@@ -323,6 +343,12 @@ jobs:
       with:
         name: ${{ env.addon }}
         path: ${{ env.addon }}.zip
+
+    - name: Upload Windows AMD FSR
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.amdfsr }}
+        path: ${{ env.amdfsr }}.zip
 
   linux:
     runs-on: ubuntu-24.04
@@ -462,7 +488,7 @@ jobs:
   release:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    needs: [get-info, windows-sdl, linux]
+    needs: [get-info, windows-sdl, linux, windows-nr]
     permissions:
       contents: write
     steps:
@@ -499,3 +525,82 @@ jobs:
         if [[ "$tag" == *-* ]]; then prerelease="--prerelease"; fi
         gh release create "$tag" dist/* --repo "${{ github.repository }}" --draft --verify-tag \
           --title "$tag" --notes-file notes.md $prerelease
+
+  # dlssnr-amd/shadps4_nr.dll, the optional DLSS 5 neural rendering add-on: mochizuki0323's
+  # DLSSNR-AMD (MIT) built with mingw-w64 as that project builds its Windows DLLs. Its version is a
+  # deliberate pin in dlssnr_addon/pin.env.
+  windows-nr:
+    runs-on: ubuntu-24.04
+    needs: get-info
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Read the DLSSNR-AMD pin
+      run: grep '^NR_' dlssnr_addon/pin.env >> "$GITHUB_ENV"
+
+    - name: Install
+      run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix
+
+    - name: Get DLSSNR-AMD
+      run: git clone --depth 1 --branch "$NR_TAG" https://gitlab.com/mochizuki0323/DLSSNR-AMD.git nr-src
+
+    - name: Cache DLSSNR-AMD dependencies
+      uses: actions/cache@v5
+      with:
+        path: |
+          nr-src/toolchain
+          nr-src/artifacts/ref
+        key: nr-deps-${{ env.NR_COMMIT }}
+
+    - name: Build
+      run: bash dlssnr_addon/build.sh nr-src build-nr
+
+    # The add-on folder goes next to shadPS4.exe as it is: dlssnr-amd\ (the network as DLSSNR-AMD's
+    # installer lays it out, shadps4_nr.dll and install-model.bat) and dlssnr-amd.ini. No model:
+    # install-model.bat makes it from the user's own nvngx_dlssnr.dll.
+    - name: Package
+      run: |
+        set -e
+        curl -fsSL --retry 3 -o nr-package.zip "$NR_PACKAGE"
+        echo "$NR_PACKAGE_SHA256  nr-package.zip" | sha256sum -c -
+        unzip -q nr-package.zip 'dlssnr-amd/*' 'model-tools/dlssnr_extract_model.exe' \
+          'ini/dlssnr-amd-optiscaler-renodx.ini' -d nr-package
+        mkdir -p pkg
+        cp -r nr-package/dlssnr-amd pkg/
+        mkdir -p pkg/dlssnr-amd/model-tools
+        cp nr-package/model-tools/dlssnr_extract_model.exe pkg/dlssnr-amd/model-tools/
+        cp nr-package/ini/dlssnr-amd-optiscaler-renodx.ini pkg/dlssnr-amd.ini
+        # The network regrades Bloodborne's warm look toward neutral: by default NR's light and
+        # detail are kept with the game's own saturation.
+        sed -i 's/^NRLookMode = 0\(\r\?\)$/NRLookMode = 1\1/; s/^NRLookColour = 1\.00\(\r\?\)$/NRLookColour = 0.00\1/' pkg/dlssnr-amd.ini
+        grep -q '^NRLookMode = 1' pkg/dlssnr-amd.ini
+        grep -q '^NRLookColour = 0\.00' pkg/dlssnr-amd.ini
+        cp dlssnr_addon/install-model.bat dlssnr_addon/install-model.ps1 pkg/dlssnr-amd/
+        sed -i "s/@NR_MODEL_SHA256@/${NR_MODEL_SHA256:?}/; s/@NR_SMALL_SHA256@/${NR_SMALL_SHA256:?}/" pkg/dlssnr-amd/install-model.ps1
+        cp build-nr/shadps4_nr.dll pkg/dlssnr-amd/
+        x86_64-w64-mingw32-strip --strip-unneeded pkg/dlssnr-amd/shadps4_nr.dll
+        cp nr-src/LICENSE pkg/dlssnr-amd/LICENSE-DLSSNR-AMD-MIT.txt
+        cp nr-src/artifacts/ref/DLSS5-Feeder/external/minhook/LICENSE.txt pkg/dlssnr-amd/LICENSE-MinHook.txt
+        cp nr-src/toolchain/imgui-nr/LICENSE.txt pkg/dlssnr-amd/LICENSE-imgui.txt
+        cp nr-src/toolchain/fonts/inter-4.1/LICENSE.txt pkg/dlssnr-amd/LICENSE-Inter.txt
+        cp /usr/share/doc/mingw-w64-common/copyright pkg/dlssnr-amd/LICENSE-mingw-w64.txt
+        # One zip whose dlssnr-amd folder and ini go next to shadPS4.exe, named like the others.
+        name=shadPS4-Bloodborne-NR-addon-win64-${{ needs.get-info.outputs.label }}
+        (cd pkg && zip -qr "../$name.zip" dlssnr-amd dlssnr-amd.ini)
+        echo "name=$name" >> $GITHUB_ENV
+
+    - name: Attest
+      if: github.event_name != 'pull_request'
+      uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: shadPS4-Bloodborne-NR-addon-win64-*.zip
+
+    - name: Upload NR add-on
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.name }}
+        path: ${{ env.name }}.zip

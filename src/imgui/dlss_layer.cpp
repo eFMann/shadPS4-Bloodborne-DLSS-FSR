@@ -36,6 +36,8 @@
 #include "input/controller.h"
 #include "input/input_mouse.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_bb_neural_rendering.h"
+#include "video_core/renderer_vulkan/vk_bb_nr_settings.h"
 #include "video_core/renderer_vulkan/vk_bb_perf_meter.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
@@ -164,8 +166,8 @@ constexpr bool ShowReflections = true;
 // 8 frames), until they are settled.
 constexpr bool ShowReflectionTuning = false;
 
-constexpr std::array UpscalerValues{"auto", "dlss", "fsr", "fsr4"};
-constexpr std::array UpscalerNames{"Automatic", "DLSS", "FSR 3.1", "FSR 4 (add-on)"};
+constexpr std::array UpscalerValues{"auto", "dlss", "fsr", "fsr4", "amdfsr"};
+constexpr std::array UpscalerNames{"Automatic", "DLSS", "FSR 3.1", "FSR 4 (add-on)", "FSR (AMD)"};
 constexpr std::array PresetValues{13, 11, 10, 12, 0};
 constexpr std::array PresetNames{"M (recommended)", "K", "J", "L", "NVIDIA default"};
 
@@ -873,11 +875,27 @@ void DlssLayer::DrawWindow() {
         for (size_t i = 0; i < UpscalerValues.size(); ++i)
             if (upscaler.starts_with(UpscalerValues[i]))
                 upscaler_index = int(i); // "fsr4" also starts with "fsr" and comes later
-        // FSR 4 is listed only when its add-on is installed.
-        const int upscaler_count = int(UpscalerNames.size()) - (status.fsr4_installed ? 0 : 1);
-        if (Combo("Upscaler", &upscaler_index, UpscalerNames.data(), upscaler_count))
-            settings.Set("upscaler", UpscalerValues[upscaler_index]);
-        if (!status.dlss_problem.empty() && upscaler_index != 2)
+        // AMD FSR is named with its runtime's version, e.g. "FSR 4.1.2 (AMD)".
+        const auto upscaler_name = [&](int index) {
+            return index == 4 && !status.amd_fsr_label.empty() ? status.amd_fsr_label.c_str()
+                                                               : UpscalerNames[index];
+        };
+        // FSR 4 is listed only when its add-on is installed, AMD FSR only when its folder is.
+        const auto upscaler_listed = [&](int index) {
+            return index == 3   ? status.fsr4_installed
+                   : index == 4 ? !status.amd_fsr_label.empty()
+                                : true;
+        };
+        if (BeginCombo("Upscaler", upscaler_name(upscaler_index))) {
+            for (int i = 0; i < int(UpscalerValues.size()); ++i) {
+                if (upscaler_listed(i) && Selectable(upscaler_name(i), i == upscaler_index)) {
+                    upscaler_index = i;
+                    settings.Set("upscaler", UpscalerValues[i]);
+                }
+            }
+            EndCombo();
+        }
+        if (!status.dlss_problem.empty() && upscaler_index != 2 && upscaler_index != 4)
             TextDisabled("%s", status.dlss_problem.c_str());
 
         const int preset = std::atoi(settings.Get("preset", "13").c_str());
@@ -893,6 +911,42 @@ void DlssLayer::DrawWindow() {
         float sharpness = float(std::atof(settings.Get("sharpness", "0.6").c_str()));
         if (SliderFloat("Sharpness", &sharpness, 0.0f, 1.0f, "%.2f"))
             settings.Set("sharpness", fmt::format("{:.2f}", sharpness));
+
+        if (status.nr_installed) {
+            SeparatorText("DLSS 5 NR");
+            bool nr = settings.Get("nr", "0") != "0";
+            if (Checkbox("Neural rendering", &nr))
+                settings.Set("nr", nr ? "1" : "0");
+            Vulkan::BbNrSettings nr_settings;
+            for (const char* key : {"nr_network", "nr_scale", "nr_intensity"})
+                Vulkan::ParseBbNrSetting(key, settings.Get(key, ""), nr_settings);
+            // The backend's installed networks, as it names them.
+            const auto& networks = Vulkan::BbNeuralRendering::Networks();
+            const int network = Vulkan::BbNeuralRendering::NetworkIndex(nr_settings.network);
+            if (BeginCombo("Network", network < 0 ? "Automatic" : networks[network].c_str())) {
+                if (Selectable("Automatic", network < 0))
+                    settings.Set("nr_network", "auto");
+                for (int i = 0; i < int(networks.size()); ++i)
+                    if (Selectable(networks[i].c_str(), i == network))
+                        settings.Set("nr_network", networks[i]);
+                EndCombo();
+            }
+            float nr_scale = nr_settings.scale;
+            if (SliderFloat("Network resolution", &nr_scale, Vulkan::BbNrScaleMin,
+                            Vulkan::BbNrScaleMax, "%.2f", ImGuiSliderFlags_AlwaysClamp))
+                settings.Set("nr_scale", fmt::format("{:.2f}", nr_scale));
+            float nr_intensity = nr_settings.intensity;
+            if (SliderFloat("Intensity", &nr_intensity, 0.0f, Vulkan::BbNrIntensityMax, "%.2f",
+                            ImGuiSliderFlags_AlwaysClamp))
+                settings.Set("nr_intensity", fmt::format("{:.2f}", nr_intensity));
+            // Wrapped: the add-on's messages run longer than the window is wide.
+            if (!status.nr_state.empty()) {
+                PushStyleColor(ImGuiCol_Text, GetStyleColorVec4(ImGuiCol_TextDisabled));
+                TextWrapped("%s", status.nr_state.c_str());
+                PopStyleColor();
+            }
+            Separator();
+        }
 
         if (Vulkan::RenoDxLoaded()) {
             bool hdr_compat = settings.Get("hdr_mod_compat", "1") != "0";

@@ -39,11 +39,14 @@ std::filesystem::path BbDlssSettingsPath();
 struct BbDlssStatus {
     bool active{};
     std::string reason;       // why upscaling is not active, in plain words
-    std::string backend;      // upscaler of the latest evaluation: DLSS, FSR 4 or FSR 3.1
+    std::string backend;      // upscaler of the latest evaluation: DLSS, FSR 4, AMD FSR or FSR 3.1
     u32 preset{};             // DLSS's preset (1 A ... 13 M), 0 the default or another upscaler
     std::string dlss_problem; // why DLSS cannot run on this system, if it cannot
     std::string gpu;
     bool fsr4_installed{};
+    std::string amd_fsr_label; // F1 name of the AMD FSR runtime, empty when it is not installed
+    bool nr_installed{};       // the DLSS 5 neural rendering add-on and its model are present
+    std::string nr_state;      // what neural rendering is doing, in plain words
     bool decoupled{}; // the Decoupled UI patch: the scene is upscaled to the game's UI size
     u32 render_width{}, render_height{}, output_width{}, output_height{};
 };

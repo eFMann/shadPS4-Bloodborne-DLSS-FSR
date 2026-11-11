@@ -53,6 +53,8 @@ Both rendered at 1280x720; open them full size to compare.
 - FSR 3.1 and FSR frame generation: any GPU that runs shadPS4
 - FSR 4 add-on (optional): a GPU with INT8 dot products and compute shader derivatives, such as
   a Radeon RX 6000 or newer, an RTX card or an Intel Arc card
+- AMD FSR 4.1 (optional, Windows): a Radeon RX 9000 series card (RDNA 4; older Radeons are
+  untested) and a current Adrenalin driver
 
 ## Install
 
@@ -104,7 +106,44 @@ trails behind moving characters in this game.
 
 It runs the FSR 4 "v07" INT8 model through [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan),
 with model files built by the Q2RTX project from the FSR 4 source AMD published under the MIT
-license. It is not AMD's official FSR 4.1 DLL, which exists only for DirectX 12.
+license. It is not AMD's official FSR 4.1; for that, see the next section.
+
+### Optional: AMD FSR 4.1
+
+AMD's own FSR 4.1 upscaler, from the
+[FSR SDK 2.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/tag/v2.4.0),
+the first release that runs it on Vulkan. Windows only.
+
+1. Unpack the release's AMD FSR download (`shadPS4-Bloodborne-AMD-FSR-win64-*.zip`) next to
+   `shadPS4.exe`, so its `amd_fsr` folder sits beside it. Or make that folder yourself and copy
+   `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` into it from the SDK's
+   [`Kits/FidelityFX/signedbin`](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin).
+2. Start the game and pick *FSR 4.1.2 (AMD)* in F1 (the version comes from the DLL), or set
+   `upscaler=amdfsr` in `dlss.ini`. *Automatic* does not pick it.
+
+Delete the folder to remove it. FSR 3.1 and the FSR 4 add-on are unaffected. Tested on a
+Radeon RX 9070 XT (driver 26.10.1), 2560x1440 to 3840x2160.
+
+### Optional: DLSS 5 neural rendering on AMD
+
+The DLSS 5 neural rendering network as reimplemented for Radeon RX 9000 by
+[DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD) (MIT), run on the render-resolution
+scene right before AMD FSR 4.1. Windows and RX 9000 only; it needs AMD FSR 4.1 (above).
+Nothing from NVIDIA is included: the model comes from your own `nvngx_dlssnr.dll`.
+
+1. Unpack this build's NR add-on download next to `shadPS4.exe` (its `dlssnr-amd` folder and
+   `dlssnr-amd.ini`).
+2. Drop your `nvngx_dlssnr.dll` (NVIDIA's own 310.9.16, for example from NBA 2K27, or 310.8.0;
+   modified copies are refused) or a zip that contains it on `dlssnr-amd\install-model.bat`. It
+   makes the model in that folder; 310.9.16 gives both networks, 310.8.0 CC_SILVER_AARDWOLD only.
+3. Pick AMD FSR in F1 and tick *Neural rendering*, or set `nr=1` in `dlss.ini`. F1 also sets the
+   network, its resolution (`nr_scale`, 0.33 to 1) and the intensity (`nr_intensity`, 0 to 2).
+
+The first start builds the network while the game runs normally (about 80 seconds on an
+RX 9070 XT); it is cached in `dlssnr-amd`, so later starts take a few seconds. F1 shows when it is
+ready and what it costs. Delete `dlssnr-amd\shadps4_nr.dll` to remove it. While that
+file is there, the GPU device is set up for the network even with *Neural rendering* off in F1,
+which only skips the pass; to compare a problem without NR, rename the file instead.
 
 ### Frame generation
 
@@ -333,7 +372,8 @@ the panel is open.
 
 - **Upscaling enabled**: compare with the normal image at any time.
 - **Upscaler**: *Automatic* uses DLSS if the card supports it, else FSR 4 if its add-on is
-  installed, else FSR 3.1. Any of them can be picked by hand.
+  installed, else FSR 3.1. Any of them can be picked by hand, as can *FSR 4.1.x (AMD)* when its
+  `amd_fsr` folder is present.
 - **DLSS model**: M (default) and L are DLSS 4.5, K (NVIDIA's recommendation for this mode) and
   J are DLSS 4.
 - **Sharpness**: after upscaling, default 0.6; 0 for the plain look.
@@ -378,6 +418,9 @@ F1 shows why upscaling isn't running.
 - **"FSR 4 needs the FSR 4 add-on" / "FSR 4 could not start"**: check the `fsr4` folder is next
   to `shadPS4.exe` with all its files and that your GPU meets the requirements. The log says why
   (search for `[FSR4]`).
+- **"AMD FSR needs the amd_fsr folder" / "AMD FSR could not be loaded"**: check `amd_fsr` next
+  to `shadPS4.exe` holds both DLLs from the same SDK release. The log says why (search for
+  `[FSR]`).
 - **Crash at boot after a "Config Migration" prompt**: you copied the files into a build that
   uses `config.toml` (ShadLix and other forks). This release and newer carry the extra dmem over;
   otherwise set it again (`"extra_dmem_in_mbytes": 8000` under `"General"` in
@@ -410,8 +453,8 @@ F1 shows why upscaling isn't running.
 
 ## FAQ
 
-**FSR 4?** Yes, as the optional add-on above. AMD's official FSR 4.1 is DirectX 12 only; the
-add-on uses the community Vulkan port of the v07 model.
+**FSR 4?** Yes, two ways: AMD's official FSR 4.1 from the FSR SDK 2.4 (see above), or the
+add-on with the community Vulkan port of the v07 model.
 
 **XeSS?** No; FSR 3.1 covers Intel cards. XeSS frame generation is DirectX 12 only.
 
@@ -465,6 +508,21 @@ For the curious, or for porting this to a newer shadPS4:
   FSR-Vulkan's v07 provider and loads the model files next to it. With the folder present, the
   device also enables INT8 dot products and compute shader derivatives. Its colour input is
   converted to linear light, since FSR 4 has no setting for display-encoded input.
+- **AMD FSR 4.1**: `amd_fsr/amd_fidelityfx_loader_vk.dll` goes through the same code as FSR 3.1,
+  with the FSR SDK 2.x number for the Vulkan backend description. With the folder present, the
+  device also enables cooperative matrices and FP8 (`VK_KHR_cooperative_matrix`,
+  `VK_EXT_shader_float8`) for its RDNA 4 model, plus what the add-on enables.
+- **Neural rendering**: `dlssnr-amd/shadps4_nr.dll` (source in [`dlssnr_addon/`](dlssnr_addon))
+  is DLSSNR-AMD's network with a small C interface instead of its game plugin. With the add-on
+  and a model present, the Vulkan device is created through it, so the device gets what the
+  network needs. Each frame the network runs on a copy of AMD FSR 4.1's colour input, with the
+  same depth and motion vectors, on shadPS4's own command buffer; AMD FSR then takes that copy.
+  Until the network is built, frames go through unchanged. That C interface
+  (`dlssnr_addon/shadps4_nr.h`) is the one every backend speaks: another one, such as NVIDIA's own
+  NR through NGX on RTX cards, is a `shadps4_nr.dll` in its own folder that names the upscalers it
+  runs before, plus a line in the backend list in `vk_bb_neural_rendering.cpp`. Before DLSS the
+  network is recorded in the same step as DLSS; no backend runs there yet, so that path is
+  untested.
 - **DLSS frame generation**: Streamline is loaded before the Vulkan instance and hands out its
   versions of the instance, device and swapchain functions. Each upscaled frame keeps its depth,
   motion and camera matrices in a small ring until presented. DLSS-G also gets the window without
@@ -501,6 +559,15 @@ cmake --build build-fsr4
 
 Its model files are `fsr4_model_v07_i8_*`, `rcas.spv` and `spd_auto_exposure.spv` from
 [Q2RTX's `baseq2/fsr4_shaders`](https://github.com/FireBurn/Q2RTX/tree/ae8d628fae208813172446d1e49ed94150b04658/baseq2/fsr4_shaders).
+
+The NR add-on is built with mingw-w64 (posix threads) from a
+[DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD) checkout at the commit pinned in
+`dlssnr_addon/pin.env`, the way that project
+builds its Windows DLLs, with the fixes in `dlssnr_addon/patches` applied to it first:
+
+```
+bash dlssnr_addon/build.sh <path to DLSSNR-AMD> build-nr
+```
 
 Frame generation needs the [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline/releases)
 2.14.16 headers: add `-DBB_STREAMLINE_DIR=<path to the Streamline SDK>` when configuring the
@@ -549,9 +616,16 @@ An AI coding agent was used in the development of this project.
 - The Streamline DLLs (`sl.*.dll`): NVIDIA's Streamline SDK, MIT.
 - `amd_fidelityfx_vk.dll` and `externals/ffx-api/`: AMD FidelityFX SDK, MIT, see
   [externals/ffx-api/LICENSE.txt](externals/ffx-api/LICENSE.txt).
+- `amd_fsr/*.dll`: AMD FSR SDK signed binaries, redistributable in binary form under AMD's
+  license (`Kits/FidelityFX/docs/license.md` in the SDK), not covered by the licenses above.
 - The FSR 4 add-on: its wrapper is GPL-2.0-or-later and FSR-Vulkan inside it is MIT. The model
   files carry the MIT notice of the FSR 4 source they were built from; the add-on zip includes
   all three license texts.
+- The NR add-on: its interface in `dlssnr_addon/` is MIT, DLSSNR-AMD inside it and its network
+  data are MIT, and it contains MinHook (BSD-2-Clause), Dear ImGui (MIT), the Inter font
+  (OFL-1.1) and the mingw-w64 runtime; the add-on zip includes their license texts. The model
+  `install-model.bat` makes comes from your own `nvngx_dlssnr.dll` and is not covered by the
+  licenses above.
 
 NVIDIA, GeForce RTX and DLSS are trademarks of NVIDIA Corporation. AMD and FidelityFX are
 trademarks of Advanced Micro Devices, Inc. Bloodborne is a trademark of Sony Interactive

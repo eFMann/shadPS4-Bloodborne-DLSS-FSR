@@ -20,8 +20,10 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_bb_fsr_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_bb_neural_rendering.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_fsr4_addon.h"
+#include "video_core/renderer_vulkan/vk_fsr_upscaler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/vram_owners.h"
@@ -210,6 +212,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 Instance::~Instance() {
     FrameGen::Shutdown();
     dlss_ngx.reset();
+    neural_rendering.reset();
     if (ImGui::GetCurrentContext()) {
         ImGui::Core::Shutdown(GetDevice());
     }
@@ -273,7 +276,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
+        vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
+        vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
+        vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -430,14 +435,25 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
                  shader_clock_features.shaderSubgroupClock);
     }
-    // The FSR 4 add-on's model passes use INT8 dot products and compute shader derivatives.
-    if (Fsr4Addon::Present()) {
+    // The FSR 4 add-on's model passes use INT8 dot products and compute shader derivatives, and
+    // so does FSR 4.1 from the AMD FSR runtime, which also uses FP8 cooperative matrices on RDNA 4.
+    const bool amd_fsr = FsrUpscaler::Present(FsrUpscaler::Runtime::AmdFsr);
+    if (Fsr4Addon::Present() || amd_fsr) {
         compute_shader_derivatives =
             add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
         if (compute_shader_derivatives)
             compute_shader_derivatives_features =
                 feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
     }
+    bool cooperative_matrix{}, shader_float8{};
+    if (amd_fsr) {
+        cooperative_matrix = add_extension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        shader_float8 = cooperative_matrix && add_extension(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    }
+    const auto cooperative_matrix_features =
+        feature_chain.get<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
+    const auto shader_float8_features =
+        feature_chain.get<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -691,9 +707,22 @@ bool Instance::CreateDevice() {
             .computeDerivativeGroupLinear =
                 compute_shader_derivatives_features.computeDerivativeGroupLinear,
         },
+        vk::PhysicalDeviceCooperativeMatrixFeaturesKHR{
+            .cooperativeMatrix = cooperative_matrix_features.cooperativeMatrix,
+        },
+        vk::PhysicalDeviceShaderFloat8FeaturesEXT{
+            .shaderFloat8 = shader_float8_features.shaderFloat8,
+            .shaderFloat8CooperativeMatrix = shader_float8_features.shaderFloat8CooperativeMatrix,
+        },
     };
     if (!compute_shader_derivatives) {
         device_chain.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
+    }
+    if (!cooperative_matrix) {
+        device_chain.unlink<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
+    }
+    if (!shader_float8) {
+        device_chain.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
     }
 
     if (!custom_border_color) {
@@ -752,7 +781,10 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
-    auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    neural_rendering = BbNeuralRendering::Load();
+    auto [device_result, dev] =
+        neural_rendering ? neural_rendering->CreateDevice(physical_device, device_chain.get())
+                         : physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
@@ -767,6 +799,10 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, present_queue_index);
+    if (neural_rendering &&
+        !neural_rendering->Init(*instance, physical_device, *device, queue_family_index)) {
+        neural_rendering.reset();
+    }
     buffer_queue_families[0] = queue_family_index;
     if (readback_family != ~0u) {
         readback_queue = device->getQueue(readback_family, readback_index);
