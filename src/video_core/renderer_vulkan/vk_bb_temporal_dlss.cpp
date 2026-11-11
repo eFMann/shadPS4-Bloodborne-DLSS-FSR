@@ -10,6 +10,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -654,8 +655,7 @@ struct BbTemporalDlss::Impl {
     // write. After a failure it stays off for the run; upscaling goes on without it.
     std::unique_ptr<OwnedImage> nr_color;
     bool nr_was_active{};
-    bool nr_failed{};
-    std::string nr_failure;
+    std::optional<std::string> nr_failure;
     // An evaluation before DLSS the recording thread found failed; seen at the next evaluation.
     std::atomic<bool> nr_evaluate_failed{false};
     // Frame generation reads depth and motion when the frame is presented, after later frames
@@ -862,9 +862,8 @@ struct BbTemporalDlss::Impl {
     }
 
     void StopNeuralRendering(BbNeuralRendering& neural) {
-        nr_failed = true;
         nr_failure = neural.Status().message;
-        LOG_ERROR(Render_Vulkan, "[NR] Evaluation failed ({}); off for this run", nr_failure);
+        LOG_ERROR(Render_Vulkan, "[NR] Evaluation failed ({}); off for this run", *nr_failure);
     }
 
     // Before FSR, recorded here; nr_color is left in SHADER_READ_ONLY_OPTIMAL for the upscaler.
@@ -885,8 +884,8 @@ struct BbTemporalDlss::Impl {
     std::string NrState(BbNeuralRendering* neural, bool input_matches) const {
         if (!neural)
             return "did not start (see the log)";
-        if (nr_failed)
-            return "failed: " + nr_failure;
+        if (nr_failure)
+            return "failed: " + *nr_failure;
         if (!tune.nr.enabled)
             return "off";
         if (!neural->RunsBefore(NrUpscaler(backend)))
@@ -1651,16 +1650,15 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         using U = vk::ImageUsageFlagBits;
         // Neural rendering copies the upscaler's input (this or linear_color) into nr_color.
         const bool neural = instance.GetNeuralRendering() != nullptr;
-        const vk::ImageUsageFlags copied = neural ? U::eTransferSrc : vk::ImageUsageFlags{};
         snapshot = std::make_unique<OwnedImage>(
             instance, color_format, in,
-            (renodx ? U::eSampled | U::eStorage : U::eSampled | U::eTransferDst) | copied);
+            (renodx ? U::eSampled | U::eStorage : U::eSampled | U::eTransferDst) | U::eTransferSrc);
         motion = std::make_unique<OwnedImage>(instance, vk::Format::eR16G16Sfloat, in,
                                               U::eSampled | U::eStorage | U::eTransferSrc);
         upscaled = std::make_unique<OwnedImage>(instance, vk::Format::eR16G16B16A16Sfloat, out,
                                                 U::eSampled | U::eStorage | U::eTransferSrc);
         linear_color = std::make_unique<OwnedImage>(instance, vk::Format::eR16G16B16A16Sfloat, in,
-                                                    U::eSampled | U::eStorage | copied);
+                                                    U::eSampled | U::eStorage | U::eTransferSrc);
         const vk::Format nr_format = renodx ? vk::Format::eR16G16B16A16Sfloat : color_format;
         const auto nr_features =
             instance.GetPhysicalDevice().getFormatProperties(nr_format).optimalTilingFeatures;
@@ -1986,7 +1984,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     OwnedImage& upscaler_input = *(linear ? linear_color : snapshot);
     const bool nr_input_matches = nr_color && nr_color->format == upscaler_input.format;
     const bool nr_active = tune.nr.enabled && neural && neural->RunsBefore(NrUpscaler(backend)) &&
-                           nr_input_matches && !nr_failed;
+                           nr_input_matches && !nr_failure;
     if (nr_active != nr_was_active)
         history_valid = false;
     nr_was_active = nr_active;

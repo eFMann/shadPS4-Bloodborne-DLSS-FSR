@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 // shadps4_nr.dll: the C interface of shadps4_nr.h over DLSSNR-AMD's Vulkan model
-// (gitlab.com/mochizuki0323/DLSSNR-AMD, MIT, built from tag v0.0.8.2). It drives the model the way
-// that project's OptiScaler plugin does on a Vulkan game (nr_asi_main.cpp: note_device, vk_init,
-// create_vk_asi and, in run_renodx_vk, evaluate_vk_asi with the RenoDX style before the upscaler),
-// except that shadPS4 hands over its device, queue and queue lock directly instead of hooks
-// finding them.
+// (gitlab.com/mochizuki0323/DLSSNR-AMD, MIT, built from the release pinned in pin.env). It drives
+// the model the way that project's OptiScaler plugin does on a Vulkan game (nr_asi_main.cpp:
+// note_device, vk_init, create_vk_asi and, in run_renodx_vk, evaluate_vk_asi with the RenoDX style
+// before the upscaler), except that shadPS4 hands over its device, queue and queue lock directly
+// instead of hooks finding them.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -41,8 +41,6 @@ nr::dlssnr::Feature* g_feature = nullptr;
 uint32_t g_width = 0, g_height = 0;
 bool g_ran = false;
 int g_network = nr::kSilverAardwold;
-bool g_renodx_read = false;
-nr::renodx::Settings g_renodx{};
 
 // The networks offered, in the order automatic tries them, each with the model file it needs in
 // dlssnr-amd\.
@@ -88,16 +86,15 @@ nr::dlssnr::VkImageRef ImageRef(const ShadNrImage& image) {
 
 // [RenoDX] of dlssnr-amd.ini next to shadPS4.exe, as mochizuki's installer writes it; read once.
 const nr::renodx::Settings& RenoDXSettings() {
-    if (!g_renodx_read) {
-        g_renodx_read = true;
+    static const nr::renodx::Settings settings = []() -> nr::renodx::Settings {
         nr::pe::RenoDXConfig config;
         const std::string ini = std::string(nr::pe::module_folder()) + "\\dlssnr-amd.ini";
         if (nr::pe::read_renodx(ini, config))
-            g_renodx = config.values;
-        else
-            nr::pe::log("[shadps4_nr] %s has no [RenoDX] section; its defaults are used", ini.c_str());
-    }
-    return g_renodx;
+            return config.values;
+        nr::pe::log("[shadps4_nr] %s has no [RenoDX] section; its defaults are used", ini.c_str());
+        return {};
+    }();
+    return settings;
 }
 
 void ReleaseFeature() {
@@ -122,6 +119,14 @@ Result Guarded(const char* call, Result failed, Body&& body) {
         nr::pe::log("[shadps4_nr] %s: unknown exception", call);
     }
     return failed;
+}
+
+template <typename Body>
+void Guarded(const char* call, Body&& body) {
+    Guarded(call, 0, [&] {
+        body();
+        return 0;
+    });
 }
 
 } // namespace
@@ -257,9 +262,9 @@ SHADPS4_NR_API int32_t shadps4_nr_evaluate(VkCommandBuffer cmd, const ShadNrFram
 }
 
 SHADPS4_NR_API void shadps4_nr_status(ShadNrStatus* out) {
-    Guarded("shadps4_nr_status", 0, [&]() -> int {
+    Guarded("shadps4_nr_status", [&] {
         if (!out)
-            return 0;
+            return;
         std::lock_guard<std::mutex> guard(g_lock);
         *out = ShadNrStatus{};
         CopyText(out->network, sizeof out->network, nr::network_codename(g_network));
@@ -273,16 +278,14 @@ SHADPS4_NR_API void shadps4_nr_status(ShadNrStatus* out) {
             out->gpu_ms = session.gpu_ms();
             CopyText(out->message, sizeof out->message, session.status());
         });
-        return 0;
     });
 }
 
 SHADPS4_NR_API void shadps4_nr_shutdown(void) {
-    Guarded("shadps4_nr_shutdown", 0, [&]() -> int {
+    Guarded("shadps4_nr_shutdown", [&] {
         std::lock_guard<std::mutex> guard(g_lock);
         ReleaseFeature();
         nr::dlssnr::vk_device_destroyed();
-        return 0;
     });
 }
 

@@ -11,9 +11,10 @@ param([string]$Dll)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 
-# The checksums DLSSNR-AMD 0.0.8.2's installer checks the models against.
-$ModelSha = '2B41C888CF4155B8958C665BA64018AB0BD25C85FC71A2B6DB86D0D04D1F7FBD'
-$SmallSha = '7E966E2639DBEC6596AA0BAC3B8761137D2C40CA8CB4ACA30DF7CA10043C6E33'
+# The checksums the pinned DLSSNR-AMD's installer checks the models against, stamped from pin.env
+# when the add-on is packaged.
+$ModelSha = '@NR_MODEL_SHA256@'
+$SmallSha = '@NR_SMALL_SHA256@'
 
 function Fail([string]$message) {
     Write-Host "install-model: $message" -ForegroundColor Red

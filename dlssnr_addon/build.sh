@@ -3,15 +3,15 @@
 # SPDX-License-Identifier: MIT
 #
 # Builds dlssnr-amd/shadps4_nr.dll, the optional DLSS 5 neural rendering add-on, with mingw-w64
-# from a DLSSNR-AMD tree (gitlab.com/mochizuki0323/DLSSNR-AMD, MIT) at tag v0.0.8.2. The model's
-# objects are compiled exactly as that tree's windows/build/build_asi.sh compiles them (same flags,
-# same network constants as the shaders its package installs); only the plugin's own units are left
-# out and shadps4_nr.cpp takes their place, and patches/ is applied first. Bash, not sh: it sources
-# that tree's bash scripts.
+# from a DLSSNR-AMD tree (gitlab.com/mochizuki0323/DLSSNR-AMD, MIT) at the commit in pin.env. The
+# model's objects are compiled exactly as that tree's windows/build/build_asi.sh compiles them (same
+# flags, same network constants as the shaders its package installs); only the plugin's own units
+# are left out and shadps4_nr.cpp takes their place, and patches/ is applied first. Bash, not sh: it
+# sources that tree's bash scripts.
 set -euo pipefail
 
 usage() {
-    echo "usage: build.sh <DLSSNR-AMD tree at v0.0.8.2> <out dir>" >&2
+    echo "usage: build.sh <DLSSNR-AMD tree at the commit in pin.env> <out dir>" >&2
     echo "  NR_MINGW / NR_MINGW_CC / NR_OBJDUMP override the x86_64-w64-mingw32 posix toolchain" >&2
     exit 2
 }
@@ -32,8 +32,10 @@ cc=$NR_MINGW_CC
 objdump=${NR_OBJDUMP:-x86_64-w64-mingw32-objdump}
 for cmd in "$cxx" "$cc" "$objdump" python3 git curl; do need_cmd "$cmd"; done
 
+source "$addon/pin.env"
 cd -- "$src"
 [ -f windows/src/pe/nr_dlssnr_model.cpp ] || die "Not a DLSSNR-AMD tree: $src"
+[ "$(git rev-parse HEAD)" = "$NR_COMMIT" ] || die "DLSSNR-AMD tree is not at $NR_TAG ($NR_COMMIT): $src"
 # Fixes to the pinned tree, each explained in its patch; skipped when already applied.
 for patch in "$addon"/patches/*.patch; do
     git apply --reverse --check "$patch" 2>/dev/null || git apply "$patch" || die "Patch does not apply: $patch"

@@ -528,7 +528,7 @@ jobs:
 
   # dlssnr-amd/shadps4_nr.dll, the optional DLSS 5 neural rendering add-on: mochizuki0323's
   # DLSSNR-AMD (MIT) built with mingw-w64 as that project builds its Windows DLLs. Its version is a
-  # deliberate pin; bump NR_TAG, NR_COMMIT, NR_PACKAGE and NR_PACKAGE_SHA256 together.
+  # deliberate pin in dlssnr_addon/pin.env.
   windows-nr:
     runs-on: ubuntu-24.04
     needs: get-info
@@ -536,22 +536,17 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    env:
-      NR_TAG: v0.0.8.2
-      NR_COMMIT: c53878b5f0ee1656e740fdbbfd52994d02fe7bd5
-      # That release's Windows package: its network data, model extractor and settings file.
-      NR_PACKAGE: https://gitlab.com/mochizuki0323/DLSSNR-AMD/-/releases/v0.0.8.2/downloads/DLSSNR-AMD-Vulkan-Windows-0.0.8.2-preview-x86_64.zip
-      NR_PACKAGE_SHA256: 85ca7911348a160b10c1a9456a8ef95332468d8402c11c4c4ea6593a7561989f
     steps:
     - uses: actions/checkout@v6
+
+    - name: Read the DLSSNR-AMD pin
+      run: grep '^NR_' dlssnr_addon/pin.env >> "$GITHUB_ENV"
 
     - name: Install
       run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix
 
     - name: Get DLSSNR-AMD
-      run: |
-        git clone --depth 1 --branch "$NR_TAG" https://gitlab.com/mochizuki0323/DLSSNR-AMD.git nr-src
-        test "$(git -C nr-src rev-parse HEAD)" = "$NR_COMMIT"
+      run: git clone --depth 1 --branch "$NR_TAG" https://gitlab.com/mochizuki0323/DLSSNR-AMD.git nr-src
 
     - name: Cache DLSSNR-AMD dependencies
       uses: actions/cache@v5
@@ -585,6 +580,7 @@ jobs:
         grep -q '^NRLookMode = 1' pkg/dlssnr-amd.ini
         grep -q '^NRLookColour = 0\.00' pkg/dlssnr-amd.ini
         cp dlssnr_addon/install-model.bat dlssnr_addon/install-model.ps1 pkg/dlssnr-amd/
+        sed -i "s/@NR_MODEL_SHA256@/${NR_MODEL_SHA256:?}/; s/@NR_SMALL_SHA256@/${NR_SMALL_SHA256:?}/" pkg/dlssnr-amd/install-model.ps1
         cp build-nr/shadps4_nr.dll pkg/dlssnr-amd/
         x86_64-w64-mingw32-strip --strip-unneeded pkg/dlssnr-amd/shadps4_nr.dll
         cp nr-src/LICENSE pkg/dlssnr-amd/LICENSE-DLSSNR-AMD-MIT.txt
