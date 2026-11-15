@@ -6262,14 +6262,17 @@ u64 Rasterizer::RingCopyGeometry(VAddr address, u64 size) {
         ring_fallbacks.fetch_add(1, std::memory_order_relaxed);
         return NoRing;
     }
-    RingCopy(address, dest, offset, size);
+    RingCopy(address, dest, offset, size, false);
     geometry_ring_copies.fetch_add(1, std::memory_order_relaxed);
     return offset;
 }
 
-void Rasterizer::RingCopy(VAddr guest, u8* dest, u64 offset, u64 size) {
+void Rasterizer::RingCopy(VAddr guest, u8* dest, u64 offset, u64 size, bool grading) {
     if (!copy_thread_on) {
         memory->CopySparseMemory(guest, dest, size);
+        if (grading) {
+            BbApplyGrading(dest, size);
+        }
         const_ring->Flush(offset, size);
         return;
     }
@@ -6278,7 +6281,7 @@ void Rasterizer::RingCopy(VAddr guest, u8* dest, u64 offset, u64 size) {
         PublishCopies();
         std::this_thread::yield();
     }
-    copy_jobs[copy_head % CopyJobCount] = {guest, dest, offset, size};
+    copy_jobs[copy_head % CopyJobCount] = {guest, dest, offset, size, grading};
     ++copy_head;
     // Handed over with the packet (PublishCopies): once per draw instead of once per buffer,
     // each a write to the line the copy thread polls.
@@ -6332,6 +6335,9 @@ void Rasterizer::RunCopyThread(std::stop_token stop) {
         for (; at < available; ++at) {
             const auto& job = copy_jobs[at % CopyJobCount];
             memory->CopySparseMemory(job.guest, job.dest, job.size);
+            if (job.grading) {
+                BbApplyGrading(job.dest, job.size);
+            }
             const_ring->Flush(job.offset, job.size);
             copy_done.store(at + 1, std::memory_order_release);
         }
@@ -6413,7 +6419,7 @@ void Rasterizer::PrefetchBuffers(const Pipeline* pipeline) {
                 std::memcpy(dest, source, size);
                 const_ring->Flush(offset, size);
             } else {
-                RingCopy(guest, dest, offset, size);
+                RingCopy(guest, dest, offset, size, BbGradingWanted(info->pgm_hash, index));
                 // The same test the scene constants' readers start with. With the copy thread the
                 // data is not read here otherwise: each test was a read of memory the game just
                 // wrote on another core (about 6% of this thread's time). So only for the

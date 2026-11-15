@@ -897,9 +897,9 @@ void DlssLayer::DrawWindow() {
         PopStyleColor();
     }
 
-    // Tabs. Display: frame rate and resolution. Graphics: textures and the image features, the same
-    // settings as F3's (Bloodborne, Graphics), both always showing the same. Other: this menu's UI
-    // scale, the FPS counter, keyboard and mouse, the benchmark route.
+    // Tabs. Display: frame rate, resolution and the picture. Graphics: textures and the image
+    // features, the same settings as F3's (Bloodborne, Graphics), both always showing the same.
+    // Other: this menu's UI scale, the FPS counter, keyboard and mouse, the benchmark route.
     bool main_tab = true, display_tab = false, graphics_tab = false, dlss5_tab = false,
          other_tab = false;
     if (BeginTabBar("##f1_tabs")) {
@@ -1124,6 +1124,88 @@ void DlssLayer::DrawWindow() {
                     "Off: the render resolution comes from the Resolution Patch you enable "
                     "for Bloodborne (shadPS4 patches or BBLauncher), upscaled to your window.");
             }
+        }
+        SeparatorText("Picture");
+        {
+            // Our own colour pass over the upscaled scene, before the HUD (bb_picture.comp).
+            struct PictureSlider {
+                const char* label;
+                const char* key;
+                const char* fallback;
+                float low, high;
+                const char* format;
+                const char* tip;
+            };
+            static constexpr std::array Sliders{
+                PictureSlider{"Brightness", "picture_brightness", "1.00", 0.0f, 3.0f, "%.2f",
+                              "1: the game's. Multiplies the light of the whole scene, the "
+                              "shadows too: for deeper shadows raise Contrast instead."},
+                PictureSlider{"Contrast", "picture_contrast", "1.00", 0.5f, 2.0f, "%.2f",
+                              "1: the game's. Above 1: darker darks and brighter lights, around "
+                              "mid grey."},
+                PictureSlider{"Black level", "picture_black", "0.00", 0.0f, 0.15f, "%.3f",
+                              "0: the game's. Takes the grey haze out of the shadows: the "
+                              "darkest greys become black, the rest keeps its brightness."},
+                PictureSlider{"Saturation", "picture_saturation", "1.00", 0.0f, 3.0f, "%.2f",
+                              "1: the game's. 0: black and white. Above 1 dull colours gain "
+                              "more than ones already strong."}};
+            for (const auto& slider : Sliders) {
+                float value = float(std::atof(settings.Get(slider.key, slider.fallback).c_str()));
+                SetNextItemWidth(Px(200.0f));
+                if (SliderFloat(slider.label, &value, slider.low, slider.high, slider.format))
+                    settings.Set(slider.key, fmt::format("{:.3f}", value));
+                if (IsItemHovered())
+                    SetTooltip("%s\nOn the 3D scene, not the HUD or menus, while upscaling is "
+                               "active (Main tab). Ctrl+click to type a value.",
+                               slider.tip);
+            }
+            if (Button("Reset picture"))
+                for (const auto& slider : Sliders)
+                    settings.Set(slider.key, slider.fallback);
+            SameLine();
+            if (Button("Log the game's colour passes"))
+                Vulkan::BbRequestPostLog();
+            if (IsItemHovered())
+                SetTooltip("For development: writes the next frame's post-processing passes, "
+                           "with their settings, to the log ([POST-LOG]).");
+        }
+        SeparatorText("The game's grading");
+        {
+            // The game's own tone mapping and colour grade, changed in its constants
+            // (BbApplyGrading): it works with and without upscaling.
+            struct GradeSlider {
+                const char* label;
+                const char* key;
+                const char* fallback;
+                float low, high;
+                const char* tip;
+            };
+            static constexpr std::array Sliders{
+                GradeSlider{"Exposure##grade", "grade_exposure", "1.00", 0.5f, 2.0f,
+                            "1: the game's. The light going into the game's tone curve: higher "
+                            "brightens the midtones and pushes highlights into its roll-off."},
+                GradeSlider{"Gamma##grade", "grade_gamma", "2.20", 1.8f, 3.0f,
+                            "2.2: the game's. The game's display gamma: higher gives deeper "
+                            "shadows and midtones (more contrast), lower lifts them (flatter)."},
+                GradeSlider{"Colour##grade", "grade_colour", "1.00", 0.0f, 2.0f,
+                            "1: the game's, which itself takes 10% of the colour out. 1.11 "
+                            "undoes that; 0 black and white."},
+                GradeSlider{"Bloom##grade", "grade_bloom", "1.00", 0.0f, 2.0f,
+                            "1: the game's. The glow it blends over the image, a large part of "
+                            "its hazy look; lower clears it."}};
+            for (const auto& slider : Sliders) {
+                float value = float(std::atof(settings.Get(slider.key, slider.fallback).c_str()));
+                SetNextItemWidth(Px(200.0f));
+                if (SliderFloat(slider.label, &value, slider.low, slider.high, "%.2f"))
+                    settings.Set(slider.key, fmt::format("{:.2f}", value));
+                if (IsItemHovered())
+                    SetTooltip("%s\nIn the game's own grading, before the HUD; with or without "
+                               "upscaling. Ctrl+click to type a value.",
+                               slider.tip);
+            }
+            if (Button("Reset grading"))
+                for (const auto& slider : Sliders)
+                    settings.Set(slider.key, slider.fallback);
         }
     }
     if (main_tab) {
@@ -1643,50 +1725,6 @@ void DlssLayer::DrawWindow() {
     }
     if (graphics_tab) {
         settings.Load(); // F3 may have changed them
-        SeparatorText("Picture");
-        {
-            // Our own colour pass over the upscaled scene, before the HUD (bb_picture.comp).
-            struct PictureSlider {
-                const char* label;
-                const char* key;
-                const char* fallback;
-                float low, high;
-                const char* format;
-                const char* tip;
-            };
-            static constexpr std::array Sliders{
-                PictureSlider{"Brightness", "picture_brightness", "1.00", 0.0f, 3.0f, "%.2f",
-                              "1: the game's. Multiplies the light of the whole scene, the "
-                              "shadows too: for deeper shadows raise Contrast instead."},
-                PictureSlider{"Contrast", "picture_contrast", "1.00", 0.5f, 2.0f, "%.2f",
-                              "1: the game's. Above 1: darker darks and brighter lights, around "
-                              "mid grey."},
-                PictureSlider{"Black level", "picture_black", "0.00", 0.0f, 0.15f, "%.3f",
-                              "0: the game's. Takes the grey haze out of the shadows: the "
-                              "darkest greys become black, the rest keeps its brightness."},
-                PictureSlider{"Saturation", "picture_saturation", "1.00", 0.0f, 3.0f, "%.2f",
-                              "1: the game's. 0: black and white. Above 1 dull colours gain "
-                              "more than ones already strong."}};
-            for (const auto& slider : Sliders) {
-                float value = float(std::atof(settings.Get(slider.key, slider.fallback).c_str()));
-                SetNextItemWidth(Px(200.0f));
-                if (SliderFloat(slider.label, &value, slider.low, slider.high, slider.format))
-                    settings.Set(slider.key, fmt::format("{:.3f}", value));
-                if (IsItemHovered())
-                    SetTooltip("%s\nOn the 3D scene, not the HUD or menus, while upscaling is "
-                               "active (Main tab). Ctrl+click to type a value.",
-                               slider.tip);
-            }
-            if (Button("Reset picture"))
-                for (const auto& slider : Sliders)
-                    settings.Set(slider.key, slider.fallback);
-            SameLine();
-            if (Button("Log the game's colour passes"))
-                Vulkan::BbRequestPostLog();
-            if (IsItemHovered())
-                SetTooltip("For development: writes the next frame's post-processing passes, "
-                           "with their settings, to the log ([POST-LOG]).");
-        }
         SeparatorText("Textures");
         {
             static constexpr std::array AnisotropyNames{"Game default", "2x", "4x", "8x", "16x"};

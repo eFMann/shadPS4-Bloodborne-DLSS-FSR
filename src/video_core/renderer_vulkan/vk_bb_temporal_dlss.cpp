@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include "common/bb_tuning.h"
 #include "common/crash_crumbs.h"
 #include "common/logging/log.h"
@@ -169,6 +170,8 @@ constexpr u64 MotionBlurAlt = 0x29e06868;
 // Copies the HDR scene (slot 0) into the target post-processing runs on. With the Decoupled UI
 // patches the scene is smaller than that target and this pass is the game's upscale.
 constexpr u64 HdrSceneCopy = 0xccbf44a6;
+// The game's tone mapping and grading: the scene, its bloom and filters to the 8-bit target.
+constexpr u64 GradingShader = 0x5c02eaf8;
 constexpr u64 CameraBytes = 4096, VelocityOffset = 4096, CoefficientBytes = 4096 + 256;
 // HUD coverage counters, one per frame in flight, each in its own aligned slot.
 constexpr u64 CoverageSlots = 3, CoverageStride = 256;
@@ -177,6 +180,13 @@ constexpr vk::ImageSubresourceRange Range{
     .aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1};
 
 std::atomic<bool> post_log_request{false};
+
+// F1's grading settings (grade_*), 1, 2.2, 1, 1 the game's: read by the threads that copy the
+// grading shader's constants.
+struct Grading {
+    std::atomic<float> exposure{1.0f}, gamma{2.2f}, colour{1.0f}, bloom{1.0f};
+    std::atomic<bool> changed{false};
+} grading;
 
 bool IsUiShader(u64 hash) {
     return hash == 0x34e8a281 || hash == 0x81d336ce || hash == 0x09957251 || hash == 0x24042a9b ||
@@ -504,6 +514,8 @@ struct Tune {
     BbDlss5Settings dlss5;
     // Picture tuning (bb_picture.comp): 1, 1, 1 and 0 leave the picture alone.
     float brightness = 1.0f, contrast = 1.0f, saturation = 1.0f, black = 0.0f;
+    // The game's grading (BbApplyGrading): 1, 2.2, 1 and 1 leave it as it is.
+    float grade_exposure = 1.0f, grade_gamma = 2.2f, grade_colour = 1.0f, grade_bloom = 1.0f;
 };
 
 enum class Backend { None, Dlss, Fsr, Fsr4, AmdFsr };
@@ -687,7 +699,12 @@ struct BbTemporalDlss::Impl {
     // BbRequestPostLog: 1 waiting for the scene copy, 2 logging up to the display copy.
     std::atomic<int> post_log_state{0};
     u32 post_log_draws{}, post_log_ui{}, post_log_frames{};
-    std::vector<std::string> post_log_constants;
+    struct PostConstants {
+        u32 index;
+        u64 size;
+        std::vector<float> values;
+    };
+    std::vector<PostConstants> post_log_constants;
 
     void PostLogDraw(const DrawInfo& draw, const VideoCore::Image* color) {
         int state = post_log_state.load(std::memory_order_relaxed);
@@ -709,8 +726,23 @@ struct BbTemporalDlss::Impl {
                          color ? color->info.size.width : 0, color ? color->info.size.height : 0,
                          color ? vk::to_string(color->info.pixel_format) : std::string{"none"},
                          draw.num_indices, draw.num_instances, draw.depth_test);
-                for (const auto& line : post_log_constants)
-                    LOG_INFO(Render_Vulkan, "[POST-LOG]     {}", line);
+                // The game's grading reads its constants from dwords 616 to 851: all of them,
+                // in rows; other draws the first 64.
+                const bool all = draw.ps_hash == GradingShader;
+                for (const auto& c : post_log_constants) {
+                    const size_t count =
+                        all ? c.values.size() : std::min<size_t>(64, c.values.size());
+                    if (!all) {
+                        LOG_INFO(Render_Vulkan, "[POST-LOG]     b{} ({} bytes): {}", c.index,
+                                 c.size, fmt::join(std::span{c.values}.first(count), " "));
+                        continue;
+                    }
+                    for (size_t row = 0; row < count; row += 8)
+                        LOG_INFO(Render_Vulkan, "[POST-LOG]     b{}[{}]: {}", c.index, row,
+                                 fmt::join(std::span{c.values}.subspan(
+                                               row, std::min<size_t>(8, count - row)),
+                                           " "));
+                }
             }
             ++post_log_draws;
         }
@@ -827,6 +859,14 @@ struct BbTemporalDlss::Impl {
                 next.saturation = std::clamp(float(std::atof(value.c_str())), 0.0f, 5.0f);
             else if (key == "picture_black")
                 next.black = std::clamp(float(std::atof(value.c_str())), 0.0f, 0.25f);
+            else if (key == "grade_exposure")
+                next.grade_exposure = std::clamp(float(std::atof(value.c_str())), 0.25f, 4.0f);
+            else if (key == "grade_gamma")
+                next.grade_gamma = std::clamp(float(std::atof(value.c_str())), 1.5f, 3.5f);
+            else if (key == "grade_colour")
+                next.grade_colour = std::clamp(float(std::atof(value.c_str())), 0.0f, 3.0f);
+            else if (key == "grade_bloom")
+                next.grade_bloom = std::clamp(float(std::atof(value.c_str())), 0.0f, 3.0f);
             else if (key == "character_motion")
                 next.character_motion = number != 0;
             else if (key == "upscaler")
@@ -845,6 +885,13 @@ struct BbTemporalDlss::Impl {
             }
         }
         tune = next;
+        grading.exposure.store(tune.grade_exposure, std::memory_order_relaxed);
+        grading.gamma.store(tune.grade_gamma, std::memory_order_relaxed);
+        grading.colour.store(tune.grade_colour, std::memory_order_relaxed);
+        grading.bloom.store(tune.grade_bloom, std::memory_order_relaxed);
+        grading.changed.store(tune.grade_exposure != 1.0f || tune.grade_gamma != 2.2f ||
+                                  tune.grade_colour != 1.0f || tune.grade_bloom != 1.0f,
+                              std::memory_order_relaxed);
         if (object_motion)
             object_motion->SetActive(tune.character_motion);
         FrameGen::SetEnabled(tune.frame_gen);
@@ -2834,18 +2881,47 @@ bool BbTemporalDlss::PostLogActive() const {
 void BbTemporalDlss::ObservePostConstants(u32 index, const void* data, u64 size) {
     if (!data || !size)
         return;
-    const u64 count = std::min<u64>(size / 4, 64);
-    std::string line = fmt::format("b{} ({} bytes):", index, size);
-    for (u64 i = 0; i < count; ++i) {
-        float value;
-        std::memcpy(&value, static_cast<const u8*>(data) + i * 4, 4);
-        line += fmt::format(" {}", value);
-    }
-    impl->post_log_constants.push_back(std::move(line));
+    std::vector<float> values(std::min<u64>(size / 4, 1024));
+    std::memcpy(values.data(), data, values.size() * 4);
+    impl->post_log_constants.push_back({index, size, std::move(values)});
 }
 
 void BbRequestPostLog() {
     post_log_request.store(true);
+}
+
+bool BbGradingWanted(u64 shader_hash, u32 buffer_index) {
+    return shader_hash == GradingShader && buffer_index == 0 &&
+           grading.changed.load(std::memory_order_relaxed) && !RenoDxLoaded();
+}
+
+void BbApplyGrading(u8* data, u64 size) {
+    // The dwords the grading shader reads (fs 5c02eaf8, decompiled): 616 the exposure into its
+    // curve 1 - e^(-light x exposure x [832]), 617 the bloom screen-blended over it, 840 to 851 a
+    // 3x4 colour matrix (rows 848, 844 and 840 give the target's blue, green and red: it holds
+    // BGR), 808 the display gamma's exponent (1 / 2.2).
+    if (size < 852 * sizeof(float))
+        return;
+    static std::once_flag logged;
+    std::call_once(logged, [] { LOG_INFO(Render_Vulkan, "[GRADING] The game's grading changed"); });
+    std::array<float, 852> f;
+    std::memcpy(f.data(), data, f.size() * sizeof(float));
+    f[616] *= grading.exposure.load(std::memory_order_relaxed);
+    f[617] *= grading.bloom.load(std::memory_order_relaxed);
+    f[808] *= grading.gamma.load(std::memory_order_relaxed) / 2.2f;
+    // Saturation after the game's own matrix: each output row moved towards the luminance
+    // row (Rec. 709 weights of the outputs blue, green and red).
+    const float colour = grading.colour.load(std::memory_order_relaxed);
+    constexpr std::array rows{848, 844, 840};
+    constexpr std::array weights{0.0722f, 0.7152f, 0.2126f};
+    std::array<float, 4> luma{};
+    for (size_t r = 0; r < rows.size(); ++r)
+        for (int k = 0; k < 4; ++k)
+            luma[k] += weights[r] * f[rows[r] + k];
+    for (const int row : rows)
+        for (int k = 0; k < 4; ++k)
+            f[row + k] = colour * f[row + k] + (1.0f - colour) * luma[k];
+    std::memcpy(data, f.data(), f.size() * sizeof(float));
 }
 
 void BbTemporalDlss::ObserveBlurInputs(const void* data, u64 size, u64 hash, u32 binding) {

@@ -59,6 +59,12 @@ void BbTemporalDlssReportGpu(std::string_view gpu);
 // F1 (Graphics, Picture): writes the next frame's post-processing to the log, from the game's
 // scene copy to its display copy: each pass's shaders, target and pixel shader constants.
 void BbRequestPostLog();
+// F1 (Graphics, The game's grading): the game's own tone mapping changed where it is made, in
+// the constants of its grading shader (vk_bb_temporal_dlss.cpp, GradingShader). True for that
+// shader's constant buffer while a setting differs from the game's.
+bool BbGradingWanted(u64 shader_hash, u32 buffer_index);
+// Changes those constants in place, after they were copied for the GPU.
+void BbApplyGrading(u8* data, u64 size);
 void BbTemporalDlssReportProblem(std::string_view problem);
 
 class BbTemporalDlss {

@@ -1287,9 +1287,10 @@ private:
         u8* dest;
         u64 offset;
         u64 size;
+        bool grading; ///< the game's grading constants, changed after the copy (BbApplyGrading)
     };
     static constexpr u64 CopyJobCount = 1ull << 16;
-    void RingCopy(VAddr guest, u8* dest, u64 offset, u64 size);
+    void RingCopy(VAddr guest, u8* dest, u64 offset, u64 size, bool grading);
     /// Hands the copy jobs made so far to the copy thread (before a packet that needs them).
     void PublishCopies();
     u64 copy_published_head{}; ///< stage A: copy_head as last published
