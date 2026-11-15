@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 IFreemz
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -24,14 +27,6 @@
 #undef __declspec
 #endif
 #include "video_core/renderer_vulkan/vk_bb_library.h"
-
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#pragma comment(lib, "version.lib")
-#endif
 
 namespace Vulkan {
 
@@ -61,31 +56,6 @@ bool FsrUpscaler::Present(Runtime runtime) {
     constexpr bool amd_fsr = false; // AMD ships the FSR SDK 2.x runtime for Windows only
 #endif
     return !disabled && (runtime == Runtime::AmdFsr ? amd_fsr : fsr31);
-}
-
-std::string FsrUpscaler::AmdFsrVersion() {
-#ifdef _WIN32
-    static const std::string version = []() -> std::string {
-        if (!Present(Runtime::AmdFsr))
-            return {};
-        const auto path = (AmdFsrDirectory() / "amd_fidelityfx_upscaler_vk.dll").wstring();
-        DWORD handle{};
-        const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
-        if (size == 0)
-            return {};
-        std::string data(size, '\0');
-        VS_FIXEDFILEINFO* info{};
-        UINT length{};
-        if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data()) ||
-            !VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &length) || !info)
-            return {};
-        return fmt::format("{}.{}.{}", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
-                           HIWORD(info->dwFileVersionLS));
-    }();
-    return version;
-#else
-    return {};
-#endif
 }
 
 #if defined(_WIN32) || defined(__linux__)
@@ -187,10 +157,64 @@ struct AmdFsrUpscaleVersionDesc {
 };
 constexpr ffxStructType_t AmdFsrUpscaleVersionType = 0x0001000bu;
 constexpr uint32_t AmdFsrUpscalerVersion = (4u << 22) | (1u << 12) | 2u;
+// FSR SDK 2.x's VkDeviceContext (ffx_api_vk.h), the device a version query is asked about.
+struct AmdFsrDeviceContext {
+    VkDevice device;
+    VkPhysicalDevice physical_device;
+    PFN_vkGetDeviceProcAddr device_proc_addr;
+};
+constexpr u32 AmdVendorId = 0x1002;
+
+// The newest FSR 4 version AMD's runtime offers on this GPU; empty when it offers none. The query
+// is asked about this device, the way the SDK's "Version selection" lists versions for a game's
+// options.
+std::string NewestFsr4(PfnFfxQuery query, vk::Device device, vk::PhysicalDevice physical) {
+    AmdFsrDeviceContext context{device, physical, DeviceProcAddr};
+    uint64_t count = 0;
+    ffxQueryDescGetVersions versions{};
+    versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    versions.device = &context;
+    versions.outputCount = &count;
+    if (query(nullptr, &versions.header) != FFX_API_RETURN_OK || count == 0)
+        return {};
+    std::vector<uint64_t> ids(count);
+    std::vector<const char*> names(count);
+    versions.versionIds = ids.data();
+    versions.versionNames = names.data();
+    if (query(nullptr, &versions.header) != FFX_API_RETURN_OK)
+        return {};
+    names.resize(std::min<size_t>(count, names.size()));
+    std::string offered, newest;
+    std::array<int, 3> newest_number{};
+    for (const char* name : names) {
+        if (!name)
+            continue;
+        const std::string_view text{name};
+        offered += offered.empty() ? std::string{text} : fmt::format(", {}", text);
+        std::array<int, 3> number{};
+        size_t at = text.find_first_of("0123456789");
+        for (int& part : number) {
+            if (at == std::string_view::npos || at >= text.size())
+                break;
+            std::from_chars(text.data() + at, text.data() + text.size(), part);
+            at = text.find('.', at);
+            at = at == std::string_view::npos ? at : at + 1;
+        }
+        if (number[0] >= 4 && number > newest_number) {
+            newest_number = number;
+            newest = fmt::format("{}.{}.{}", number[0], number[1], number[2]);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "[FSR] AMD FSR runtime's upscalers on this GPU: {}",
+             offered.empty() ? "none" : offered);
+    return newest;
+}
 } // namespace
 
 struct FsrUpscaler::Impl {
     Runtime runtime{};
+    std::string version; // AMD FSR: the FSR 4 version it runs on this GPU
     void* module{};
     PfnFfxCreateContext create{};
     PfnFfxDestroyContext destroy{};
@@ -233,9 +257,25 @@ std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance& instance, Runti
     }
     s.device = instance.GetDevice();
     s.physical = instance.GetPhysicalDevice();
+    if (runtime == Runtime::AmdFsr) {
+        // FSR 4.1 runs on some Radeon and Ryzen GPUs only; elsewhere it isn't offered at all.
+        if (s.physical.getProperties().vendorID == AmdVendorId)
+            s.version = NewestFsr4(s.query, s.device, s.physical);
+        if (s.version.empty()) {
+            LOG_INFO(Render_Vulkan, "[FSR] AMD FSR 4 does not run on this GPU; not offered");
+            BbLibrary::Free(s.module);
+            s.module = {};
+            return {};
+        }
+    }
     BbTemporalDlssReportGpu(s.physical.getProperties().deviceName.data());
-    LOG_INFO(Render_Vulkan, "[FSR] Ready ({})", name);
+    LOG_INFO(Render_Vulkan, "[FSR] Ready ({}{})", name,
+             s.version.empty() ? "" : fmt::format(", FSR {}", s.version));
     return fsr;
+}
+
+const std::string& FsrUpscaler::Version() const {
+    return impl->version;
 }
 
 FsrUpscaler::~FsrUpscaler() {
@@ -334,6 +374,10 @@ FsrUpscaler::FsrUpscaler() = default;
 FsrUpscaler::~FsrUpscaler() = default;
 std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance&, Runtime) {
     return {};
+}
+const std::string& FsrUpscaler::Version() const {
+    static const std::string none;
+    return none;
 }
 bool FsrUpscaler::HasContext(const ContextDesc&) const {
     return false;

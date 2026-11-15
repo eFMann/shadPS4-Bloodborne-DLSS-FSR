@@ -53,8 +53,9 @@ Both rendered at 1280x720; open them full size to compare.
 - FSR 3.1 and FSR frame generation: any GPU that runs shadPS4
 - FSR 4 add-on (optional): a GPU with INT8 dot products and compute shader derivatives, such as
   a Radeon RX 6000 or newer, an RTX card or an Intel Arc card
-- AMD FSR 4.1 (optional, Windows): a Radeon RX 9000 series card (RDNA 4; older Radeons are
-  untested) and a current Adrenalin driver
+- AMD FSR 4.1 (optional, Windows): a GPU AMD runs it on: per the FSR SDK 2.4 notes Radeon
+  RX 6000, 7000 and 9000 cards and some Ryzen AI processors' graphics (tested on RX 9000 only),
+  and a current Adrenalin driver. F1 lists it only on those
 
 ## Install
 
@@ -118,8 +119,9 @@ the first release that runs it on Vulkan. Windows only.
    `shadPS4.exe`, so its `amd_fsr` folder sits beside it. Or make that folder yourself and copy
    `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` into it from the SDK's
    [`Kits/FidelityFX/signedbin`](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin).
-2. Start the game and pick *FSR 4.1.2 (AMD)* in F1 (the version comes from the DLL), or set
-   `upscaler=amdfsr` in `dlss.ini`. *Automatic* does not pick it.
+2. Start the game and pick *FSR 4.1.2 (AMD)* in F1, or set `upscaler=amdfsr` in `dlss.ini`.
+   *Automatic* does not pick it. F1 lists it only when AMD's runtime offers FSR 4 on your GPU
+   (the version is the one it offers); the log lists what it offers (search for `[FSR]`).
 
 Delete the folder to remove it. FSR 3.1 and the FSR 4 add-on are unaffected. Tested on a
 Radeon RX 9070 XT (driver 26.10.1), 2560x1440 to 3840x2160.
@@ -397,9 +399,9 @@ F1 shows why upscaling isn't running.
 - **"FSR 4 needs the FSR 4 add-on" / "FSR 4 could not start"**: check the `fsr4` folder is next
   to `shadPS4.exe` with all its files and that your GPU meets the requirements. The log says why
   (search for `[FSR4]`).
-- **"AMD FSR needs the amd_fsr folder" / "AMD FSR could not be loaded"**: check `amd_fsr` next
-  to `shadPS4.exe` holds both DLLs from the same SDK release. The log says why (search for
-  `[FSR]`).
+- **AMD FSR isn't in F1's upscaler list**: AMD's runtime doesn't offer FSR 4 on your GPU, or
+  `amd_fsr` next to `shadPS4.exe` doesn't hold both DLLs from the same SDK release. The log says
+  which (search for `[FSR]`).
 - **Crash at boot after a "Config Migration" prompt**: you copied the files into a build that
   uses `config.toml` (ShadLix and other forks). This release and newer carry the extra dmem over;
   otherwise set it again (`"extra_dmem_in_mbytes": 8000` under `"General"` in

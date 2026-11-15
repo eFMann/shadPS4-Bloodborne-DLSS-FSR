@@ -29,11 +29,11 @@ public:
     };
     // True when the runtime's loader DLL is present and FSR is not disabled.
     static bool Present(Runtime runtime = Runtime::Fsr31);
-    // Null when the DLL cannot be loaded.
+    // Null when the DLL cannot be loaded, and for AmdFsr when it offers no FSR 4 on this GPU.
     static std::unique_ptr<FsrUpscaler> Create(const Instance& instance,
                                                Runtime runtime = Runtime::Fsr31);
-    // The version of the AMD FSR runtime's upscaler DLL, e.g. "4.1.2"; empty when not present.
-    static std::string AmdFsrVersion();
+    // AmdFsr: the FSR 4 version it runs on this GPU, e.g. "4.1.2". Empty for Fsr31.
+    const std::string& Version() const;
     // The vkGetDeviceProcAddr the FidelityFX backend gets (PFN_vkGetDeviceProcAddr), with
     // stand-ins for functions it calls that the device may lack.
     static void* FfxDeviceProcAddr();

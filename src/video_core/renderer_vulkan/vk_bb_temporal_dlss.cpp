@@ -61,15 +61,11 @@ std::filesystem::path BbDlssSettingsPath() {
 }
 
 namespace {
-std::string AmdFsrLabel() {
-    if (!FsrUpscaler::Present(FsrUpscaler::Runtime::AmdFsr))
-        return {};
-    const auto version = FsrUpscaler::AmdFsrVersion();
-    return version.empty() ? "FSR (AMD)" : fmt::format("FSR {} (AMD)", version);
-}
-
 std::mutex status_mutex;
 BbDlssStatus status;
+// AMD FSR's F1 name, e.g. "FSR 4.1.2 (AMD)"; empty until AMD's runtime offered FSR 4 on this GPU.
+// Written on the GPU command thread under status_mutex, which other threads read it under.
+std::string amd_fsr_label;
 std::string ngx_problem;
 std::chrono::steady_clock::time_point last_evaluation;
 
@@ -107,7 +103,7 @@ BbDlssStatus BbTemporalDlssStatus() {
     copy.active = std::chrono::steady_clock::now() - last_evaluation < std::chrono::seconds{1};
     copy.dlss_problem = ngx_problem;
     copy.fsr4_installed = Fsr4Addon::Present();
-    copy.amd_fsr_label = AmdFsrLabel();
+    copy.amd_fsr_label = amd_fsr_label;
     if (!BbTemporalDlssRequested())
         copy.reason =
             "No upscaler files were found next to " BB_LIBRARY_NAME("shadPS4.exe", "shadps4") ".";
@@ -499,11 +495,10 @@ struct Tune {
 
 enum class Backend { None, Dlss, Fsr, Fsr4, AmdFsr };
 
-const char* BackendName(Backend backend) {
-    static const std::string amd_fsr = AmdFsrLabel();
+std::string BackendName(Backend backend) {
     return backend == Backend::Dlss     ? "DLSS"
            : backend == Backend::Fsr4   ? "FSR 4"
-           : backend == Backend::AmdFsr ? amd_fsr.c_str()
+           : backend == Backend::AmdFsr ? amd_fsr_label
                                         : "FSR 3.1";
 }
 } // namespace
@@ -1025,9 +1020,16 @@ struct BbTemporalDlss::Impl {
             if (!amd_fsr && !amd_fsr_tried) {
                 amd_fsr_tried = true;
                 amd_fsr = FsrUpscaler::Create(instance, FsrUpscaler::Runtime::AmdFsr);
+                if (amd_fsr) {
+                    std::scoped_lock lock{status_mutex};
+                    amd_fsr_label = fmt::format("FSR {} (AMD)", amd_fsr->Version());
+                }
             }
             return amd_fsr != nullptr;
         };
+        // F1 lists AMD FSR only once its runtime offered FSR 4 on this GPU: asked at the start.
+        if (FsrUpscaler::Present(FsrUpscaler::Runtime::AmdFsr))
+            amd_fsr_ready();
         const auto fsr4_ready = [&] {
             if (rejected_size)
                 return false;
@@ -1072,8 +1074,9 @@ struct BbTemporalDlss::Impl {
             return no_fsr;
         if (tune.upscaler == 4)
             return FsrUpscaler::Present(FsrUpscaler::Runtime::AmdFsr)
-                       ? "AMD FSR could not be loaded (see the log; the amd_fsr folder needs "
-                         "amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll)."
+                       ? "AMD FSR 4 does not run on this GPU, or could not be loaded (see the "
+                         "log; the amd_fsr folder needs amd_fidelityfx_loader_vk.dll and "
+                         "amd_fidelityfx_upscaler_vk.dll)."
                        : "AMD FSR needs the amd_fsr folder next to shadPS4.exe (Windows only).";
         if (tune.upscaler == 3) {
             if (fsr4_rejected_size)
