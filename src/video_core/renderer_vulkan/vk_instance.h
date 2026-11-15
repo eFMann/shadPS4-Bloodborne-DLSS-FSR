@@ -24,6 +24,8 @@ VK_DEFINE_HANDLE(VmaPool)
 
 namespace Vulkan {
 
+class BbNeuralRendering;
+
 class Instance {
 public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
@@ -34,6 +36,11 @@ public:
     /// Optional DLSS context; null when shadps4_dlss.dll is absent.
     DlssNgx* GetDlssNgx() const {
         return dlss_ngx.get();
+    }
+
+    /// Optional DLSS 5 neural rendering; null when its add-on is absent or did not start.
+    BbNeuralRendering* GetNeuralRendering() const {
+        return neural_rendering.get();
     }
 
     /// Returns a formatted string for the driver version
@@ -589,6 +596,8 @@ private:
     vk::SurfaceKHR presentation_probe;
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;
+    // After the device, so it goes first: its session waits for the device to be idle.
+    std::unique_ptr<BbNeuralRendering> neural_rendering;
     vk::PhysicalDeviceProperties properties;
     vk::PhysicalDeviceMemoryProperties memory_properties;
     vk::PhysicalDeviceVulkan11Properties vk11_props;

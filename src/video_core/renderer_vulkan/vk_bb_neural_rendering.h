@@ -1,0 +1,67 @@
+// SPDX-FileCopyrightText: Copyright 2026 Robert Bopko
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "common/types.h"
+#include "video_core/renderer_vulkan/vk_common.h"
+
+#include "../../../dlssnr_addon/shadps4_nr.h"
+
+namespace Vulkan {
+
+// Optional DLSS 5 neural rendering: the first installed backend of the list in the .cpp, a
+// shadps4_nr.dll (dlssnr_addon/shadps4_nr.h) in its own folder next to the executable, today
+// dlssnr-amd with the model mochizuki0323's DLSSNR-AMD installer extracts. It runs the network on
+// shadPS4's device, so the device is created through it; with no backend installed nothing about
+// the device changes.
+class BbNeuralRendering {
+public:
+    // A backend's files are present and SHADPS4_NR is not "0"; Windows only.
+    static bool Present();
+    // The loaded backend's installed networks, in the order automatic tries them; empty until
+    // Load has run.
+    static const std::vector<std::string>& Networks();
+    // name's index in Networks() (case does not matter); -1 for automatic or an unknown name.
+    static int NetworkIndex(std::string_view name);
+    // Null when the backend cannot be loaded or speaks another ABI version.
+    static std::unique_ptr<BbNeuralRendering> Load();
+    ~BbNeuralRendering();
+
+    // upscaler: a SHADNR_BEFORE_* bit.
+    bool RunsBefore(u32 upscaler) const {
+        return (info.upscalers & upscaler) != 0;
+    }
+
+    vk::ResultValue<vk::UniqueDevice> CreateDevice(vk::PhysicalDevice physical,
+                                                   const vk::DeviceCreateInfo& info);
+    bool Init(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device,
+              u32 queue_family);
+    // False: the network failed; the caller stops using the add-on.
+    bool Evaluate(vk::CommandBuffer command, const ShadNrFrame& frame,
+                  const ShadNrSettings& settings);
+    ShadNrStatus Status() const;
+
+private:
+    BbNeuralRendering() = default;
+    struct Api {
+        decltype(&shadps4_nr_abi_version) abi_version;
+        decltype(&shadps4_nr_info) info;
+        decltype(&shadps4_nr_create_device) create_device;
+        decltype(&shadps4_nr_init) init;
+        decltype(&shadps4_nr_evaluate) evaluate;
+        decltype(&shadps4_nr_status) status;
+        decltype(&shadps4_nr_shutdown) shutdown;
+    };
+    void* module{};
+    Api api{};
+    ShadNrInfo info{};
+    bool device_made{};
+};
+
+} // namespace Vulkan

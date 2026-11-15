@@ -1,0 +1,113 @@
+SPDX-FileCopyrightText: Copyright 2026 Robert Bopko
+SPDX-License-Identifier: MIT
+
+DLSSNR-AMD v0.0.8.2, ACO Mode on a device with VK_EXT_vertex_input_dynamic_state (shadPS4's, and any
+emulator's or DXVK's with graphics pipeline libraries): AMD's driver then keeps user-data entry 1 for
+its uber-fetch buffer in every compact pipeline layout, so the push constants start at entry 2, not 1,
+and the network's ACO pipelines were refused as "unsupported XGL user-data layout" (seen in the PAL
+metadata of a captured pipeline: .user_data_limit 8 for 20 push bytes, entry 1 unused). splice now
+reads where the push constants start from the captured pipeline and maps them, the spill-table loads
+and the push pointer from there. Applied by build.sh.
+
+--- a/windows/src/core/nr_pal_binary.hpp
++++ b/windows/src/core/nr_pal_binary.hpp
+@@ -162,15 +162,16 @@
+     std::vector<uint64_t> map=std::vector<uint64_t>(32,0xffffffff);
+     std::vector<std::pair<int,int>> moves,loads;
+     unsigned user=0;int spill=-1,grid=-1;
+-    explicit Arguments(const Record& r,unsigned descriptor_slot=33) {
++    // push_base: the user-data entry of the first push-constant dword (see splice).
++    explicit Arguments(const Record& r,unsigned descriptor_slot=33,unsigned push_base=1) {
+         map[0]=0x10000000;map[1]=descriptor_slot;user=2;moves.emplace_back(r.set0,1);
+         unsigned extra=(r.grid>=0?2:0)+(r.push>=0?1:0);
+         bool spill_needed=r.push>=0 || user+r.inlines.size()+extra>16;
+         // A spill slot replaces the push-pointer slot, or one inline slot.
+         unsigned limit=16-(r.grid>=0?2:0)-(spill_needed?1:0);
+         for(auto [dst,dw]:r.inlines) {
+-            if(user<limit) {map[user]=dw+1;moves.emplace_back(dst,int(user++));}
+-            else loads.emplace_back(dst,4*(dw+1));
++            if(user<limit) {map[user]=dw+push_base;moves.emplace_back(dst,int(user++));}
++            else loads.emplace_back(dst,4*(dw+push_base));
+         }
+         if(spill_needed) {spill=int(user);map[user++]=0x10000002;}
+         if(r.grid>=0) {grid=int(user);map[user]=0x10000006;user+=2;}
+@@ -190,8 +191,8 @@
+ 
+ // Incoming pointers are saved before argument copies; the body keeps its
+ // relative branch offsets and uses m0 for the 32-bit address high word.
+-inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t mach = 0x4e) {
+-    Bytes b;Arguments a(r,descriptor_slot);
++inline Bytes prologue(const Record& r, unsigned descriptor_slot = 33, uint32_t mach = 0x4e, unsigned push_base = 1) {
++    Bytes b;Arguments a(r,descriptor_slot,push_base);
+     auto mov=[&](unsigned dst,unsigned src){word(b,0xbe800000|(dst<<16)|src);};
+     if(a.spill>=0)mov(96,a.spill);
+     if(a.grid>=0) {mov(100,a.grid);mov(101,a.grid+1);}
+@@ -228,7 +229,7 @@
+         }
+     }
+     for(auto [reg,offset]:a.loads)ld(reg,96,offset);
+-    if(r.push>=0) {word(b,0x80000000|(uint32_t(r.push)<<16)|(0x84<<8)|96);word(b,0xbf800002);}
++    if(r.push>=0) {word(b,0x80000000|(uint32_t(r.push)<<16)|((0x80+4*push_base)<<8)|96);word(b,0xbf800002);}
+     if(r.grid>=0)for(unsigned j=0;j<3;++j)ld(r.grid+j,100,j*4);
+     // The wait before the first use of the loaded arguments. gfx12 has the split waits
+     // (s_wait_kmcnt 0); gfx11 has the classic one (s_waitcnt lgkmcnt(0)). The gfx12 word is
+@@ -290,10 +291,26 @@
+         for(const auto& s:sections) {size_t p=out.size();out.resize(p+64);write(out,p,s);}return out;
+     }
+ };
++// The captured pipeline's .user_data_limit, from its PAL metadata note.
++inline uint64_t user_data_limit(const Bytes& src) {
++    size_t pos=0;
++    while(pos<src.size()) {
++        range(src,pos,12);
++        auto ns=read<uint32_t>(src,pos),ds=read<uint32_t>(src,pos+4),type=read<uint32_t>(src,pos+8);
++        pos+=12;range(src,pos,(uint64_t(ns)+3)&~uint64_t(3));pos+=(uint64_t(ns)+3)&~uint64_t(3);
++        range(src,pos,(uint64_t(ds)+3)&~uint64_t(3));
++        if(type==32) {
++            auto m=unpack(Bytes(src.begin()+pos,src.begin()+pos+ds));
++            auto& ps=m.at("amdpal.pipelines");require(ps.kind==Value::Array && ps.items.size()==1,"PAL pipeline count");
++            return ps.items[0].at(".user_data_limit").number();
++        }
++        pos+=(uint64_t(ds)+3)&~uint64_t(3);
++    }
++    throw std::runtime_error("PAL metadata note missing");
++}
+ inline Bytes splice(const Bytes& binary,const Record& r,unsigned push_bytes=128,
+                     std::array<uint32_t,3> workgroup={0,0,0}) {
+     require(push_bytes<=128 && push_bytes%4==0 && r.push_bytes<=push_bytes,"unsupported pipeline push range");
+-    const unsigned descriptor_slot=push_bytes/4+1;
+     Elf e(binary);
+     if(r.mach!=0) {
+         bool compatible = (r.mach == e.mach) ||
+@@ -302,6 +319,13 @@
+         require(compatible, "record target architecture mismatch");
+     }
+     auto text=e.find(".text"),note=e.find(".note"),sym=e.find(".symtab");
++    // XGL's compact layout: entry 0 its vertex-buffer table, then one uber-fetch entry when the device enables
++    // VK_EXT_vertex_input_dynamic_state or graphics pipeline libraries (as emulators and DXVK do), then the push
++    // constants, then set 0's pointer, the last entry.
++    const uint64_t limit=user_data_limit(e.data[note]);
++    require(limit==push_bytes/4+2 || limit==push_bytes/4+3,"unsupported XGL user-data layout");
++    const unsigned push_base=unsigned(limit)-1-push_bytes/4;
++    const unsigned descriptor_slot=push_bytes/4+push_base;
+     require(e.sections[text].align==256 && e.sections[text].addr==0,"PAL entry alignment");
+     // Exactly one compute entry, no relocations, no secondary functions/data.
+     const auto& sy=e.sections[sym];require(sy.entsize==24 && sy.link<e.data.size() && e.data[sym].size()%24==0,"ELF symbols");
+@@ -319,7 +343,7 @@
+         ++found;
+     }
+     require(found==1,"PAL compute entry count");
+-    auto pre=prologue(r,descriptor_slot,e.mach);
++    auto pre=prologue(r,descriptor_slot,e.mach,push_base);
+     write(e.data[sym],cs_sym_pos+16,uint64_t(pre.size()+r.exec));
+     e.data[text]=pre;
+     e.data[text].insert(e.data[text].end(),r.code.begin(),r.code.end());
+@@ -351,7 +375,7 @@
+         auto& map=cs.at(".user_data_reg_map");require(map.kind==Value::Array && map.items.size()==32 &&
+                 map.items[0].number()==0x10000000,"PAL global table ABI");
+         for(const auto& v:map.items) {auto x=v.number();require(x<=descriptor_slot || x==0xffffffff || x==0x10000000 || x==0x10000002 || x==0x10000006,"unhandled PAL user-data mapping");}
+-        Arguments a(r,descriptor_slot);map.items.clear();for(auto x:a.map)map.items.emplace_back(x);
++        Arguments a(r,descriptor_slot,push_base);map.items.clear();for(auto x:a.map)map.items.emplace_back(x);
+         p.set(".spill_threshold",Value(a.spill>=0?1:65535));
+         cs.set(".shader_spill_threshold",Value(a.spill>=0?1:65535));
+         cs.set(".user_sgprs",Value(a.user));

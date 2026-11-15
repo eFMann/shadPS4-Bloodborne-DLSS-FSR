@@ -40,6 +40,8 @@
 #include "input/input_mouse.h"
 #include "video_core/renderer_vulkan/vk_bb_dlss5.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_bb_neural_rendering.h"
+#include "video_core/renderer_vulkan/vk_bb_nr_settings.h"
 #include "video_core/renderer_vulkan/vk_bb_perf_meter.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
@@ -1135,6 +1137,42 @@ void DlssLayer::DrawWindow() {
         float sharpness = float(std::atof(settings.Get("sharpness", "0.6").c_str()));
         if (SliderFloat("Sharpness", &sharpness, 0.0f, 1.0f, "%.2f"))
             settings.Set("sharpness", fmt::format("{:.2f}", sharpness));
+
+        if (status.nr_installed) {
+            SeparatorText("DLSS 5 NR");
+            bool nr = settings.Get("nr", "0") != "0";
+            if (Checkbox("Neural rendering", &nr))
+                settings.Set("nr", nr ? "1" : "0");
+            Vulkan::BbNrSettings nr_settings;
+            for (const char* key : {"nr_network", "nr_scale", "nr_intensity"})
+                Vulkan::ParseBbNrSetting(key, settings.Get(key, ""), nr_settings);
+            // The backend's installed networks, as it names them.
+            const auto& networks = Vulkan::BbNeuralRendering::Networks();
+            const int network = Vulkan::BbNeuralRendering::NetworkIndex(nr_settings.network);
+            if (BeginCombo("Network", network < 0 ? "Automatic" : networks[network].c_str())) {
+                if (Selectable("Automatic", network < 0))
+                    settings.Set("nr_network", "auto");
+                for (int i = 0; i < int(networks.size()); ++i)
+                    if (Selectable(networks[i].c_str(), i == network))
+                        settings.Set("nr_network", networks[i]);
+                EndCombo();
+            }
+            float nr_scale = nr_settings.scale;
+            if (SliderFloat("Network resolution", &nr_scale, Vulkan::BbNrScaleMin,
+                            Vulkan::BbNrScaleMax, "%.2f", ImGuiSliderFlags_AlwaysClamp))
+                settings.Set("nr_scale", fmt::format("{:.2f}", nr_scale));
+            float nr_intensity = nr_settings.intensity;
+            if (SliderFloat("Intensity", &nr_intensity, 0.0f, Vulkan::BbNrIntensityMax, "%.2f",
+                            ImGuiSliderFlags_AlwaysClamp))
+                settings.Set("nr_intensity", fmt::format("{:.2f}", nr_intensity));
+            // Wrapped: the add-on's messages run longer than the window is wide.
+            if (!status.nr_state.empty()) {
+                PushStyleColor(ImGuiCol_Text, GetStyleColorVec4(ImGuiCol_TextDisabled));
+                TextWrapped("%s", status.nr_state.c_str());
+                PopStyleColor();
+            }
+            Separator();
+        }
 
         if (Vulkan::RenoDxLoaded()) {
             bool hdr_compat = settings.Get("hdr_mod_compat", "1") != "0";
