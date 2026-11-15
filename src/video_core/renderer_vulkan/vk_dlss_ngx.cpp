@@ -119,8 +119,16 @@ DlssNgx::DlssNgx() : impl{std::make_unique<Impl>()} {
     impl->module = BbLibrary::Load(directory / BridgeName);
     const auto get_api = BbLibrary::Find<ShadDlssGetApiFn>(impl->module, "ShadDlssGetApi");
     impl->api = get_api ? get_api() : nullptr;
+    if (!impl->module) {
+        impl->Disable(fmt::format("{} could not be loaded", BridgeName));
+        return;
+    }
     if (!impl->api || impl->api->abi != SHADPS4_DLSS_BRIDGE_ABI) {
-        impl->Disable(fmt::format("{} is missing or from a different version", BridgeName));
+        impl->Disable(fmt::format("{} is version {}, this shadPS4 needs version {}: copy the one "
+                                  "built with it",
+                                  BridgeName, impl->api ? impl->api->abi : 0u,
+                                  SHADPS4_DLSS_BRIDGE_ABI));
+        impl->api = nullptr;
         return;
     }
     const auto data = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "dlss";
@@ -310,6 +318,43 @@ void DlssNgx::FrameGenReleaseAfterGpuDrain() {
         impl->api->FrameGenRelease();
 }
 
+bool DlssNgx::NeuralInitialize(std::string& problem) {
+    if (!impl->available) {
+        problem = "DLSS is not running on this GPU";
+        return false;
+    }
+    std::array<char, 256> text{};
+    const bool ready = impl->api->NrInitialize(text.data(), u32(text.size())) != 0;
+    problem = text.data();
+    return ready;
+}
+
+bool DlssNgx::NeuralCreate(vk::CommandBuffer command, const NeuralDesc& desc) {
+    if (!impl->available)
+        return false;
+    const ShadDlssNrFeature feature{desc.width,      desc.height,         desc.preset,
+                                    desc.style,      desc.intensity,      desc.local_structure,
+                                    desc.local_tone, desc.skin_structure, desc.auto_mask ? 1 : 0,
+                                    desc.passes};
+    return impl->api->NrCreate(command, &feature) != 0;
+}
+
+bool DlssNgx::NeuralEvaluate(vk::CommandBuffer command, const Resource& color,
+                             const Resource& depth, const Resource& motion, const Resource& output,
+                             bool depth_inverted, bool reset, u32 pass) {
+    if (!impl->available)
+        return false;
+    const ShadDlssNrEvaluate evaluate{Image(color),  Image(depth),           Image(motion),
+                                      Image(output), depth_inverted ? 1 : 0, reset ? 1 : 0,
+                                      pass};
+    return impl->api->NrEvaluate(command, &evaluate) != 0;
+}
+
+void DlssNgx::NeuralReleaseAfterGpuDrain() {
+    if (impl->api)
+        impl->api->NrRelease();
+}
+
 void DlssNgx::Shutdown() {
     impl->available = false;
     impl->feature.reset();
@@ -357,6 +402,18 @@ bool DlssNgx::FrameGenEvaluate(vk::CommandBuffer, const Resource&, const Resourc
     return false;
 }
 void DlssNgx::FrameGenReleaseAfterGpuDrain() {}
+bool DlssNgx::NeuralInitialize(std::string& problem) {
+    problem = "DLSS 5 is Windows only";
+    return false;
+}
+bool DlssNgx::NeuralCreate(vk::CommandBuffer, const NeuralDesc&) {
+    return false;
+}
+bool DlssNgx::NeuralEvaluate(vk::CommandBuffer, const Resource&, const Resource&, const Resource&,
+                             const Resource&, bool, bool, u32) {
+    return false;
+}
+void DlssNgx::NeuralReleaseAfterGpuDrain() {}
 
 #endif
 

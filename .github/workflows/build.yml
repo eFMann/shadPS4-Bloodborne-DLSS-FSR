@@ -278,7 +278,7 @@ jobs:
         $addon = "shadPS4-Bloodborne-FSR4-addon-win64-$label$suffix"
         $amdfsr = "shadPS4-Bloodborne-AMD-FSR-win64-$label$suffix"
         New-Item -ItemType Directory -Force pkg/main/LICENSES, pkg/addon/fsr4, pkg/amdfsr/amd_fsr | Out-Null
-        Copy-Item build/shadPS4.exe, build-dlss/shadps4_dlss.dll pkg/main/
+        Copy-Item build/shadPS4.exe, build-dlss/shadps4_dlss.dll, build-dlss/shadps4_dlss5_nvngx.dll pkg/main/
         Copy-Item sdk/dlss/lib/Windows_x86_64/rel/nvngx_dlss.dll pkg/main/
         Copy-Item sdk/ffx/PrebuiltSignedDLL/amd_fidelityfx_vk.dll pkg/main/
         foreach ($dll in "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll") {

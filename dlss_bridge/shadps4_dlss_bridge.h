@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define SHADPS4_DLSS_BRIDGE_ABI 3
+#define SHADPS4_DLSS_BRIDGE_ABI 5
 
 typedef void (*ShadDlssLogFn)(int warning, const char* message);
 
@@ -89,6 +89,33 @@ typedef struct ShadDlssgEvaluate {
     uint32_t multi_frame_index; // 1 .. multi_frame_count
 } ShadDlssgEvaluate;
 
+// DLSS 5 (Neural Rendering, NGX feature 18), Windows only. Its model, nvngx_dlssnr.dll, is not
+// shipped: the player puts it next to shadPS4.exe. It only accepts calls from a library whose path
+// contains "nvngx.dll", so they go through shadps4_dlss5_nvngx.dll, which does nothing else.
+// Everything it reads at creation is fixed until the feature is made again.
+typedef struct ShadDlssNrFeature {
+    uint32_t width; // colour and output, the size the model runs at
+    uint32_t height;
+    uint32_t preset;
+    uint32_t style;
+    float intensity;
+    float local_structure;
+    float local_tone;
+    float skin_structure;
+    int32_t auto_mask;
+    uint32_t passes; // 1 to 4: a model of its own for each, so each keeps its own history
+} ShadDlssNrFeature;
+
+typedef struct ShadDlssNrEvaluate {
+    ShadDlssImage color;  // general layout, display-encoded 0..1
+    ShadDlssImage depth;  // sampled, hardware depth (render size)
+    ShadDlssImage motion; // sampled, render pixels, current to previous
+    ShadDlssImage output; // storage, general layout, the colour's size
+    int32_t depth_inverted;
+    int32_t reset;
+    uint32_t pass; // 0 .. passes - 1
+} ShadDlssNrEvaluate;
+
 typedef struct ShadDlssApi {
     uint32_t abi;
     // Directories are UTF-16 paths: where nvngx_dlss.dll lives, and a writable data directory.
@@ -114,6 +141,13 @@ typedef struct ShadDlssApi {
     int32_t (*FrameGenEvaluate)(VkCommandBuffer command, const ShadDlssgEvaluate* evaluate);
     // The caller must have drained the GPU.
     void (*FrameGenRelease)(void);
+    // DLSS 5 after Initialize: 1 when the model and its loader are next to the bridge and the
+    // model started on this device. `problem` (may be null) gets why not, in plain words.
+    int32_t (*NrInitialize)(char* problem, uint32_t problem_size);
+    int32_t (*NrCreate)(VkCommandBuffer command, const ShadDlssNrFeature* feature);
+    int32_t (*NrEvaluate)(VkCommandBuffer command, const ShadDlssNrEvaluate* evaluate);
+    // The caller must have drained the GPU.
+    void (*NrRelease)(void);
 } ShadDlssApi;
 
 typedef const ShadDlssApi* (*ShadDlssGetApiFn)(void);

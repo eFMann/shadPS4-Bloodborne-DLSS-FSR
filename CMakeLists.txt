@@ -1245,6 +1245,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
                src/video_core/renderer_vulkan/vk_bb_frame_gen.cpp
+               src/video_core/renderer_vulkan/vk_bb_dlss5.cpp
+               src/video_core/renderer_vulkan/vk_bb_dlss5.h
                src/video_core/renderer_vulkan/vk_bb_library.cpp
                src/video_core/renderer_vulkan/vk_bb_library.h
                src/video_core/renderer_vulkan/vk_bb_frame_gen.h

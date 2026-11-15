@@ -80,6 +80,25 @@ public:
                           std::array<float, 2> mvec_scale, bool reset, u32 count, u32 index);
     void FrameGenReleaseAfterGpuDrain();
 
+    // DLSS 5 (Neural Rendering), Windows only: its model, nvngx_dlssnr.dll, is the player's own.
+    // Started once; false (and `problem` saying why) when it can't run.
+    bool NeuralInitialize(std::string& problem);
+    struct NeuralDesc {
+        u32 width, height;
+        u32 preset, style;
+        float intensity, local_structure, local_tone, skin_structure;
+        bool auto_mask;
+        u32 passes; // 1 to 4, a model each
+        bool operator==(const NeuralDesc&) const = default;
+    };
+    // Releases an existing feature first; the caller must have drained the GPU if one exists.
+    bool NeuralCreate(vk::CommandBuffer command, const NeuralDesc& desc);
+    // `color` in the general layout, display-encoded 0..1; `output` the same size.
+    bool NeuralEvaluate(vk::CommandBuffer command, const Resource& color, const Resource& depth,
+                        const Resource& motion, const Resource& output, bool depth_inverted,
+                        bool reset, u32 pass);
+    void NeuralReleaseAfterGpuDrain();
+
 private:
     DlssNgx();
     struct Impl;

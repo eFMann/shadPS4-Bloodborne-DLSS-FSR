@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: Copyright 2026 IFreemz
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 460
+// Picture tuning before the HUD, in linear light: brightness, contrast around mid grey, a black
+// level that takes the grey lift out of the shadows, and saturation in OkLab (Bjorn Ottosson's
+// colour space) that raises dull colours more than vivid ones.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) uniform image2D scene;
+
+layout(push_constant) uniform Push {
+    uint encoding; // 0 sRGB-encoded 0..1, 1 linear 0..1, 2 linear c / (1 + max), 3 HDR
+    float brightness;
+    float contrast;
+    float saturation;
+    float black; // display-encoded level that becomes black
+} pc;
+
+vec3 SrgbToLinear(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+
+vec3 LinearToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+
+float MaxOf(vec3 c) {
+    return max(c.r, max(c.g, c.b));
+}
+
+vec3 ToLight(vec3 c) {
+    if (pc.encoding == 0u)
+        return SrgbToLinear(c);
+    if (pc.encoding == 2u)
+        return max(c, 0.0) / max(1.0 - min(MaxOf(c), 0.999), 1e-3);
+    return max(c, 0.0);
+}
+
+vec3 FromLight(vec3 c) {
+    c = max(c, 0.0);
+    if (pc.encoding == 0u)
+        return LinearToSrgb(c);
+    if (pc.encoding == 1u)
+        return min(c, 1.0);
+    if (pc.encoding == 2u)
+        return c / (1.0 + MaxOf(c));
+    return c;
+}
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 ToOklab(vec3 c) {
+    const vec3 lms = vec3(dot(c, vec3(0.4122214708, 0.5363325363, 0.0514459929)),
+                          dot(c, vec3(0.2119034982, 0.6806995451, 0.1073969566)),
+                          dot(c, vec3(0.0883024619, 0.2817188376, 0.6299787005)));
+    const vec3 l = sign(lms) * pow(abs(lms), vec3(1.0 / 3.0));
+    return vec3(dot(l, vec3(0.2104542553, 0.7936177850, -0.0040720468)),
+                dot(l, vec3(1.9779984951, -2.4285922050, 0.4505937099)),
+                dot(l, vec3(0.0259040371, 0.7827717662, -0.8086757660)));
+}
+
+vec3 FromOklab(vec3 c) {
+    const vec3 l = vec3(dot(c, vec3(1.0, 0.3963377774, 0.2158037573)),
+                        dot(c, vec3(1.0, -0.1055613458, -0.0638541728)),
+                        dot(c, vec3(1.0, -0.0894841775, -1.2914855480)));
+    const vec3 lms = l * l * l;
+    return vec3(dot(lms, vec3(4.0767416621, -3.3077115913, 0.2309699292)),
+                dot(lms, vec3(-1.2684380046, 2.6097574011, -0.3413193965)),
+                dot(lms, vec3(-0.0041960863, -0.7034186147, 1.7076147010)));
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(scene))))
+        return;
+    const vec4 original = imageLoad(scene, pixel);
+    vec3 light = ToLight(original.rgb) * pc.brightness;
+    float luma = Luma(light);
+    if (luma > 1e-6) {
+        float graded = 0.18 * pow(luma / 0.18, pc.contrast);
+        if (pc.black > 0.0 && graded < 1.0) {
+            const float shown = LinearToSrgb(vec3(graded)).r;
+            graded = SrgbToLinear(vec3(max(shown - pc.black, 0.0) / (1.0 - pc.black))).r;
+        }
+        light *= graded / luma;
+    }
+    if (pc.saturation != 1.0) {
+        vec3 lab = ToOklab(light);
+        const float chroma = length(lab.yz);
+        // Above 1, colours already near full strength (OkLab chroma about 0.25) gain less.
+        const float gain = pc.saturation > 1.0
+                               ? 1.0 + (pc.saturation - 1.0) * (1.0 - smoothstep(0.0, 0.25, chroma))
+                               : pc.saturation;
+        lab.yz *= gain;
+        light = max(FromOklab(lab), 0.0);
+    }
+    imageStore(scene, pixel, vec4(FromLight(light), original.a));
+}

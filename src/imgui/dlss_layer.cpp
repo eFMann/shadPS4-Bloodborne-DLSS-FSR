@@ -8,8 +8,11 @@
 #include <filesystem>
 #include <fstream>
 #include <regex>
+#include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -35,6 +38,7 @@
 #include "input/bb_route.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
+#include "video_core/renderer_vulkan/vk_bb_dlss5.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_bb_perf_meter.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
@@ -168,6 +172,224 @@ constexpr std::array UpscalerValues{"auto", "dlss", "fsr", "fsr4", "amdfsr"};
 constexpr std::array UpscalerNames{"Automatic", "DLSS", "FSR 3.1", "FSR 4 (add-on)", "FSR (AMD)"};
 constexpr std::array PresetValues{13, 11, 10, 12, 0};
 constexpr std::array PresetNames{"M (recommended)", "K", "J", "L", "NVIDIA default"};
+
+// DLSS 5's settings: DLSS5OneClick's (OptiScaler's [DlssNr]), with the same defaults.
+struct Dlss5Default {
+    const char* key;
+    const char* value;
+};
+constexpr std::array Dlss5Defaults{Dlss5Default{"dlss5_transfer_strength", "1.00"},
+                                   Dlss5Default{"dlss5_colour_strength", "1.00"},
+                                   Dlss5Default{"dlss5_white_point_scale", "4.00"},
+                                   Dlss5Default{"dlss5_max_ratio", "2.00"},
+                                   Dlss5Default{"dlss5_working_scale", "1.00"},
+                                   Dlss5Default{"dlss5_downscaler", "1"},
+                                   Dlss5Default{"dlss5_debug_view", "0"},
+                                   Dlss5Default{"dlss5_preset", "1"},
+                                   Dlss5Default{"dlss5_style", "0"},
+                                   Dlss5Default{"dlss5_intensity", "1.75"},
+                                   Dlss5Default{"dlss5_local_structure", "1.00"},
+                                   Dlss5Default{"dlss5_local_tone", "1.00"},
+                                   Dlss5Default{"dlss5_skin_structure", "-1.00"},
+                                   Dlss5Default{"dlss5_auto_mask", "1"},
+                                   Dlss5Default{"dlss5_before_upscale", "1"},
+                                   Dlss5Default{"dlss5_passes", "1"},
+                                   Dlss5Default{"dlss5_blending", "0"},
+                                   Dlss5Default{"dlss5_black_restore", "1"}};
+
+const char* Dlss5Fallback(const char* key) {
+    for (const auto& entry : Dlss5Defaults)
+        if (std::string_view{entry.key} == key)
+            return entry.value;
+    return "0";
+}
+
+// Each setting's tooltip ends with its name in OptiScaler's [DlssNr], to compare with guides.
+void DrawDlss5Tab(SettingsFile& settings) {
+    const auto status = Vulkan::BbDlss5GetStatus();
+    if (status.running) {
+        TextColored({0.4f, 1.0f, 0.4f, 1.0f}, "Running");
+        SameLine();
+        Text("model %ux%u on the %ux%u image", status.model_width, status.model_height,
+             status.width, status.height);
+    } else if (status.enabled) {
+        TextColored({1.0f, 0.75f, 0.3f, 1.0f}, "Not running");
+        if (!status.problem.empty())
+            TextWrapped("%s", status.problem.c_str());
+    }
+    TextWrapped("NVIDIA's neural rendering model over the game's image, before the HUD and frame "
+                "generation. It needs an RTX card and nvngx_dlssnr.dll next to shadPS4.exe, which "
+                "is not included. It costs a lot of GPU time, and it runs only while upscaling is "
+                "active (Main tab).");
+
+    bool enabled = settings.Get("dlss5", "0") == "1";
+    if (Checkbox("DLSS 5", &enabled))
+        settings.Set("dlss5", enabled ? "1" : "0");
+
+    const auto number = [&](const char* key) {
+        return float(std::atof(settings.Get(key, Dlss5Fallback(key)).c_str()));
+    };
+    const auto slider = [&](const char* label, const char* key, float low, float high,
+                            const char* tip) {
+        float value = number(key);
+        SetNextItemWidth(Px(200.0f));
+        if (SliderFloat(label, &value, low, high, "%.2f"))
+            settings.Set(key, fmt::format("{:.2f}", value));
+        if (IsItemHovered())
+            SetTooltip("%s", tip);
+    };
+    const auto choice = [&](const char* label, const char* key, std::span<const char* const> names,
+                            int first, const char* tip) {
+        int index = std::clamp(int(number(key)) - first, 0, int(names.size()) - 1);
+        SetNextItemWidth(Px(200.0f));
+        if (Combo(label, &index, names.data(), int(names.size())))
+            settings.Set(key, std::to_string(index + first));
+        if (IsItemHovered())
+            SetTooltip("%s", tip);
+    };
+
+    BeginDisabled(!enabled);
+    SeparatorText("The model (it restarts after a change)");
+    static constexpr std::array WhereNames{"Before upscaling (faster)", "After upscaling"};
+    {
+        int index = number("dlss5_before_upscale") != 0.0f ? 0 : 1;
+        SetNextItemWidth(Px(200.0f));
+        if (Combo("Runs", &index, WhereNames.data(), int(WhereNames.size())))
+            settings.Set("dlss5_before_upscale", index == 0 ? "1" : "0");
+        if (IsItemHovered())
+            SetTooltip("Before upscaling: on the render-size image the upscaler starts from, much "
+                       "cheaper; the upscaler then brings it to the output size.\nAfter "
+                       "upscaling: on the full output image.\nWith a Decoupled UI patch it always "
+                       "runs on the game's finished frame before the HUD; Before upscaling then "
+                       "runs the model at the render size, as cheap as before.\n"
+                       "(DLSS5OneClick's ReShade NRHookPoint: Render / Upscaled)");
+    }
+    static constexpr std::array StyleNames{"Standard (default)", "Natural", "Cinematic"};
+    choice("Style", "dlss5_style", StyleNames, 0,
+           "The model's own looks. NVIDIA gives them no names; these come from players' "
+           "testing.\nStandard: the strongest, more local contrast and deeper lighting, can look "
+           "oversaturated.\nNatural: the same detail, gentler, closer to the game's own "
+           "tones.\nCinematic: less shine and processing, a film-like look.\n(Style)");
+    // Two networks in the 310.9 model library: preset 1 the full one (310.8's), preset 2 and 0
+    // (NVIDIA's default) the same smaller one (from DLSSNR-AMD's notes); 3 undocumented.
+    static constexpr std::array Dlss5PresetValues{1, 2, 3};
+    static constexpr std::array Dlss5PresetNames{"Preset 1 (strongest, slowest)",
+                                                 "Preset 2 (faster, weaker, NVIDIA's default)",
+                                                 "Preset 3 (faster, weaker)"};
+    {
+        const int preset = int(number("dlss5_preset"));
+        int index = preset == 0 ? 1 : 0;
+        for (size_t i = 0; i < Dlss5PresetValues.size(); ++i)
+            if (Dlss5PresetValues[i] == preset)
+                index = int(i);
+        SetNextItemWidth(Px(200.0f));
+        if (Combo("Preset", &index, Dlss5PresetNames.data(), int(Dlss5PresetNames.size())))
+            settings.Set("dlss5_preset", std::to_string(Dlss5PresetValues[index]));
+        if (IsItemHovered())
+            SetTooltip("Which network the model runs. Preset 1 is the full network (the one of "
+                       "the older 310.8 library): by far the most visible, especially on faces, "
+                       "and the most GPU time. Preset 2, NVIDIA's default, is a smaller, faster "
+                       "network that changes much less. Preset 3 is undocumented and "
+                       "looks like the smaller one.\n(Preset)");
+    }
+    slider("Model strength", "dlss5_intensity", 0.0f, 2.0f,
+           "How strongly the model reworks the image: the main strength setting.\n(Intensity)");
+    slider("Detail", "dlss5_local_structure", 0.0f, 2.0f,
+           "How much fine detail and texture the model adds.\n(LocalStructure)");
+    slider("Local contrast", "dlss5_local_tone", 0.0f, 2.0f,
+           "How much the model deepens light and shade within each area.\n(LocalTone)");
+    bool skin_follows = number("dlss5_skin_structure") < 0.0f;
+    if (Checkbox("Skin detail same as Detail", &skin_follows))
+        settings.Set("dlss5_skin_structure",
+                     skin_follows ? "-1.00"
+                                  : fmt::format("{:.2f}", number("dlss5_local_structure")));
+    if (IsItemHovered())
+        SetTooltip("Off: set the detail on faces and skin on its own.\n(SkinStructure -1)");
+    if (!skin_follows)
+        slider("Skin detail", "dlss5_skin_structure", 0.0f, 2.0f,
+               "How much detail the model adds to faces and skin.\n(SkinStructure)");
+    bool auto_mask = number("dlss5_auto_mask") != 0.0f;
+    if (Checkbox("Auto mask", &auto_mask))
+        settings.Set("dlss5_auto_mask", auto_mask ? "1" : "0");
+    if (IsItemHovered())
+        SetTooltip("The model finds the parts of the image it should leave alone itself.\n"
+                   "(AutoMask)");
+    static constexpr std::array PassNames{"1 (normal)", "2 (twice the cost)", "3 (3x the cost)",
+                                          "4 (4x the cost)"};
+    choice("Passes", "dlss5_passes", PassNames, 1,
+           "How many times the model runs, each time over the last one's result. 1 is what it "
+           "was made for; 2 often looks richer, more starts to look artificial. Each pass is a "
+           "model of its own: more video memory too.\n(Passes, NRPasses)");
+    {
+        // In steps of 0.05: a size just off the image's (0.99) shifted the model's colours.
+        float scale = number("dlss5_working_scale");
+        SetNextItemWidth(Px(200.0f));
+        if (SliderFloat("Model resolution", &scale, 0.5f, 2.0f, "%.2f"))
+            settings.Set("dlss5_working_scale",
+                         fmt::format("{:.2f}", std::round(scale * 20.0f) / 20.0f));
+        if (IsItemHovered())
+            SetTooltip("The model's resolution against the image: below 1 faster, above 1 "
+                       "supersampled. Keep it at 1 unless you need the speed: other sizes can "
+                       "change the colours.\n(WorkingScale)");
+    }
+    static constexpr std::array DownscalerNames{"Bilinear", "Lanczos 3"};
+    BeginDisabled(number("dlss5_working_scale") == 1.0f);
+    choice("Resize filter", "dlss5_downscaler", DownscalerNames, 0,
+           "How the image is resized for the model and back when Model resolution isn't "
+           "1.\n(ScalingDownscaler)");
+    EndDisabled();
+
+    SeparatorText("Blending into the image (applies at once)");
+    static constexpr std::array BlendingNames{"Default", "RenoDX"};
+    choice("Blending", "dlss5_blending", BlendingNames, 0,
+           "How the model is shown the image and how its answer goes back in.\nDefault: shown in "
+           "light scaled to a white point; only the change it makes to brightness and colour is "
+           "applied to the image.\nRenoDX: the way RenoDX's DLSS 5 add-on (Carlos Lopez Jr., "
+           "MIT) does it for an SDR game: shown the picture as displayed, its answer goes in "
+           "whole, and the grey it lifts into dark areas is taken out again.\n(RenoDX)");
+    const bool renodx = number("dlss5_blending") != 0.0f;
+    // RenoDX's SDR codec has no brightness blend, limit or white point; an HDR image uses two.
+    BeginDisabled(renodx && !status.hdr);
+    slider("Brightness blend", "dlss5_transfer_strength", 0.0f, 2.0f,
+           "How much of the model's change to brightness is kept: 0 none, 1 all of it, above 1 "
+           "exaggerated. Not the model's strength (that's Model strength above). RenoDX: HDR "
+           "images only.\n(TransferStrength)");
+    EndDisabled();
+    slider("Colour blend", "dlss5_colour_strength", 0.0f, 4.0f,
+           renodx ? "1: the model's answer as it is. 0: only its brightness, on the image's own "
+                    "colours.\n(ColorStrength)"
+                  : "How much of the model's change to colour is kept: 0 none, 1 all of it, above "
+                    "1 more saturated.\n(ColourStrength)");
+    BeginDisabled(renodx);
+    slider("Brightening limit", "dlss5_max_ratio", 1.0f, 8.0f,
+           "The most the model may brighten a pixel, so lamps don't turn into flat patches. "
+           "RenoDX: fixed at 4.\n(MaxRatio)");
+    EndDisabled();
+    BeginDisabled(renodx && !status.hdr);
+    slider("Input white point", "dlss5_white_point_scale", 0.5f, 16.0f,
+           "How bright the image shown to the model is. Higher: it sees a darker image and "
+           "darkens less in return (faces stop going dark). Lower: the opposite. RenoDX: HDR "
+           "images only, as its paper white.\n(WhitePointScale, PaperWhiteScale)");
+    EndDisabled();
+    if (renodx) {
+        static constexpr std::array BlackNames{"Off", "Dark areas (default)", "Everywhere",
+                                               "Dark areas, smooth edges"};
+        choice("Black level", "dlss5_black_restore", BlackNames, 0,
+               "Takes out the grey the model lifts into blacks (at most 0.025), in 32x32 "
+               "blocks.\nDark areas: only blocks whose brightest pixel is near black.\n"
+               "Everywhere: every block, RenoDX's older behaviour; can darken patches.\n"
+               "Smooth edges: fades out towards the near-black limit instead of a step.\n"
+               "(NRSdrBlackRestore)");
+    }
+    static constexpr std::array DebugNames{"Off", "What the model sees", "The model's answer",
+                                           "Difference x20"};
+    choice("Debug view", "dlss5_debug_view", DebugNames, 0,
+           "Shows the model's input, its raw answer, or how much it changed.\n(DebugView)");
+    if (Button("Reset to defaults"))
+        for (const auto& entry : Dlss5Defaults)
+            settings.Set(entry.key, entry.value);
+    EndDisabled();
+}
 
 class DlssLayer final : public ImGui::Layer {
 public:
@@ -640,10 +862,14 @@ void DlssLayer::DrawWindow() {
     // Tabs. Display: frame rate and resolution. Graphics: textures and the image features, the same
     // settings as F3's (Bloodborne, Graphics), both always showing the same. Other: this menu's UI
     // scale, the FPS counter, keyboard and mouse, the benchmark route.
-    bool main_tab = true, display_tab = false, graphics_tab = false, other_tab = false;
+    bool main_tab = true, display_tab = false, graphics_tab = false, dlss5_tab = false,
+         other_tab = false;
     if (BeginTabBar("##f1_tabs")) {
         main_tab = BeginTabItem("Main");
         if (main_tab)
+            EndTabItem();
+        dlss5_tab = BeginTabItem("DLSS 5");
+        if (dlss5_tab)
             EndTabItem();
         display_tab = BeginTabItem("Display");
         if (display_tab)
@@ -1176,6 +1402,8 @@ void DlssLayer::DrawWindow() {
 
         // Applies at once: toggled while watching the game.
     }
+    if (dlss5_tab)
+        DrawDlss5Tab(settings);
     if (other_tab) {
         SeparatorText("F1 menu");
         // Its own UI scale, apart from F3's. Applied when let go, so the slider doesn't move under
@@ -1377,6 +1605,50 @@ void DlssLayer::DrawWindow() {
     }
     if (graphics_tab) {
         settings.Load(); // F3 may have changed them
+        SeparatorText("Picture");
+        {
+            // Our own colour pass over the upscaled scene, before the HUD (bb_picture.comp).
+            struct PictureSlider {
+                const char* label;
+                const char* key;
+                const char* fallback;
+                float low, high;
+                const char* format;
+                const char* tip;
+            };
+            static constexpr std::array Sliders{
+                PictureSlider{"Brightness", "picture_brightness", "1.00", 0.0f, 3.0f, "%.2f",
+                              "1: the game's. Multiplies the light of the whole scene, the "
+                              "shadows too: for deeper shadows raise Contrast instead."},
+                PictureSlider{"Contrast", "picture_contrast", "1.00", 0.5f, 2.0f, "%.2f",
+                              "1: the game's. Above 1: darker darks and brighter lights, around "
+                              "mid grey."},
+                PictureSlider{"Black level", "picture_black", "0.00", 0.0f, 0.15f, "%.3f",
+                              "0: the game's. Takes the grey haze out of the shadows: the "
+                              "darkest greys become black, the rest keeps its brightness."},
+                PictureSlider{"Saturation", "picture_saturation", "1.00", 0.0f, 3.0f, "%.2f",
+                              "1: the game's. 0: black and white. Above 1 dull colours gain "
+                              "more than ones already strong."}};
+            for (const auto& slider : Sliders) {
+                float value = float(std::atof(settings.Get(slider.key, slider.fallback).c_str()));
+                SetNextItemWidth(Px(200.0f));
+                if (SliderFloat(slider.label, &value, slider.low, slider.high, slider.format))
+                    settings.Set(slider.key, fmt::format("{:.3f}", value));
+                if (IsItemHovered())
+                    SetTooltip("%s\nOn the 3D scene, not the HUD or menus, while upscaling is "
+                               "active (Main tab). Ctrl+click to type a value.",
+                               slider.tip);
+            }
+            if (Button("Reset picture"))
+                for (const auto& slider : Sliders)
+                    settings.Set(slider.key, slider.fallback);
+            SameLine();
+            if (Button("Log the game's colour passes"))
+                Vulkan::BbRequestPostLog();
+            if (IsItemHovered())
+                SetTooltip("For development: writes the next frame's post-processing passes, "
+                           "with their settings, to the log ([POST-LOG]).");
+        }
         SeparatorText("Textures");
         {
             static constexpr std::array AnisotropyNames{"Game default", "2x", "4x", "8x", "16x"};
@@ -1567,12 +1839,9 @@ void DlssLayer::DrawWindow() {
                     SetTooltip(
                         "Built in, no patch needed. Game's: as the game draws them.\nBetter: "
                         "traced more precisely, sharper, to the screen's edges. Off: none "
-                        "at all, no cost.\nSwitching between Off and on needs a restart.");
-                if (::Core::BbGameFixes::SsrNeedsRestart(mode)) {
-                    SameLine();
-                    TextColored(ImVec4(1.0f, 0.78f, 0.35f, 1.0f), "restart to apply");
-                } else if (::Core::BbGameFixes::GetSsrPatch() ==
-                           ::Core::BbGameFixes::SsrPatch::Unavailable) {
+                        "at all.\nChanges at once.");
+                if (::Core::BbGameFixes::GetSsrPatch() ==
+                    ::Core::BbGameFixes::SsrPatch::Unavailable) {
                     SameLine();
                     TextDisabled("not available (needs game version 1.09)");
                 }

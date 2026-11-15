@@ -63,6 +63,8 @@ Both rendered at 1280x720; open them full size to compare.
 2. Copy `shadPS4.exe` and all the DLLs into your shadPS4 folder, replacing its `shadPS4.exe`
    (back it up if you want to switch back).
    - `shadps4_dlss.dll`, `nvngx_dlss.dll`: DLSS, used on RTX cards only
+   - `shadps4_dlss5_nvngx.dll`: DLSS 5 (F1, DLSS 5 tab), used only with NVIDIA's
+     `nvngx_dlssnr.dll` next to it, which is not included: you supply it yourself
    - `amd_fidelityfx_vk.dll`: FSR 3.1 upscaling and FSR frame generation
    - `sl.*.dll`, `nvngx_dlssg.dll`: DLSS Frame Generation (NVIDIA Streamline), loaded only when
      frame generation is on
@@ -395,6 +397,8 @@ F1 shows why upscaling isn't running.
 - **"NGX initialization failed"**: update your NVIDIA driver.
 - **"shadps4_dlss.dll is missing or from a different version"**: copy all files from the same
   zip.
+- **DLSS 5 "nvngx_dlssnr.dll is not next to shadPS4.exe"**: the model is not included; put your
+  own copy there. The log says why it doesn't start otherwise (search for `[DLSS 5]`).
 - **"FSR needs amd_fidelityfx_vk.dll"**: copy that DLL next to `shadPS4.exe`.
 - **"FSR 4 needs the FSR 4 add-on" / "FSR 4 could not start"**: check the `fsr4` folder is next
   to `shadPS4.exe` with all its files and that your GPU meets the requirements. The log says why
@@ -482,7 +486,16 @@ For the curious, or for porting this to a newer shadPS4:
   DLSS and FSR. FSR also gets the camera's near/far planes and field of view.
 - **NVIDIA code**: shadPS4 itself has none. `shadps4_dlss.dll` (source in
   [`dlss_bridge/`](dlss_bridge)) is a small bridge to the DLSS SDK, loaded at runtime if
-  present.
+  present. DLSS 5's model accepts calls only from a library with `nvngx.dll` in its name, so the
+  bridge makes them through `shadps4_dlss5_nvngx.dll` (same folder), which does nothing else.
+- **DLSS 5**: the model is shown the upscaled scene scaled to its white point, highlights rolled
+  off and sRGB-encoded. Its answer is applied to the scene as a change of brightness and a
+  change of colour, each by its own strength, rather than replacing it; the idea of composing it
+  back as a ratio comes from RenoDX's DLSS 5 add-on (clshortfuse). The settings are
+  DLSS5OneClick's (OptiScaler's `[DlssNr]`), with the same defaults. Blending: RenoDX instead
+  runs a port of that add-on's legacy codec (v8.5.0-rc10, Carlos Lopez Jr., MIT, as carried by
+  DLSSNR-AMD): the model sees the picture as displayed, its answer goes in whole, and the grey it
+  lifts into dark areas is taken out again.
 - **AMD code**: `amd_fidelityfx_vk.dll` is AMD's signed FidelityFX SDK 1.1.4 build, loaded at
   runtime if present; only its headers are here ([`externals/ffx-api`](externals/ffx-api)).
 - **FSR 4 add-on**: `fsr4/shadps4_fsr4.dll` (source in [`fsr4_addon/`](fsr4_addon)) links
@@ -512,7 +525,8 @@ The emulator builds like normal shadPS4 (see [documents/building-windows.md](doc
 and doesn't need the DLSS SDK. Release builds use profile-guided optimisation (see
 [`pgo/README.md`](pgo/README.md)).
 
-The bridge needs the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS):
+The bridge needs the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) (on Windows it also
+builds `shadps4_dlss5_nvngx.dll`, which needs nothing):
 
 ```
 cmake -S dlss_bridge -B build-dlss -G Ninja -DCMAKE_BUILD_TYPE=Release -DDLSS_SDK_ROOT=<path to DLSS SDK>
@@ -564,7 +578,9 @@ An AI coding agent was used in the development of this project.
 - The authors of the Bloodborne patches for shadPS4 (Kyo, illusion and others), including the
   resolution patches and the AA, chromatic aberration and depth-of-field patches; F1's
   resolution and the built-in reflections are made from Kyo's patches.
-- The [RenoDX](https://github.com/clshortfuse/renodx) authors, for the HDR mod.
+- The [RenoDX](https://github.com/clshortfuse/renodx) authors, for the HDR mod, and Carlos Lopez
+  Jr. for RenoDX's DLSS 5 add-on, whose codec DLSS 5's RenoDX blending is ported from (MIT, by way
+  of mochizuki0323's [DLSSNR-AMD](https://gitlab.com/mochizuki0323/DLSSNR-AMD)).
 - zeroznet, for SDR to HDR.
 - NVIDIA, for DLSS, Streamline and Reflex, and AMD, for FSR and the open FidelityFX SDK.
 

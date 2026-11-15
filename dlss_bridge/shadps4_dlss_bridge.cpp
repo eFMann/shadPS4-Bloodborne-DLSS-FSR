@@ -23,6 +23,8 @@
 #ifndef _WIN32
 #define DIRECT_FRAME_GENERATION
 #include <nvsdk_ngx_helpers_dlssg_vk.h>
+#else
+#include <windows.h>
 #endif
 
 namespace {
@@ -49,6 +51,8 @@ struct State {
     bool fg_device_supported{};
     int32_t fg_max_count{};
     std::vector<VkExtensionProperties> instance_extensions, device_extensions;
+    VkInstance instance{};
+    VkPhysicalDevice physical{};
     VkDevice device{};
     bool configured{};
     bool initialized{};
@@ -196,6 +200,8 @@ int32_t Initialize(VkInstance instance, VkPhysicalDevice physical, VkDevice devi
                    get_device_proc, &state.common)))
         return 0;
     state.initialized = true;
+    state.instance = instance;
+    state.physical = physical;
     state.device = device;
     if (!Check("Capability query", NVSDK_NGX_VULKAN_GetCapabilityParameters(&state.capabilities)))
         return 0;
@@ -445,7 +451,222 @@ int32_t FrameGenEvaluate(VkCommandBuffer, const ShadDlssgEvaluate*) {
 }
 #endif
 
+#ifdef _WIN32
+constexpr int NrFeatureId = 18;
+constexpr uint32_t NrMaxPasses = 4;
+
+struct NrState {
+    bool tried{}, ready{};
+    std::string problem;
+    HMODULE caller{}, model{};
+    using InitFn = int32_t (*)(void*, unsigned long long, const wchar_t*, void*, void*, void*,
+                               int32_t, const void*);
+    using CreateFn = int32_t (*)(void*, void*, int32_t, void*, void**);
+    using EvaluateFn = int32_t (*)(void*, void*, const void*, const void*);
+    using ReleaseFn = int32_t (*)(void*, void*);
+    InitFn init{};
+    CreateFn create{};
+    EvaluateFn evaluate{};
+    ReleaseFn release{};
+    void *model_init{}, *model_create{}, *model_evaluate{}, *model_release{};
+    // The model's settings and resources go in a parameter block of the NGX core: its capability
+    // block, or one of its own when the model would not build from that.
+    NVSDK_NGX_Parameter* parameters{};
+    NVSDK_NGX_Parameter* own_parameters{};
+    std::array<void*, NrMaxPasses> features{};
+    ShadDlssNrFeature desc{};
+    // NGX reads the resources during the evaluation, through pointers in the block.
+    NVSDK_NGX_Resource_VK color{}, depth{}, motion{}, output{};
+} nr;
+
+int32_t NrFail(std::string problem) {
+    nr.problem = std::move(problem);
+    Log(1, "DLSS 5: %s", nr.problem.c_str());
+    return 0;
+}
+
+int32_t NrInitialize(char* problem, uint32_t problem_size) {
+    const auto answer = [&](int32_t result) {
+        if (problem && problem_size)
+            std::snprintf(problem, problem_size, "%s", nr.problem.c_str());
+        return result;
+    };
+    if (nr.tried)
+        return answer(nr.ready ? 1 : 0);
+    nr.tried = true;
+    if (!state.initialized || !state.capabilities)
+        return answer(NrFail("DLSS is not running on this GPU"));
+    const std::wstring directory = state.dll_directory + L"\\";
+    nr.model = LoadLibraryExW((directory + L"nvngx_dlssnr.dll").c_str(), nullptr,
+                              LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!nr.model)
+        return answer(NrFail("nvngx_dlssnr.dll is not next to shadPS4.exe"));
+    nr.caller = LoadLibraryExW((directory + L"shadps4_dlss5_nvngx.dll").c_str(), nullptr,
+                               LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!nr.caller)
+        return answer(NrFail("shadps4_dlss5_nvngx.dll is not next to shadPS4.exe"));
+    nr.init = reinterpret_cast<NrState::InitFn>(GetProcAddress(nr.caller, "ShadNvngxInit"));
+    nr.create = reinterpret_cast<NrState::CreateFn>(GetProcAddress(nr.caller, "ShadNvngxCreate"));
+    nr.evaluate =
+        reinterpret_cast<NrState::EvaluateFn>(GetProcAddress(nr.caller, "ShadNvngxEvaluate"));
+    nr.release =
+        reinterpret_cast<NrState::ReleaseFn>(GetProcAddress(nr.caller, "ShadNvngxRelease"));
+    if (!nr.init || !nr.create || !nr.evaluate || !nr.release)
+        return answer(NrFail("shadps4_dlss5_nvngx.dll is from another version"));
+    nr.model_init = reinterpret_cast<void*>(GetProcAddress(nr.model, "NVSDK_NGX_VULKAN_Init_Ext"));
+    nr.model_create =
+        reinterpret_cast<void*>(GetProcAddress(nr.model, "NVSDK_NGX_VULKAN_CreateFeature"));
+    nr.model_evaluate =
+        reinterpret_cast<void*>(GetProcAddress(nr.model, "NVSDK_NGX_VULKAN_EvaluateFeature"));
+    nr.model_release =
+        reinterpret_cast<void*>(GetProcAddress(nr.model, "NVSDK_NGX_VULKAN_ReleaseFeature"));
+    if (!nr.model_init || !nr.model_create || !nr.model_evaluate || !nr.model_release)
+        return answer(NrFail("this nvngx_dlssnr.dll has no Vulkan support"));
+    const int32_t result =
+        nr.init(nr.model_init, 0, state.data_directory.c_str(), state.instance, state.physical,
+                state.device, NVSDK_NGX_Version_API, state.capabilities);
+    if (NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(result))) {
+        char text[96];
+        std::snprintf(text, sizeof(text),
+                      "the model did not start on this GPU (0x%08x, an RTX card is needed)",
+                      static_cast<unsigned>(result));
+        return answer(NrFail(text));
+    }
+    nr.parameters = state.capabilities;
+    nr.ready = true;
+    nr.problem.clear();
+    Log(0, "DLSS 5 ready");
+    return answer(1);
+}
+
+void NrRelease() {
+    for (auto& feature : nr.features) {
+        if (feature)
+            nr.release(nr.model_release, feature);
+        feature = nullptr;
+    }
+}
+
+void NrSetCreate(NVSDK_NGX_Parameter* block, const ShadDlssNrFeature& desc) {
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.Enabled", 1);
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.Width", desc.width);
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.Height", desc.height);
+    NVSDK_NGX_Parameter_SetUI(block, NVSDK_NGX_Parameter_CreationNodeMask, 1);
+    NVSDK_NGX_Parameter_SetUI(block, NVSDK_NGX_Parameter_VisibilityNodeMask, 1);
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.Hint.Render.Preset", desc.preset);
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.Style", desc.style);
+    NVSDK_NGX_Parameter_SetF(block, "DLSSNR.Intensity", desc.intensity);
+    NVSDK_NGX_Parameter_SetF(block, "DLSSNR.LocalStructureStrength", desc.local_structure);
+    NVSDK_NGX_Parameter_SetF(block, "DLSSNR.LocalToneStrength", desc.local_tone);
+    NVSDK_NGX_Parameter_SetF(block, "DLSSNR.SkinStructureStrength", desc.skin_structure);
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.UseAutoMask", desc.auto_mask ? 1 : 0);
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.UICorrection", 1);
+}
+
+int32_t NrCreate(VkCommandBuffer command, const ShadDlssNrFeature* desc) {
+    if (!nr.ready || !desc)
+        return 0;
+    NrRelease();
+    const uint32_t passes = std::clamp(desc->passes, 1u, NrMaxPasses);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (attempt == 1) {
+            if (!nr.own_parameters &&
+                NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&nr.own_parameters)))
+                break;
+            nr.parameters = nr.own_parameters;
+        }
+        int32_t result = NVSDK_NGX_Result_Success;
+        for (uint32_t pass = 0;
+             pass < passes && NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(result)); ++pass) {
+            NrSetCreate(nr.parameters, *desc);
+            result =
+                nr.create(nr.model_create, command, NrFeatureId, nr.parameters, &nr.features[pass]);
+            if (!nr.features[pass] && NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(result)))
+                result = NVSDK_NGX_Result_Fail;
+        }
+        Log(NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(result)) ? 1 : 0,
+            "DLSS 5 %ux%u, %u pass(es), with the %s parameters: 0x%08x", desc->width, desc->height,
+            passes, attempt == 0 ? "capability" : "allocated", static_cast<unsigned>(result));
+        if (NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(result))) {
+            nr.desc = *desc;
+            return 1;
+        }
+        NrRelease();
+    }
+    nr.parameters = state.capabilities;
+    return 0;
+}
+
+void NrSetSubrect(const char* name, uint32_t width, uint32_t height) {
+    const std::string prefix = std::string{"DLSSNR."} + name + "Subrect";
+    NVSDK_NGX_Parameter_SetUI(nr.parameters, (prefix + "BaseX").c_str(), 0);
+    NVSDK_NGX_Parameter_SetUI(nr.parameters, (prefix + "BaseY").c_str(), 0);
+    NVSDK_NGX_Parameter_SetUI(nr.parameters, (prefix + "Width").c_str(), width);
+    NVSDK_NGX_Parameter_SetUI(nr.parameters, (prefix + "Height").c_str(), height);
+}
+
+int32_t NrEvaluate(VkCommandBuffer command, const ShadDlssNrEvaluate* evaluate) {
+    if (!evaluate || evaluate->pass >= NrMaxPasses || !nr.features[evaluate->pass])
+        return 0;
+    nr.color = Wrap(evaluate->color, false);
+    nr.depth = Wrap(evaluate->depth, false);
+    nr.motion = Wrap(evaluate->motion, false);
+    nr.output = Wrap(evaluate->output, true);
+    auto* block = nr.parameters;
+    NVSDK_NGX_Parameter_SetVoidPointer(block, "DLSSNR.Color", &nr.color);
+    NVSDK_NGX_Parameter_SetVoidPointer(block, "DLSSNR.Depth", &nr.depth);
+    NVSDK_NGX_Parameter_SetVoidPointer(block, "DLSSNR.MVec", &nr.motion);
+    NVSDK_NGX_Parameter_SetVoidPointer(block, "DLSSNR.Output", &nr.output);
+    NVSDK_NGX_Parameter_SetVoidPointer(block, "DLSSNR.UI", nullptr);
+    NVSDK_NGX_Parameter_SetVoidPointer(block, "DLSSNR.UIAlpha", nullptr);
+    NVSDK_NGX_Parameter_SetVoidPointer(block, "DLSSNR.Backbuffer", nullptr);
+    // The block is shared, so everything the model reads is written again every time.
+    NrSetCreate(block, nr.desc);
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.DepthInverted", evaluate->depth_inverted ? 1 : 0);
+    NVSDK_NGX_Parameter_SetUI(block, "DLSSNR.Reset", evaluate->reset ? 1 : 0);
+    NrSetSubrect("Color", evaluate->color.width, evaluate->color.height);
+    NrSetSubrect("Output", evaluate->output.width, evaluate->output.height);
+    NrSetSubrect("Depth", evaluate->depth.width, evaluate->depth.height);
+    NrSetSubrect("MVec", evaluate->motion.width, evaluate->motion.height);
+    NVSDK_NGX_Parameter_SetF(block, "DLSSNR.MVecScaleX", 1.0f);
+    NVSDK_NGX_Parameter_SetF(block, "DLSSNR.MVecScaleY", 1.0f);
+    const int32_t result =
+        nr.evaluate(nr.model_evaluate, command, nr.features[evaluate->pass], block);
+    return Check("DLSS 5 evaluation", static_cast<NVSDK_NGX_Result>(result)) ? 1 : 0;
+}
+
+void NrShutdown() {
+    NrRelease();
+    if (nr.own_parameters) {
+        NVSDK_NGX_VULKAN_DestroyParameters(nr.own_parameters);
+        nr.own_parameters = nullptr;
+    }
+    nr.parameters = nullptr;
+    nr.ready = false;
+    nr.tried = false;
+}
+#else
+int32_t NrInitialize(char* problem, uint32_t problem_size) {
+    if (problem && problem_size)
+        std::snprintf(problem, problem_size, "%s", "DLSS 5 is Windows only");
+    return 0;
+}
+
+int32_t NrCreate(VkCommandBuffer, const ShadDlssNrFeature*) {
+    return 0;
+}
+
+int32_t NrEvaluate(VkCommandBuffer, const ShadDlssNrEvaluate*) {
+    return 0;
+}
+
+void NrRelease() {}
+
+void NrShutdown() {}
+#endif
+
 void Shutdown() {
+    NrShutdown();
     FrameGenRelease();
     ReleaseFeature();
     if (state.capabilities) {
@@ -471,7 +692,11 @@ const ShadDlssApi api{SHADPS4_DLSS_BRIDGE_ABI,
                       FrameGenMaxCount,
                       FrameGenCreate,
                       FrameGenEvaluate,
-                      FrameGenRelease};
+                      FrameGenRelease,
+                      NrInitialize,
+                      NrCreate,
+                      NrEvaluate,
+                      NrRelease};
 
 } // namespace
 

@@ -155,8 +155,8 @@ bool FindLoadingFlag() {
 
 // Screen-space reflections: Kyo's "Enable Screen Space Reflections" patch (1.09), built in so the
 // reflection setting works without the patch file. Only the lines that change the game's bytes
-// (the patch's other lines write what is already there). Installed at a start, and only when
-// reflections aren't Off: the game then also allocates and draws its reflection passes.
+// (the patch's other lines write what is already there). Always installed at a start, so every
+// reflection setting (Off included) applies at once; Off clears the reflections instead.
 struct PatchLine {
     u64 offset;
     std::string_view original;
@@ -176,7 +176,7 @@ constexpr std::array<PatchLine, 8> SsrLines{{
     {0x22c42b4, "C704240000000031C941B9140000004589E0", "8324240031C941B91400000041B80A000000"},
 }};
 
-std::atomic<SsrPatch> ssr_patch{SsrPatch::Off};
+std::atomic<SsrPatch> ssr_patch{SsrPatch::Unavailable};
 
 u8 HexByte(std::string_view hex, size_t i) {
     const auto digit = [](char c) -> u8 {
@@ -219,9 +219,6 @@ SsrPatch InstallSsr() {
         }
         return SsrPatch::FromPatchFile;
     }
-    if (EmulatorSettings.GetBbSsrMode() == 2) {
-        return SsrPatch::Off;
-    }
     for (const auto& line : SsrLines) {
         for (size_t i = 0; i < line.patched.size() / 2; ++i) {
             At(line.offset)[i] = HexByte(line.patched, i);
@@ -247,7 +244,6 @@ void Install() {
     LOG_INFO(Loader, "Screen space reflections: {}",
              ssr == SsrPatch::Installed       ? "on (built-in patch)"
              : ssr == SsrPatch::FromPatchFile ? "on (from the patch file)"
-             : ssr == SsrPatch::Off           ? "off"
                                               : "not available (the game's code differs)");
     loading_flag_found.store(FindLoadingFlag(), std::memory_order_release);
     LOG_INFO(Loader, "Loading screen detection: {}",
@@ -258,14 +254,6 @@ void Install() {
 
 SsrPatch GetSsrPatch() {
     return ssr_patch.load(std::memory_order_acquire);
-}
-
-bool SsrNeedsRestart(int ssr_mode) {
-    const SsrPatch state = GetSsrPatch();
-    if (state == SsrPatch::FromPatchFile || state == SsrPatch::Unavailable) {
-        return false;
-    }
-    return (ssr_mode != 2) != (state == SsrPatch::Installed);
 }
 
 bool IsLoadingScreen() {

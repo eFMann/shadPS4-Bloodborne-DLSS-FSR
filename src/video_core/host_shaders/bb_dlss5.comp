@@ -1,0 +1,468 @@
+// SPDX-FileCopyrightText: Copyright 2026 IFreemz
+// SPDX-FileCopyrightText: Copyright (c) 2025 Carlos Lopez Jr. (RenoDX DLSS5 add-on v8.5.0-rc10)
+// SPDX-License-Identifier: GPL-2.0-or-later AND MIT
+#version 460
+// DLSS 5 around the upscaled scene. The model expects a finished, display-encoded picture: it
+// is shown a copy of the scene in light scaled to its white point, with highlights rolled off
+// below 1 and sRGB-encoded (the proxy). Its answer is not pasted over the scene: the change in
+// brightness it made to each pixel is applied to the scene's own light, and the change in
+// colour it made is added to the scene's colour, both by an adjustable amount. The idea of
+// composing the model's answer back as a ratio comes from RenoDX's DLSS 5 add-on (clshortfuse).
+//
+// The RenoDX blending (blending 1) is a port of that add-on's legacy codec (legacy_encode,
+// legacy_common's ResolvePixel and UpgradeToneMap, legacy_reduce built with MEASURE_UNSHAPED and
+// legacy_apply; as carried by DLSSNR-AMD, MIT): the model is shown the picture as it would be
+// displayed, its answer goes in whole, Colour blend fading between the answer and only its
+// brightness on the scene's colours, and the grey it lifts into dark areas is taken out again.
+// An HDR scene goes the codec's scRGB way, the white point standing for its paper white.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba16f) uniform image2D scene;      // the upscaled scene, read and written
+layout(binding = 1, rgba16f) uniform writeonly image2D proxy_out; // working size
+layout(binding = 2) uniform sampler2D proxy_tex;          // working size
+layout(binding = 3) uniform sampler2D answer_tex;         // working size, the model's answer
+layout(binding = 4, std430) buffer White {
+    float white;   // HDR scene: light that the proxy shows as white, followed over frames
+    vec4 blocks[]; // RenoDX black level: each 32x32 block's answer and scene means, scene max
+};
+
+layout(push_constant) uniform Push {
+    uint mode;       // 0 measure the white point, 1 proxy, 2 compose, 3 and 4 the black level
+    uint encoding;   // scene: 0 sRGB-encoded 0..1, 1 linear 0..1, 2 linear c / (1 + max), 3 HDR
+    uint resample;   // working scale resampling: 0 bilinear / area, 1 Lanczos 3
+    uint debug_view; // 0 off, 1 the proxy, 2 the model's answer, 3 their difference x20
+    ivec2 scene_size;
+    ivec2 work_size;
+    float white_scale;
+    float transfer; // 0 the scene untouched, 1 the model's brightness, above 1 further
+    float colour;   // 0 the scene's colour, 1 the model's change of colour, above 1 further
+    float max_ratio;
+    uint blending;      // 0 default, 1 RenoDX
+    uint black_restore; // RenoDX: 0 off, 1 dark blocks, 2 every block, 3 dark blocks smoothly
+} pc;
+
+const float Knee = 0.8;
+const float Eps = 1e-5;
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 SrgbToLinear(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+
+vec3 LinearToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+
+float MaxOf(vec3 c) {
+    return max(c.r, max(c.g, c.b));
+}
+
+vec3 SceneToLight(vec3 c) {
+    if (pc.encoding == 0u)
+        return SrgbToLinear(c);
+    if (pc.encoding == 2u)
+        return max(c, 0.0) / max(1.0 - min(MaxOf(c), 0.999), 1e-3);
+    return max(c, 0.0);
+}
+
+vec3 LightToScene(vec3 c) {
+    c = max(c, 0.0);
+    if (pc.encoding == 0u)
+        return LinearToSrgb(c);
+    if (pc.encoding == 1u)
+        return min(c, 1.0);
+    if (pc.encoding == 2u)
+        return c / (1.0 + MaxOf(c));
+    return c;
+}
+
+float WhitePoint() {
+    return (pc.encoding == 3u && white > 0.0 ? white : 1.0) * pc.white_scale;
+}
+
+// Highlights roll off towards 1 instead of clipping, by scaling all three channels so the hue
+// is kept; undone exactly by FromProxy.
+vec3 ToProxy(vec3 light) {
+    vec3 c = light / WhitePoint();
+    const float m = MaxOf(c);
+    if (m > Knee) {
+        const float span = 1.0 - Knee;
+        c *= (Knee + span * (1.0 - exp(-(m - Knee) / span))) / m;
+    }
+    return LinearToSrgb(c);
+}
+
+vec3 FromProxy(vec3 v) {
+    vec3 c = SrgbToLinear(v);
+    const float m = MaxOf(c);
+    if (m > Knee) {
+        const float span = 1.0 - Knee;
+        const float rolled = min(m, 0.9999);
+        c *= (Knee - span * log(1.0 - (rolled - Knee) / span)) / m;
+    }
+    return c * WhitePoint();
+}
+
+// The RenoDX blending's own colour math (legacy_common.hlsli, codec_math.hlsli).
+float RenoLuminance(vec3 c) {
+    return dot(c, vec3(0.212639, 0.715169, 0.072192));
+}
+
+vec3 ToOkLab(vec3 c) {
+    const vec3 lms = vec3(dot(c, vec3(0.4122214708, 0.5363325363, 0.0514459929)),
+                          dot(c, vec3(0.2119034982, 0.6806995451, 0.1073969566)),
+                          dot(c, vec3(0.0883024619, 0.2817188376, 0.6299787005)));
+    const vec3 l = sign(lms) * pow(abs(lms), vec3(1.0 / 3.0));
+    return vec3(dot(l, vec3(0.2104542553, 0.7936177850, -0.0040720468)),
+                dot(l, vec3(1.9779984951, -2.4285922050, 0.4505937099)),
+                dot(l, vec3(0.0259040371, 0.7827717662, -0.8086757660)));
+}
+
+vec3 FromOkLab(vec3 c) {
+    const vec3 l = vec3(dot(c, vec3(1.0, 0.3963377774, 0.2158037573)),
+                        dot(c, vec3(1.0, -0.1055613458, -0.0638541728)),
+                        dot(c, vec3(1.0, -0.0894841775, -1.2914855480)));
+    const vec3 lms = l * l * l;
+    return vec3(dot(lms, vec3(4.0767416621, -3.3077115913, 0.2309699292)),
+                dot(lms, vec3(-1.2684380046, 2.6097574011, -0.3413193965)),
+                dot(lms, vec3(-0.0041960863, -0.7034186147, 1.7076147010)));
+}
+
+vec3 ClampAp1(vec3 c) {
+    const vec3 ap1 = max(vec3(dot(c, vec3(0.613097, 0.339523, 0.047379)),
+                              dot(c, vec3(0.070194, 0.916354, 0.013452)),
+                              dot(c, vec3(0.020616, 0.109570, 0.869815))),
+                         0.0);
+    return vec3(dot(ap1, vec3(1.705051, -0.621792, -0.083259)),
+                dot(ap1, vec3(-0.130256, 1.140805, -0.010548)),
+                dot(ap1, vec3(-0.024003, -0.128969, 1.152972)));
+}
+
+vec3 HueOkLab(vec3 incorrect, vec3 correct) {
+    vec3 incorrect_lab = ToOkLab(incorrect);
+    const vec3 correct_lab = ToOkLab(correct);
+    const float incorrect_chroma = length(incorrect_lab.yz);
+    const float correct_chroma = length(correct_lab.yz);
+    incorrect_lab.yz =
+        correct_lab.yz * (correct_chroma == 0.0 ? 1.0 : incorrect_chroma / correct_chroma);
+    return ClampAp1(FromOkLab(incorrect_lab));
+}
+
+vec3 UpgradeToneMap(vec3 original, vec3 proxy, vec3 neural) {
+    const float original_y = RenoLuminance(original);
+    const float proxy_y = RenoLuminance(proxy);
+    const float neural_y = RenoLuminance(neural);
+    vec3 result = original;
+    if (neural_y > 1e-5) {
+        float ratio = original_y / max(proxy_y, 1e-6);
+        if (original_y >= proxy_y)
+            ratio = (neural_y + max(0.0, original_y - proxy_y)) / neural_y;
+        result = mix(original, HueOkLab(neural * ratio, neural), pc.transfer);
+    }
+    return result;
+}
+
+// The scene in the codec's units: as displayed (sRGB-encoded) for an SDR scene, its own light
+// for an HDR one. The black level is measured and taken out in these units.
+vec3 SceneToCodec(vec3 c) {
+    if (pc.encoding == 0u)
+        return clamp(c, 0.0, 1.0);
+    if (pc.encoding == 3u)
+        return max(c, 0.0);
+    return LinearToSrgb(c);
+}
+
+vec3 CodecToScene(vec3 c) {
+    if (pc.encoding == 0u || pc.encoding == 3u)
+        return max(c, 0.0);
+    return SrgbToLinear(c);
+}
+
+// Light the proxy is resampled in: the displayed light for SDR, paper-white units for HDR.
+vec3 SceneToRenoLight(vec3 c) {
+    if (pc.encoding == 3u)
+        return max(c, 0.0) / WhitePoint();
+    return SrgbToLinear(SceneToCodec(c));
+}
+
+vec3 ToRenoProxy(vec3 light) {
+    if (pc.encoding == 3u) {
+        const float m = MaxOf(light);
+        if (m > 0.75)
+            light *= (0.75 + 0.25 * (1.0 - exp(-5.770780 * (m - 0.75)))) / max(m, 1e-6);
+    }
+    return LinearToSrgb(light);
+}
+
+// ResolvePixel: the scene's pixel with the model's answer, in the codec's units.
+vec3 RenoResolve(vec3 scene_value, vec3 proxy, vec3 neural) {
+    vec3 original;
+    vec3 upgraded;
+    if (pc.encoding == 3u) {
+        original = max(scene_value, 0.0) / WhitePoint();
+        upgraded = UpgradeToneMap(original, SrgbToLinear(proxy), SrgbToLinear(neural));
+    } else {
+        // An SDR picture has no HDR to transfer to: the answer goes in whole.
+        original = SceneToCodec(scene_value);
+        upgraded = neural;
+    }
+    const float original_y = RenoLuminance(original);
+    const float upgraded_y = RenoLuminance(upgraded);
+    const float ratio = original_y == 0.0 ? 1.0 : clamp(upgraded_y / original_y, 0.0, 4.0);
+    const vec3 result = mix(original * ratio, upgraded, pc.colour);
+    return pc.encoding == 3u ? result * WhitePoint() : result;
+}
+
+float Lanczos3(float x) {
+    x = abs(x);
+    if (x < 1e-4)
+        return 1.0;
+    if (x >= 3.0)
+        return 0.0;
+    const float pi_x = 3.14159265 * x;
+    return 3.0 * sin(pi_x) * sin(pi_x / 3.0) / (pi_x * pi_x);
+}
+
+// Samples at `at` (pixels of a `size` image) for a destination `ratio` times as large. Lanczos 3
+// widens with the step when shrinking; the other filter is bilinear when enlarging and an area
+// average when shrinking.
+#define RESAMPLE(NAME, FETCH)                                                                      \
+    vec3 NAME(vec2 at, ivec2 size, vec2 ratio) {                                                   \
+        const vec2 step_ = max(vec2(1.0) / ratio, vec2(1.0));                                      \
+        vec3 sum = vec3(0.0);                                                                      \
+        float weights = 0.0;                                                                       \
+        if (pc.resample == 1u) {                                                                     \
+            const vec2 reach = 3.0 * step_;                                                        \
+            const ivec2 lo = ivec2(floor(at - reach));                                             \
+            const ivec2 hi = ivec2(ceil(at + reach));                                              \
+            for (int y = lo.y; y <= hi.y; ++y) {                                                   \
+                const float wy = Lanczos3((float(y) + 0.5 - at.y) / step_.y);                      \
+                if (wy == 0.0)                                                                     \
+                    continue;                                                                      \
+                for (int x = lo.x; x <= hi.x; ++x) {                                               \
+                    const float w = wy * Lanczos3((float(x) + 0.5 - at.x) / step_.x);              \
+                    if (w == 0.0)                                                                  \
+                        continue;                                                                  \
+                    sum += w * FETCH(clamp(ivec2(x, y), ivec2(0), size - 1));                      \
+                    weights += w;                                                                  \
+                }                                                                                  \
+            }                                                                                      \
+            return max(sum / max(weights, Eps), 0.0);                                              \
+        }                                                                                          \
+        if (step_.x > 1.0 || step_.y > 1.0) {                                                      \
+            const ivec2 lo = ivec2(floor(at - 0.5 * step_));                                       \
+            const ivec2 hi = ivec2(ceil(at + 0.5 * step_)) - 1;                                    \
+            for (int y = lo.y; y <= hi.y; ++y)                                                     \
+                for (int x = lo.x; x <= hi.x; ++x)                                                 \
+                    sum += FETCH(clamp(ivec2(x, y), ivec2(0), size - 1));                          \
+            return sum / float((hi.x - lo.x + 1) * (hi.y - lo.y + 1));                             \
+        }                                                                                          \
+        const vec2 p = at - 0.5;                                                                   \
+        const ivec2 base = ivec2(floor(p));                                                        \
+        const vec2 f = p - vec2(base);                                                             \
+        const vec3 a = FETCH(clamp(base, ivec2(0), size - 1));                                     \
+        const vec3 b = FETCH(clamp(base + ivec2(1, 0), ivec2(0), size - 1));                       \
+        const vec3 c = FETCH(clamp(base + ivec2(0, 1), ivec2(0), size - 1));                       \
+        const vec3 d = FETCH(clamp(base + ivec2(1, 1), ivec2(0), size - 1));                       \
+        return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);                                           \
+    }
+
+vec3 FetchSceneLight(ivec2 p) {
+    return SceneToLight(imageLoad(scene, p).rgb);
+}
+vec3 FetchProxy(ivec2 p) {
+    return FromProxy(texelFetch(proxy_tex, p, 0).rgb);
+}
+vec3 FetchAnswer(ivec2 p) {
+    return FromProxy(texelFetch(answer_tex, p, 0).rgb);
+}
+
+vec3 FetchSceneRenoLight(ivec2 p) {
+    return SceneToRenoLight(imageLoad(scene, p).rgb);
+}
+vec3 FetchProxyRaw(ivec2 p) {
+    return texelFetch(proxy_tex, p, 0).rgb;
+}
+vec3 FetchAnswerRaw(ivec2 p) {
+    return texelFetch(answer_tex, p, 0).rgb;
+}
+
+// As the model sees them: no white point, no roll-off undone.
+vec3 FetchProxyShown(ivec2 p) {
+    return SrgbToLinear(texelFetch(proxy_tex, p, 0).rgb);
+}
+vec3 FetchAnswerShown(ivec2 p) {
+    return SrgbToLinear(texelFetch(answer_tex, p, 0).rgb);
+}
+
+RESAMPLE(SampleSceneLight, FetchSceneLight)
+RESAMPLE(SampleProxy, FetchProxy)
+RESAMPLE(SampleAnswer, FetchAnswer)
+RESAMPLE(SampleProxyShown, FetchProxyShown)
+RESAMPLE(SampleAnswerShown, FetchAnswerShown)
+RESAMPLE(SampleSceneRenoLight, FetchSceneRenoLight)
+RESAMPLE(SampleProxyRaw, FetchProxyRaw)
+RESAMPLE(SampleAnswerRaw, FetchAnswerRaw)
+
+vec3 RenoResolveAt(ivec2 pixel, vec3 scene_value) {
+    const vec2 ratio = vec2(pc.scene_size) / vec2(pc.work_size);
+    const vec2 at = (vec2(pixel) + 0.5) / ratio;
+    return RenoResolve(scene_value, SampleProxyRaw(at, pc.work_size, ratio),
+                       SampleAnswerRaw(at, pc.work_size, ratio));
+}
+
+shared float log_sum[256];
+shared vec4 block_part[256];
+
+uint BlocksWide() {
+    return (uint(pc.scene_size.x) + 31u) / 32u;
+}
+
+// legacy_reduce (MEASURE_UNSHAPED): per 32x32 block, before the scene is written, the mean
+// brightness of the scene with the answer, the scene's own mean and its brightest pixel.
+void ReduceBlackLevel() {
+    const uint index = gl_LocalInvocationIndex;
+    const ivec2 base = ivec2(gl_WorkGroupID.xy * 32u + gl_LocalInvocationID.xy * 2u);
+    vec4 part = vec4(0.0);
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            const ivec2 pixel = base + ivec2(x, y);
+            if (any(greaterThanEqual(pixel, pc.scene_size)))
+                continue;
+            const vec3 value = imageLoad(scene, pixel).rgb;
+            part.x += RenoLuminance(RenoResolveAt(pixel, value));
+            const float untouched = RenoLuminance(SceneToCodec(value));
+            part.y += untouched;
+            part.z = max(part.z, untouched);
+            part.w += 1.0;
+        }
+    }
+    block_part[index] = part;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            const vec4 a = block_part[index];
+            const vec4 b = block_part[index + stride];
+            block_part[index] = vec4(a.xy + b.xy, max(a.z, b.z), a.w + b.w);
+        }
+        barrier();
+    }
+    if (index == 0u) {
+        const vec4 total = block_part[0];
+        const float count = max(total.w, 1.0);
+        blocks[gl_WorkGroupID.y * BlocksWide() + gl_WorkGroupID.x] =
+            vec4(total.x / count, total.y / count, total.z, 0.0);
+    }
+}
+
+vec4 BlockAt(ivec2 block) {
+    return blocks[uint(block.y) * BlocksWide() + uint(block.x)];
+}
+
+// legacy_apply: the grey the model lifted into a dark block (at most 0.025) taken out again,
+// only where the block's brightest pixel is near black.
+void ApplyBlackLevel(ivec2 pixel) {
+    const ivec2 block_max = ivec2((uvec2(pc.scene_size) + 31u) / 32u) - 1;
+    const vec2 block_pos = (vec2(pixel) + 0.5) / 32.0 - 0.5;
+    const ivec2 b0 = clamp(ivec2(floor(block_pos)), ivec2(0), block_max);
+    const ivec2 b1 = min(b0 + 1, block_max);
+    const vec2 f = clamp(block_pos - vec2(b0), 0.0, 1.0);
+    const vec4 m = mix(mix(BlockAt(b0), BlockAt(ivec2(b1.x, b0.y)), f.x),
+                       mix(BlockAt(ivec2(b0.x, b1.y)), BlockAt(b1), f.x), f.y);
+    const float gate = pc.black_restore == 2u ? 2.0 : 0.061;
+    const float weight = pc.black_restore == 3u ? 1.0 - smoothstep(0.5 * gate, gate, m.z)
+                                                : (m.z <= gate ? 1.0 : 0.0);
+    const float pedestal = clamp(m.x - m.y, 0.0, 0.025) * weight;
+    if (pedestal <= 0.0)
+        return;
+    const vec4 value = imageLoad(scene, pixel);
+    imageStore(scene, pixel,
+               vec4(CodecToScene(max(SceneToCodec(value.rgb) - pedestal, 0.0)), value.a));
+}
+
+void Measure() {
+    const uint index = gl_LocalInvocationIndex;
+    const vec2 at = (vec2(gl_LocalInvocationID.xy) + 0.5) / 16.0 * vec2(pc.scene_size);
+    const vec3 light = SceneToLight(imageLoad(scene, ivec2(at)).rgb);
+    log_sum[index] = log(max(Luma(light), 1e-4));
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (index < stride)
+            log_sum[index] += log_sum[index + stride];
+        barrier();
+    }
+    if (index == 0u) {
+        // The scene's average light shows as mid grey.
+        const float measured = clamp(exp(log_sum[0] / 256.0) / 0.18, 0.01, 10000.0);
+        white = white > 0.0 ? mix(white, measured, 0.05) : measured;
+    }
+}
+
+void main() {
+    if (pc.mode == 0u) {
+        Measure();
+        return;
+    }
+    if (pc.mode == 3u) {
+        ReduceBlackLevel();
+        return;
+    }
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pc.mode == 4u) {
+        if (all(lessThan(pixel, pc.scene_size)))
+            ApplyBlackLevel(pixel);
+        return;
+    }
+    if (pc.mode == 1u) {
+        if (any(greaterThanEqual(pixel, pc.work_size)))
+            return;
+        const vec2 ratio = vec2(pc.work_size) / vec2(pc.scene_size);
+        const vec2 at = (vec2(pixel) + 0.5) / ratio;
+        const vec3 shown = pc.blending == 1u
+                               ? ToRenoProxy(SampleSceneRenoLight(at, pc.scene_size, ratio))
+                               : ToProxy(SampleSceneLight(at, pc.scene_size, ratio));
+        imageStore(proxy_out, pixel, vec4(shown, 1.0));
+        return;
+    }
+    if (any(greaterThanEqual(pixel, pc.scene_size)))
+        return;
+    const vec4 original = imageLoad(scene, pixel);
+    const vec2 ratio = vec2(pc.scene_size) / vec2(pc.work_size);
+    const vec2 at = (vec2(pixel) + 0.5) / ratio;
+    vec3 result;
+    if (pc.debug_view == 1u) {
+        result = SampleProxyShown(at, pc.work_size, ratio);
+    } else if (pc.debug_view == 2u) {
+        result = SampleAnswerShown(at, pc.work_size, ratio);
+    } else if (pc.debug_view == 3u) {
+        result = pc.blending == 1u
+                     ? abs(SampleAnswerShown(at, pc.work_size, ratio) -
+                           SampleProxyShown(at, pc.work_size, ratio)) * 20.0
+                     : abs(SampleAnswer(at, pc.work_size, ratio) -
+                           SampleProxy(at, pc.work_size, ratio)) * 20.0;
+    } else if (pc.blending == 1u) {
+        imageStore(scene, pixel,
+                   vec4(CodecToScene(RenoResolveAt(pixel, original.rgb)), original.a));
+        return;
+    } else {
+        const vec3 proxy = SampleProxy(at, pc.work_size, ratio);
+        const vec3 answer = SampleAnswer(at, pc.work_size, ratio);
+        const vec3 light = SceneToLight(original.rgb);
+        const float floor_ = 1e-4 * WhitePoint();
+        const float luma_proxy = max(Luma(proxy), floor_);
+        const float luma_answer = max(Luma(answer), floor_);
+        float gain = pow(luma_answer / luma_proxy, pc.transfer);
+        gain = isnan(gain) || isinf(gain) ? 1.0 : min(gain, pc.max_ratio);
+        const float luma = Luma(light) * gain;
+        const vec3 hue = light / max(Luma(light), floor_) +
+                         pc.colour * (answer / luma_answer - proxy / luma_proxy);
+        result = max(hue, 0.0) * luma;
+        result *= luma / max(Luma(result), floor_);
+    }
+    imageStore(scene, pixel, vec4(LightToScene(result), original.a));
+}

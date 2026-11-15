@@ -4122,6 +4122,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         light_shadow_buffers = {};
         light_shadows->ClearPending();
     }
+    const bool post_log =
+        stage.sw_stage == Shader::SwStage::Fragment && temporal_dlss.PostLogActive();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
         const auto src_access =
@@ -4150,6 +4152,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     sharp.GetSize()};
             }
             const auto observe_start = RecMark();
+            if (post_log) {
+                temporal_dlss.ObservePostConstants(
+                    buffer_index,
+                    desc.IsSpecial()
+                        ? static_cast<const void*>(stage.FlatUserData().data())
+                        : reinterpret_cast<const void*>(desc.GetSharp(stage).base_address),
+                    size);
+            }
             if (desc.IsSpecial()) {
                 temporal_dlss.ObserveConstants(runtime, instance, ring, prefetched->offset, size,
                                                stage.pgm_hash, binding.unified);
@@ -4211,6 +4221,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u32 ubo_size = flat_ud.size() * sizeof(u32);
                 const u64 offset = vk_buffer.Copy(flat_ud.data(), ubo_size, alignment);
                 res->buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                if (post_log) {
+                    temporal_dlss.ObservePostConstants(buffer_index, flat_ud.data(), ubo_size);
+                }
                 temporal_dlss.ObserveConstants(runtime, instance, &vk_buffer, offset, ubo_size,
                                                stage.pgm_hash, binding.unified);
                 temporal_dlss.ObserveSceneConstants(flat_ud.data(), ubo_size);
@@ -4313,6 +4326,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
                 RecAdd(RecDetail::BufferHazards, hazard_start);
                 const auto observe_start = RecMark();
+                if (post_log && !desc.is_written) {
+                    temporal_dlss.ObservePostConstants(
+                        buffer_index, reinterpret_cast<const void*>(vsharp.base_address), size);
+                }
                 if (!desc.is_written && vbao) {
                     vbao->ObserveSceneConstants(reinterpret_cast<const void*>(vsharp.base_address),
                                                 size);

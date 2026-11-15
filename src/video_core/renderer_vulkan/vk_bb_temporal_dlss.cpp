@@ -10,6 +10,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <numbers>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -30,8 +31,11 @@
 #include "video_core/host_shaders/bb_dlss_motion_comp.h"
 #include "video_core/host_shaders/bb_dlss_motion_debug_comp.h"
 #include "video_core/host_shaders/bb_dlss_sharpen_hdr_comp.h"
+#include "video_core/host_shaders/bb_finished_store_comp.h"
 #include "video_core/host_shaders/bb_hud_layer_comp.h"
 #include "video_core/host_shaders/bb_hudless_dim_comp.h"
+#include "video_core/host_shaders/bb_picture_comp.h"
+#include "video_core/renderer_vulkan/vk_bb_dlss5.h"
 #include "video_core/renderer_vulkan/vk_bb_library.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
@@ -167,6 +171,8 @@ constexpr u64 CoverageSlots = 3, CoverageStride = 256;
 constexpr u64 DimmingBytes = 2 * 64 * sizeof(u32); // HUD dimming histogram, GPU only
 constexpr vk::ImageSubresourceRange Range{
     .aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1};
+
+std::atomic<bool> post_log_request{false};
 
 bool IsUiShader(u64 hash) {
     return hash == 0x34e8a281 || hash == 0x81d336ce || hash == 0x09957251 || hash == 0x24042a9b ||
@@ -491,6 +497,9 @@ struct Tune {
     bool menu_fix = true;
     bool auto_exposure = true;    // HDR input (decoupled UI): FSR computes the exposure
     bool texture_lod_bias = true; // sharper scene textures while upscaling (BbSceneMipBias)
+    BbDlss5Settings dlss5;
+    // Picture tuning (bb_picture.comp): 1, 1, 1 and 0 leave the picture alone.
+    float brightness = 1.0f, contrast = 1.0f, saturation = 1.0f, black = 0.0f;
 };
 
 enum class Backend { None, Dlss, Fsr, Fsr4, AmdFsr };
@@ -630,7 +639,8 @@ struct BbTemporalDlss::Impl {
     u32 producer_constants{}, producer_depths{}, velocity_draw_constants{};
     std::unordered_map<VAddr, std::unique_ptr<OwnedImage>> outputs;
     std::unique_ptr<ComputePass> motion_pass, composite_pass, composite_hdr_pass, linearize_pass,
-        sharpen_pass, hudless_dim_pass, motion_debug_pass, hud_layer_pass;
+        sharpen_pass, hudless_dim_pass, motion_debug_pass, hud_layer_pass, picture_pass,
+        finished_store_pass;
     vk::UniqueSampler nearest, linear;
     Backend backend{};
     // Menus cover much of the screen. Where the HUD layer can't be drawn (RenoDX), the scene is
@@ -644,6 +654,62 @@ struct BbTemporalDlss::Impl {
     bool fsr_tried{}, amd_fsr_tried{}, fsr4_tried{}, camera_logged{};
     BbObjectMotion* object_motion{};
     u64 character_motion_frames{};
+    BbDlss5 dlss5;
+    bool dlss5_before{};
+    // BbRequestPostLog: 1 waiting for the scene copy, 2 logging up to the display copy.
+    std::atomic<int> post_log_state{0};
+    u32 post_log_draws{}, post_log_ui{}, post_log_frames{};
+    std::vector<std::string> post_log_constants;
+
+    void PostLogDraw(const DrawInfo& draw, const VideoCore::Image* color) {
+        int state = post_log_state.load(std::memory_order_relaxed);
+        if (state == 0 && post_log_request.exchange(false)) {
+            state = 1;
+            post_log_draws = post_log_ui = post_log_frames = 0;
+            LOG_INFO(Render_Vulkan, "[POST-LOG] Waiting for the scene copy");
+        }
+        if (state == 1 && draw.ps_hash == HdrSceneCopy)
+            state = 2;
+        if (state == 2) {
+            if (IsUiShader(draw.vs_hash)) {
+                ++post_log_ui;
+            } else {
+                LOG_INFO(Render_Vulkan,
+                         "[POST-LOG] #{} ps {:08x} vs {:08x} target {}x{} {} indices {} "
+                         "instances {} depth test {}",
+                         post_log_draws, draw.ps_hash, draw.vs_hash,
+                         color ? color->info.size.width : 0, color ? color->info.size.height : 0,
+                         color ? vk::to_string(color->info.pixel_format) : std::string{"none"},
+                         draw.num_indices, draw.num_instances, draw.depth_test);
+                for (const auto& line : post_log_constants)
+                    LOG_INFO(Render_Vulkan, "[POST-LOG]     {}", line);
+            }
+            ++post_log_draws;
+        }
+        if (draw.ps_hash == DisplayCopy && state != 0) {
+            if (state == 2) {
+                LOG_INFO(Render_Vulkan, "[POST-LOG] Display copy: {} draws, {} HUD draws left out",
+                         post_log_draws, post_log_ui);
+                state = 0;
+            } else if (++post_log_frames >= 30) {
+                LOG_INFO(Render_Vulkan, "[POST-LOG] No scene copy in 30 frames: nothing logged");
+                state = 0;
+            }
+        }
+        post_log_constants.clear();
+        post_log_state.store(state, std::memory_order_relaxed);
+    }
+
+    // Decoupled UI: this frame's depth and motion for DLSS 5 on the finished frame, and that
+    // frame's float copy.
+    struct Guides {
+        DlssNgx::Resource depth, motion;
+        Tracked depth_image;
+        bool reset{};
+        bool valid{};
+    } guides;
+    std::unique_ptr<OwnedImage> finished;
+    bool finished_done{};
 
     Impl() {
         requested = BbTemporalDlssRequested();
@@ -673,6 +739,8 @@ struct BbTemporalDlss::Impl {
             const auto key = line.substr(0, eq);
             const auto value = line.substr(eq + 1);
             const int number = std::atoi(value.c_str());
+            if (ParseBbDlss5Setting(next.dlss5, key, value))
+                continue;
             if (key == "enabled")
                 next.enabled = number != 0;
             else if (key == "jitter")
@@ -723,6 +791,14 @@ struct BbTemporalDlss::Impl {
                 next.texture_lod_bias = number != 0;
             else if (key == "motion_blur")
                 next.motion_blur = number != 0;
+            else if (key == "picture_brightness")
+                next.brightness = std::clamp(float(std::atof(value.c_str())), 0.0f, 5.0f);
+            else if (key == "picture_contrast")
+                next.contrast = std::clamp(float(std::atof(value.c_str())), 0.5f, 2.0f);
+            else if (key == "picture_saturation")
+                next.saturation = std::clamp(float(std::atof(value.c_str())), 0.0f, 5.0f);
+            else if (key == "picture_black")
+                next.black = std::clamp(float(std::atof(value.c_str())), 0.0f, 0.25f);
             else if (key == "character_motion")
                 next.character_motion = number != 0;
             else if (key == "upscaler")
@@ -793,6 +869,12 @@ struct BbTemporalDlss::Impl {
             T::eStorageImage,         T::eStorageBuffer};
         hud_layer_pass =
             std::make_unique<ComputePass>(device, hud_layer_types, BB_HUD_LAYER_COMP, 4);
+        static constexpr std::array picture_types{T::eStorageImage};
+        picture_pass = std::make_unique<ComputePass>(device, picture_types, BB_PICTURE_COMP, 20);
+        static constexpr std::array finished_store_types{T::eCombinedImageSampler,
+                                                         T::eStorageImage};
+        finished_store_pass =
+            std::make_unique<ComputePass>(device, finished_store_types, BB_FINISHED_STORE_COMP, 20);
         const auto sampler = [&](vk::Filter filter) {
             return Make(device.createSamplerUnique(vk::SamplerCreateInfo{
                             .magFilter = filter,
@@ -1268,6 +1350,161 @@ struct BbTemporalDlss::Impl {
     bool RunDlss(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
                  VideoCore::TextureCache& cache, BbVelocityMirror& mirror, VideoCore::Image& source,
                  bool pre_hud, std::optional<vk::Extent2D> upscale_to = std::nullopt);
+    bool PictureTuned() const {
+        return tune.brightness != 1.0f || tune.contrast != 1.0f || tune.saturation != 1.0f ||
+               tune.black != 0.0f;
+    }
+
+    // Picture tuning (bb_picture.comp) on `image`, in place.
+    template <typename Command>
+    void ApplyPicture(const Command& command, OwnedImage& image, BbDlss5::Encoding encoding) {
+        if (!PictureTuned())
+            return;
+        image.Transit(command, vk::ImageLayout::eGeneral,
+                      vk::PipelineStageFlagBits2::eComputeShader,
+                      vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+        const vk::DescriptorImageInfo info{{}, *image.view, vk::ImageLayout::eGeneral};
+        const std::array writes{
+            vk::WriteDescriptorSet{.dstBinding = 0,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eStorageImage,
+                                   .pImageInfo = &info}};
+        const struct {
+            u32 encoding;
+            float brightness, contrast, saturation, black;
+        } push{u32(encoding), tune.brightness, tune.contrast, tune.saturation, tune.black};
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, *picture_pass->pipeline);
+        command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *picture_pass->layout, 0,
+                                     writes);
+        command.pushConstants(*picture_pass->layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(push), &push);
+        command.dispatch((image.extent.width + 7) / 8, (image.extent.height + 7) / 8, 1);
+    }
+
+    // Decoupled UI: DLSS 5 and the picture tuning on the game's finished frame in `target` (its
+    // post-processing done, no HUD yet), as the regular mode gets them; once a frame.
+    void FinishFrame(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
+                     VideoCore::TextureCache& cache, VideoCore::Image& target) {
+        finished_done = true;
+        if (!guides.valid || !last_copy_view || (!tune.dlss5.enabled && !PictureTuned()))
+            return;
+        const auto& read_info = *last_copy_view;
+        const bool srgb_view = read_info.format == vk::Format::eR8G8B8A8Srgb ||
+                               read_info.format == vk::Format::eB8G8R8A8Srgb;
+        if (target.info.pixel_format != vk::Format::eR8G8B8A8Unorm &&
+            target.info.pixel_format != vk::Format::eR8G8B8A8Srgb)
+            return;
+        auto* depth = cache.TryGetImage(guides.depth_image.id, guides.depth_image.uid);
+        if (!depth || !motion)
+            return;
+        scheduler.EndRendering();
+        EnsurePipelines(instance);
+        const vk::Extent2D size{target.info.size.width, target.info.size.height};
+        if (!finished || finished->extent != size) {
+            if (finished)
+                scheduler.Finish();
+            using U = vk::ImageUsageFlagBits;
+            finished = std::make_unique<OwnedImage>(instance, vk::Format::eR16G16B16A16Sfloat, size,
+                                                    U::eSampled | U::eStorage);
+        }
+        const auto& read_view = target.FindView(read_info);
+        VideoCore::ImageViewInfo write_info{};
+        write_info.format = vk::Format::eR8G8B8A8Unorm;
+        write_info.is_storage = true;
+        const auto& write_view = target.FindView(write_info);
+        const auto encoding = srgb_view ? BbDlss5::Encoding::Linear : BbDlss5::Encoding::Srgb;
+        const QueuedCommands command{scheduler};
+
+        runtime.Transit(&target, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.Transit(depth, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
+        motion->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        finished->Transit(command, vk::ImageLayout::eGeneral,
+                          vk::PipelineStageFlagBits2::eComputeShader,
+                          vk::AccessFlagBits2::eShaderWrite);
+        {
+            const std::array images{
+                vk::DescriptorImageInfo{*nearest, *read_view.image_view,
+                                        vk::ImageLayout::eShaderReadOnlyOptimal},
+                vk::DescriptorImageInfo{{}, *finished->view, vk::ImageLayout::eGeneral}};
+            const std::array writes{
+                vk::WriteDescriptorSet{.dstBinding = 0,
+                                       .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                       .pImageInfo = &images[0]},
+                vk::WriteDescriptorSet{.dstBinding = 1,
+                                       .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eStorageImage,
+                                       .pImageInfo = &images[1]}};
+            const u32 copy_flags = 2; // plain copy
+            command.bindPipeline(vk::PipelineBindPoint::eCompute, *linearize_pass->pipeline);
+            command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *linearize_pass->layout,
+                                         0, writes);
+            command.pushConstants(*linearize_pass->layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                  sizeof(copy_flags), &copy_flags);
+            command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+        }
+        finished->Transit(command, vk::ImageLayout::eGeneral,
+                          vk::PipelineStageFlagBits2::eComputeShader,
+                          vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+        const BbDlss5::Inputs neural{.image = finished->image.image,
+                                     .view = *finished->view,
+                                     .extent = size,
+                                     .encoding = encoding,
+                                     .depth = guides.depth,
+                                     .motion = guides.motion,
+                                     .depth_inverted = tune.depth_inverted,
+                                     .reset = guides.reset};
+        // "Before upscaling" keeps its cost here: the model works at the render size.
+        auto settings = tune.dlss5;
+        if (settings.before_upscale && render.width && render.width < size.width)
+            settings.working_scale *= float(render.width) / float(size.width);
+        dlss5.Apply(instance, scheduler, settings, neural);
+        ApplyPicture(command, *finished, encoding);
+
+        runtime.Transit(&target, vk::ImageLayout::eGeneral,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+        runtime.FlushBarriers();
+        finished->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                          vk::PipelineStageFlagBits2::eComputeShader,
+                          vk::AccessFlagBits2::eShaderRead);
+        {
+            const std::array images{
+                vk::DescriptorImageInfo{*nearest, *finished->view,
+                                        vk::ImageLayout::eShaderReadOnlyOptimal},
+                vk::DescriptorImageInfo{{}, *write_view.image_view, vk::ImageLayout::eGeneral}};
+            const std::array writes{
+                vk::WriteDescriptorSet{.dstBinding = 0,
+                                       .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                       .pImageInfo = &images[0]},
+                vk::WriteDescriptorSet{.dstBinding = 1,
+                                       .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eStorageImage,
+                                       .pImageInfo = &images[1]}};
+            const struct {
+                std::array<u32, 4> map;
+                u32 srgb;
+            } push{
+                {read_info.mapping.Map(0), read_info.mapping.Map(1), read_info.mapping.Map(2), 3},
+                srgb_view ? 1u : 0u};
+            command.bindPipeline(vk::PipelineBindPoint::eCompute, *finished_store_pass->pipeline);
+            command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
+                                         *finished_store_pass->layout, 0, writes);
+            command.pushConstants(*finished_store_pass->layout, vk::ShaderStageFlagBits::eCompute,
+                                  0, sizeof(push), &push);
+            command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+        }
+        scheduler.GetDynamicState().Invalidate();
+    }
+
     void SnapshotHud(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
                      VideoCore::Image& target) {
         scheduler.EndRendering();
@@ -1790,7 +2027,14 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     // the 16-bit HDR scene of the Decoupled UI patches), so it gets the scene the same way.
     // With RenoDX every upscaler gets it, reversibly tone mapped so highlights above 1 survive.
     const bool linear = (backend == Backend::Fsr4 && !hdr && tune.fsr4_linear) || renodx;
-    if (linear) {
+    // DLSS 5 before upscaling works on a float copy of the upscaler's input.
+    // Decoupled UI: the game grades this scene after us (exposure, bloom), so DLSS 5 and the
+    // picture tuning work on its finished frame instead (FinishFrame). RenoDX's float target
+    // keeps the old way.
+    const bool on_finished = upscale_to.has_value() && !RenoDxLoaded();
+    const bool neural_before = !on_finished && tune.dlss5.enabled && tune.dlss5.before_upscale;
+    const bool own_input = linear || neural_before;
+    if (own_input) {
         linear_color->Transit(command, vk::ImageLayout::eGeneral,
                               vk::PipelineStageFlagBits2::eComputeShader,
                               vk::AccessFlagBits2::eShaderWrite);
@@ -1807,7 +2051,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                                    .descriptorCount = 1,
                                    .descriptorType = vk::DescriptorType::eStorageImage,
                                    .pImageInfo = &images[1]}};
-        const u32 linear_flags = renodx ? 1u : 0u;
+        const u32 linear_flags = !linear ? 2u : renodx ? 1u : 0u;
         command.bindPipeline(vk::PipelineBindPoint::eCompute, *linearize_pass->pipeline);
         command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *linearize_pass->layout, 0,
                                      writes);
@@ -1822,18 +2066,44 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         history_valid = false; // the history is in the other encoding
     upscaled_linear = linear;
     upscaled_tone_mapped = renodx;
+    if (neural_before != dlss5_before)
+        history_valid = false;
+    dlss5_before = neural_before;
     const DlssNgx::Resource depth_resource{depth->backing->image.image, *depth_view.image_view,
                                            Range, vk::Format::eR32Sfloat, in};
     const bool reset = !history_valid;
+    const auto neural_encoding = hdr      ? BbDlss5::Encoding::Hdr
+                                 : renodx ? BbDlss5::Encoding::ToneMapped
+                                 : linear ? BbDlss5::Encoding::Linear
+                                          : BbDlss5::Encoding::Srgb;
     const DlssNgx::EvalDesc eval{(tune.swap ? applied[1] : applied[0]) * tune.sign_x,
                                  (tune.swap ? applied[0] : applied[1]) * tune.sign_y, reset,
                                  frame_ms};
+    if (neural_before) {
+        linear_color->Transit(command, vk::ImageLayout::eGeneral,
+                              vk::PipelineStageFlagBits2::eComputeShader,
+                              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+        const BbDlss5::Inputs neural{.image = linear_color->image.image,
+                                     .view = *linear_color->view,
+                                     .extent = in,
+                                     .encoding = neural_encoding,
+                                     .depth = depth_resource,
+                                     .motion = motion->Resource(),
+                                     .depth_inverted = tune.depth_inverted,
+                                     .reset = reset};
+        if (dlss5.Apply(instance, scheduler, tune.dlss5, neural))
+            scheduler.GetDynamicState().Invalidate();
+        linear_color->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                              vk::PipelineStageFlagBits2::eComputeShader,
+                              vk::AccessFlagBits2::eShaderRead);
+    }
+    const auto& upscale_input = own_input ? linear_color : snapshot;
     bool success = true;
     if (backend == Backend::Dlss) {
         // Recorded by the recording thread like the passes around it; a failure is seen at the
         // next evaluation (stock rendering from then on, as before).
-        scheduler.Record([ngx, color = (linear ? linear_color : snapshot)->Resource(),
-                          depth_resource, motion_resource = motion->Resource(),
+        scheduler.Record([ngx, color = upscale_input->Resource(), depth_resource,
+                          motion_resource = motion->Resource(),
                           output_resource = upscaled->Resource(), eval, failure = &evaluate_failed,
                           mode = upscale_to ? 2 : 1](vk::CommandBuffer cmdbuf) {
             const auto start = std::chrono::steady_clock::now();
@@ -1849,13 +2119,12 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         // FSR 4 waits for and tracks its own submissions through the scheduler: recorded here.
         const auto direct = scheduler.CommandBuffer();
         success = backend == Backend::Fsr4
-                      ? fsr4->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
-                                       depth_resource, motion->Resource(), upscaled->Resource(),
-                                       eval, FsrCamera(), hdr ? (tune.auto_exposure ? 1 : 2) : 0)
+                      ? fsr4->Evaluate(direct, upscale_input->Resource(), depth_resource,
+                                       motion->Resource(), upscaled->Resource(), eval, FsrCamera(),
+                                       hdr ? (tune.auto_exposure ? 1 : 2) : 0)
                       : (backend == Backend::AmdFsr ? amd_fsr : fsr)
-                            ->Evaluate(direct, (linear ? linear_color : snapshot)->Resource(),
-                                       depth_resource, motion->Resource(), upscaled->Resource(),
-                                       eval, FsrCamera());
+                            ->Evaluate(direct, upscale_input->Resource(), depth_resource,
+                                       motion->Resource(), upscaled->Resource(), eval, FsrCamera());
     }
     scheduler.GetDynamicState().Invalidate(); // the upscaler records its own Vulkan state
     if (!success) {
@@ -1863,6 +2132,23 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         LOG_ERROR(Render_Vulkan, "[DLSS-TEMPORAL] Evaluation failed; stock rendering");
         return false;
     }
+    if (on_finished) {
+        // The finished frame gets DLSS 5 and the picture tuning before its HUD (FinishFrame).
+        guides = Guides{depth_resource, motion->Resource(), *r32_depth, reset, true};
+    } else if (!neural_before) {
+        const BbDlss5::Inputs neural{.image = upscaled->image.image,
+                                     .view = *upscaled->view,
+                                     .extent = out,
+                                     .encoding = neural_encoding,
+                                     .depth = depth_resource,
+                                     .motion = motion->Resource(),
+                                     .depth_inverted = tune.depth_inverted,
+                                     .reset = reset};
+        if (dlss5.Apply(instance, scheduler, tune.dlss5, neural))
+            scheduler.GetDynamicState().Invalidate();
+    }
+    if (!on_finished)
+        ApplyPicture(command, *upscaled, neural_encoding);
     if (upscale_to && tune.debug_motion) {
         // The composite (and its motion view) does not run when the upscaled image replaces
         // the game's own upscale: draw the motion view over the upscaled image instead.
@@ -2325,6 +2611,28 @@ void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::Im
         impl->hdr_copy_source = Impl::Bound{id, view};
 }
 
+bool BbTemporalDlss::PostLogActive() const {
+    return post_log_request.load(std::memory_order_relaxed) ||
+           impl->post_log_state.load(std::memory_order_relaxed) != 0;
+}
+
+void BbTemporalDlss::ObservePostConstants(u32 index, const void* data, u64 size) {
+    if (!data || !size)
+        return;
+    const u64 count = std::min<u64>(size / 4, 64);
+    std::string line = fmt::format("b{} ({} bytes):", index, size);
+    for (u64 i = 0; i < count; ++i) {
+        float value;
+        std::memcpy(&value, static_cast<const u8*>(data) + i * 4, 4);
+        line += fmt::format(" {}", value);
+    }
+    impl->post_log_constants.push_back(std::move(line));
+}
+
+void BbRequestPostLog() {
+    post_log_request.store(true);
+}
+
 void BbTemporalDlss::ObserveBlurInputs(const void* data, u64 size, u64 hash, u32 binding) {
     auto& s = *impl;
     if (!s.requested || s.failed || s.stopped || !data)
@@ -2411,6 +2719,7 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
     if (!s.requested || s.failed || s.stopped)
         return {};
     auto* color = draw.color ? &cache.GetImage(draw.color) : nullptr;
+    s.PostLogDraw(draw, color);
     try {
         if (draw.ps_hash == MotionBlur || draw.ps_hash == MotionBlurAlt) {
             ++s.blur.blur_draws;
@@ -2496,6 +2805,8 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
             s.last_copy_format = s.copy_source->view.format;
             s.last_copy_view = s.copy_source->view;
             s.hud_snapshot_taken = false;
+            s.finished_done = false;
+            s.guides.valid = false;
             s.DisplayCopyDone();
             return {};
         }
@@ -2522,6 +2833,10 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
             return depth && depth->info.size.width == image.info.size.width &&
                    depth->info.size.height == image.info.size.height;
         };
+        // Decoupled UI: DLSS 5 and the picture tuning on the finished frame, before its HUD.
+        if (s.decoupled && !s.finished_done && color && IsUiShader(draw.vs_hash) &&
+            s.last_copy_source && draw.color == *s.last_copy_source)
+            s.FinishFrame(instance, runtime, scheduler, cache, *color);
         // Decoupled UI + FSR frame generation: the UI target as it is before the HUD.
         if (s.decoupled && !s.hud_snapshot_taken && s.frame_gen_pending && color &&
             IsUiShader(draw.vs_hash) && s.last_copy_source && draw.color == *s.last_copy_source &&
@@ -2685,6 +3000,7 @@ void BbTemporalDlss::Shutdown(const Instance& instance, Scheduler& scheduler) {
     s.amd_fsr.reset();
     s.fsr.reset();
     s.fsr4.reset();
+    s.dlss5.Shutdown(instance.GetDlssNgx());
     if (auto* ngx = instance.GetDlssNgx()) {
         ngx->ReleaseFeatureAfterGpuDrain();
         ngx->Shutdown();
@@ -2709,6 +3025,9 @@ void BbTemporalDlss::Shutdown(const Instance& instance, Scheduler& scheduler) {
     s.sharpen_pass.reset();
     s.motion_debug_pass.reset();
     s.hudless_dim_pass.reset();
+    s.picture_pass.reset();
+    s.finished_store_pass.reset();
+    s.finished.reset();
     LOG_INFO(Render_Vulkan, "[DLSS-TEMPORAL] Teardown: evaluations={} composites={} fallbacks={}",
              s.evaluations, s.composites, s.fallbacks);
 }

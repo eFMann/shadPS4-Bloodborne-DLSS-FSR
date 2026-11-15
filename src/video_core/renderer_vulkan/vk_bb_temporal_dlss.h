@@ -53,6 +53,9 @@ BbDlssStatus BbTemporalDlssStatus();
 // DLSS guide, AMD's FSR guide: log2(render / output) - 1), 0 otherwise or when turned off in F1.
 float BbSceneMipBias();
 void BbTemporalDlssReportGpu(std::string_view gpu);
+// F1 (Graphics, Picture): writes the next frame's post-processing to the log, from the game's
+// scene copy to its display copy: each pass's shaders, target and pixel shader constants.
+void BbRequestPostLog();
 void BbTemporalDlssReportProblem(std::string_view problem);
 
 class BbTemporalDlss {
@@ -117,6 +120,10 @@ public:
                           u32 binding);
     // The same bytes CPU-side: the game's motion blur inputs, for the motion blur watch.
     void ObserveBlurInputs(const void* data, u64 size, u64 shader_hash, u32 binding);
+    // BbRequestPostLog: while a frame is logged, the constants of the draw about to be passed
+    // to OnDraw (pixel shader buffer `index`).
+    bool PostLogActive() const;
+    void ObservePostConstants(u32 index, const void* data, u64 size);
 
     struct Presentation {
         vk::ImageView view;

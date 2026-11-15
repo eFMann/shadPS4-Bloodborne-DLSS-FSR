@@ -15,7 +15,6 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/render_affinity.h"
-#include "core/bb_game_fixes.h"
 #include "core/bb_resolution.h"
 #include "core/cpu_patches.h"
 #include "core/devtools/layer.h"
@@ -1594,16 +1593,11 @@ void SettingsWindow::DrawBbImageSettings() {
     AddSettingCombo("Screen space reflections", ssr_mode, ssr_modes);
     if (ImGui::IsItemHovered()) {
         ShowTooltip("Built in, no patch needed. Better: traced more precisely, sharper, to the "
-                    "screen's edges. Off: no cost. Switching between Off and on needs a restart");
+                    "screen's edges. Off: none at all. Changes at once");
     }
     if (ssr_mode != ssr_before) {
         EmulatorSettings.SetBbSsrMode(ssr_mode);
         saved();
-        // Off to on or back: the game's own reflection code is patched in at a start.
-        if (isGameRunning && ::Core::BbGameFixes::SsrNeedsRestart(ssr_mode)) {
-            restartChanged = {"Screen space reflections"};
-            restartPromptRequest = true;
-        }
     }
     if (ssr_mode == 1) {
         checkbox(

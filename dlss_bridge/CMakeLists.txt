@@ -31,6 +31,9 @@ if (WIN32)
     target_link_libraries(shadps4_dlss PRIVATE
                           "${DLSS_SDK_ROOT}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
     target_compile_definitions(shadps4_dlss PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    # DLSS 5's model only takes calls from a library with "nvngx.dll" in its path.
+    add_library(shadps4_dlss5_nvngx SHARED shadps4_dlss5_nvngx.cpp)
+    add_dependencies(shadps4_dlss shadps4_dlss5_nvngx)
 else()
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/exports.map" "{ global: ShadDlssGetApi; local: *; };")
     set_target_properties(shadps4_dlss PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)

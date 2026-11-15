@@ -72,7 +72,7 @@ void main() {
 
 layout(binding = 0) uniform texture2D depth_tex;  // the game's depth copy (R32 float, 0..1)
 layout(binding = 1) uniform texture2D normal_tex; // G-buffer world normals (0.5 n + 0.5)
-layout(binding = 2) uniform texture2D mask_tex;   // the light draw's own mask (its texture 4)
+layout(binding = 2) uniform sampler2D mask_tex; // the light draw's own mask (its texture 4, any size)
 layout(binding = 3, r8) uniform writeonly image2D out_img;
 // A light draw of the batch: the rectangle it covers (first pixel, one past the last), each
 // light's layer (4 bits each, 15: not traced, 14: taken out) and how many lights it has, and
@@ -255,7 +255,8 @@ void main() {
     if (any(greaterThanEqual(uvec2(pixel), rect.zw)) || any(greaterThanEqual(pixel, size))) {
         return;
     }
-    const float mask = texelFetch(mask_tex, pixel, 0).r;
+    // As the light draws read it: its first channel, filtered at the pixel's place.
+    const float mask = textureLod(mask_tex, (vec2(pixel) + 0.5) / vec2(size), 0.0).r;
     const float depth = texelFetch(depth_tex, pixel, 0).r;
     if (depth >= 1.0) {
         imageStore(out_img, pixel, vec4(mask));

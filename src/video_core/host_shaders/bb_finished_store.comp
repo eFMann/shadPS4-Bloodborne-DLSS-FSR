@@ -1,0 +1,33 @@
+// SPDX-FileCopyrightText: Copyright 2026 IFreemz
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 460
+// Decoupled UI: the finished frame, worked on in a float copy read through the display copy's
+// view, written back into the game's 8-bit UI target before its HUD is drawn.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D processed;
+layout(binding = 1, rgba8) uniform image2D target;
+
+layout(push_constant) uniform Push {
+    uvec4 map;  // the target's channel the view shows as red, green and blue
+    uint srgb;  // the view decoded sRGB: encode again
+} pc;
+
+vec3 LinearToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(target))))
+        return;
+    vec3 color = texelFetch(processed, pixel, 0).rgb;
+    if (pc.srgb != 0u)
+        color = LinearToSrgb(color);
+    vec4 raw = imageLoad(target, pixel);
+    raw[pc.map.x] = color.r;
+    raw[pc.map.y] = color.g;
+    raw[pc.map.z] = color.b;
+    imageStore(target, pixel, raw);
+}

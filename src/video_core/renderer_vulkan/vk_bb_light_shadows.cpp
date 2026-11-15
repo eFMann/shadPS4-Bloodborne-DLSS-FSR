@@ -11,8 +11,10 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
+#include <fmt/format.h>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "video_core/amdgpu/regs.h"
@@ -215,6 +217,9 @@ struct BbLightShadows::Impl {
     vk::UniqueDescriptorSetLayout show_desc_layout;
     vk::UniquePipelineLayout show_pipeline_layout;
     vk::UniquePipeline show_pipeline;
+    /// The game's mask is read filtered where it is another size than the scene (half size
+    /// without the remaster mod), as its light draws read it.
+    vk::UniqueSampler mask_sampler;
 
     /// The shadowed masks the light draws read as their texture 4 (R8, the masks' size). Each
     /// light draw covers its own tile of the screen, so one image serves them all: a batch of
@@ -306,7 +311,9 @@ struct BbLightShadows::Impl {
     };
     std::array<Slot, MaxTraced> slots{};
     PushConstants last_view{}; ///< the frame's last light draw's camera (the debug view's markers)
-    std::array<u64, 64> logged{}; ///< light pixel shaders whose buffers were logged
+    std::array<u64, 64> logged{};   ///< light pixel shaders whose buffers were logged
+    std::array<u64, 32> rejected{}; ///< pixel shaders logged as left alone (their textures)
+    u32 rejected_logged{};
     u32 logged_shaders{};
     u32 traces_logged{};
     /// Log what it does: with the diagnostics in the log, or the debug view, on (each frame).
@@ -396,6 +403,15 @@ struct BbLightShadows::Impl {
     }
 
     void CreatePipelines() {
+        mask_sampler = CheckOrThrow(device.createSamplerUnique({
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+            .mipmapMode = vk::SamplerMipmapMode::eNearest,
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+            .maxLod = 0.0f,
+        }));
         using T = vk::DescriptorType;
         const auto bind = [](u32 binding, T type) {
             return vk::DescriptorSetLayoutBinding{.binding = binding,
@@ -404,9 +420,10 @@ struct BbLightShadows::Impl {
                                                   .stageFlags = vk::ShaderStageFlagBits::eCompute};
         };
         const std::array bindings = {
-            bind(0, T::eSampledImage), bind(1, T::eSampledImage),  bind(2, T::eSampledImage),
-            bind(3, T::eStorageImage), bind(4, T::eStorageBuffer), bind(6, T::eStorageImage),
-            bind(7, T::eStorageImage), bind(8, T::eSampledImage),
+            bind(0, T::eSampledImage),         bind(1, T::eSampledImage),
+            bind(2, T::eCombinedImageSampler), bind(3, T::eStorageImage),
+            bind(4, T::eStorageBuffer),        bind(6, T::eStorageImage),
+            bind(7, T::eStorageImage),         bind(8, T::eSampledImage),
         };
         desc_layout = CheckOrThrow(device.createDescriptorSetLayoutUnique({
             .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
@@ -563,20 +580,44 @@ struct BbLightShadows::Impl {
                           std::span<const VideoCore::ImageId> ids, const Buffer& camera,
                           const Buffer& lights, const AmdGpu::Regs& regs, const DrawArea& area) {
         prepared_id = 0;
+        // A draw whose buffers look like a light draw's (lights of 144 bytes each, the camera),
+        // left alone because of its textures: what they are, once a shader (the diagnostics).
+        const auto log_textures = [&](const char* why) {
+            if (!verbose || rejected_logged >= rejected.size() || lights.guest_size < LightBytes ||
+                lights.guest_size % LightBytes != 0 || camera.guest_size < CameraFloats * 4 ||
+                std::ranges::find(rejected, ps_hash) != rejected.end()) {
+                return;
+            }
+            rejected[rejected_logged++] = ps_hash;
+            std::string list;
+            for (u32 i = 0; i < ids.size(); ++i) {
+                if (!ids[i]) {
+                    list += fmt::format(" t{}: none;", i);
+                    continue;
+                }
+                const auto& info = texture_cache.GetImage(ids[i]).info;
+                list += fmt::format(" t{}: {} {}x{};", i, vk::to_string(info.pixel_format),
+                                    info.size.width, info.size.height);
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Light shadows: draw of pixel shader {:#x} ({} lights) left alone ({}):{}",
+                     ps_hash, lights.guest_size / LightBytes, why, list);
+        };
         if (textures.size() < 5 || ids.size() < 5 || !ids[0] || !ids[1] || !ids[4]) {
+            log_textures("fewer than 5 textures");
             return {};
         }
         const auto& depth = texture_cache.GetImage(ids[0]).info;
         const auto& normals = texture_cache.GetImage(ids[1]).info;
         const auto& game_mask = texture_cache.GetImage(ids[4]).info;
-        // The light draws' textures: the depth copy, the normals, the R8 mask, all one size.
+        // The light draws' textures: the depth copy and the normals, one size, and the mask, of
+        // which their shaders read the first channel (R8 at full size with the remaster mod,
+        // RGBA8 at half size without).
         if (depth.pixel_format != vk::Format::eR32Sfloat ||
             normals.pixel_format != vk::Format::eR8G8B8A8Unorm ||
-            game_mask.pixel_format != vk::Format::eR8Unorm ||
-            depth.size.width != game_mask.size.width ||
-            depth.size.height != game_mask.size.height ||
-            normals.size.width != game_mask.size.width ||
-            normals.size.height != game_mask.size.height || game_mask.num_samples != 1) {
+            normals.size.width != depth.size.width || normals.size.height != depth.size.height ||
+            depth.num_samples != 1 || game_mask.num_samples != 1) {
+            log_textures("its textures are not a depth copy R32 and normals RGBA8 of one size");
             return {};
         }
         ++stats.light_draws;
@@ -602,8 +643,8 @@ struct BbLightShadows::Impl {
         const auto& control = regs.viewport_control;
         const float x_sign = control.xscale_enable && vp.xscale < 0.0f ? -1.0f : 1.0f;
         const float y_sign = control.yscale_enable && vp.yscale < 0.0f ? -1.0f : 1.0f;
-        const float width = float(game_mask.size.width);
-        const float height = float(game_mask.size.height);
+        const float width = float(depth.size.width);
+        const float height = float(depth.size.height);
         push.viewport = {width * 0.5f * x_sign, width * 0.5f, height * 0.5f * y_sign,
                          height * 0.5f};
 
@@ -614,8 +655,8 @@ struct BbLightShadows::Impl {
             LOG_INFO(Render_Vulkan,
                      "Light shadows: light draws of pixel shader {:#x}, lights buffer {} bytes "
                      "({} lights), camera buffer {} bytes, {}x{}",
-                     ps_hash, lights.guest_size, count, camera.guest_size, game_mask.size.width,
-                     game_mask.size.height);
+                     ps_hash, lights.guest_size, count, camera.guest_size, depth.size.width,
+                     depth.size.height);
         }
         stats.lights += count;
 
@@ -711,7 +752,7 @@ struct BbLightShadows::Impl {
         if (!blend_pipeline) {
             CreatePipelines();
         }
-        EnsureImages(game_mask.size.width, game_mask.size.height);
+        EnsureImages(depth.size.width, depth.size.height);
 
         // The rectangle the light draw covers: its scissor, and its quad's bounds where they are
         // known.
@@ -730,7 +771,7 @@ struct BbLightShadows::Impl {
             ++stats.untraced;
             return {};
         }
-        if (rect.Pixels() == u64(game_mask.size.width) * game_mask.size.height) {
+        if (rect.Pixels() == u64(depth.size.width) * depth.size.height) {
             ++stats.whole_screen;
         }
         stats.blend_pixels += rect.Pixels();
@@ -762,7 +803,10 @@ struct BbLightShadows::Impl {
             .id = next_id++,
             .frame = frame,
             .push = push,
-            .textures = {textures[0], textures[1], textures[4]},
+            .textures = {textures[0], textures[1],
+                         vk::DescriptorImageInfo{.sampler = *mask_sampler,
+                                                 .imageView = textures[4].imageView,
+                                                 .imageLayout = textures[4].imageLayout}},
             .mask = mask->image,
             .vis = vis->image,
             .debug = debug->image,
@@ -1003,7 +1047,7 @@ struct BbLightShadows::Impl {
                 const std::array writes = {
                     image(0, T::eSampledImage, &textures[0]),
                     image(1, T::eSampledImage, &textures[1]),
-                    image(2, T::eSampledImage, &textures[2]),
+                    image(2, T::eCombinedImageSampler, &textures[2]),
                     image(3, T::eStorageImage, &mask_storage),
                     vk::WriteDescriptorSet{.dstBinding = 4,
                                            .descriptorCount = 1,
