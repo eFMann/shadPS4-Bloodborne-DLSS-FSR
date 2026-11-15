@@ -7,6 +7,8 @@
 #include <string>
 #include <string_view>
 
+#include <fmt/format.h>
+
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_fsr_upscaler.h"
@@ -23,20 +25,67 @@
 #endif
 #include "video_core/renderer_vulkan/vk_bb_library.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#pragma comment(lib, "version.lib")
+#endif
+
 namespace Vulkan {
 
 namespace {
 constexpr char FsrName[] = BB_LIBRARY_NAME("amd_fidelityfx_vk.dll", "libamd_fidelityfx_vk.so");
+
+std::filesystem::path AmdFsrDirectory() {
+    return BbLibrary::ExecutableDirectory() / "amd_fsr";
+}
+
+std::filesystem::path LoaderPath(FsrUpscaler::Runtime runtime) {
+    return runtime == FsrUpscaler::Runtime::AmdFsr
+               ? AmdFsrDirectory() / "amd_fidelityfx_loader_vk.dll"
+               : BbLibrary::ExecutableDirectory() / FsrName;
+}
 } // namespace
 
-bool FsrUpscaler::Present() {
-    static const bool present = [] {
+bool FsrUpscaler::Present(Runtime runtime) {
+    static const bool disabled = [] {
         const char* setting = std::getenv("SHADPS4_FSR");
-        if (setting && std::string_view{setting} == "0")
-            return false;
-        return std::filesystem::is_regular_file(BbLibrary::ExecutableDirectory() / FsrName);
+        return setting && std::string_view{setting} == "0";
     }();
-    return present;
+    static const bool fsr31 = std::filesystem::is_regular_file(LoaderPath(Runtime::Fsr31));
+#ifdef _WIN32
+    static const bool amd_fsr = std::filesystem::is_regular_file(LoaderPath(Runtime::AmdFsr));
+#else
+    constexpr bool amd_fsr = false; // AMD ships the FSR SDK 2.x runtime for Windows only
+#endif
+    return !disabled && (runtime == Runtime::AmdFsr ? amd_fsr : fsr31);
+}
+
+std::string FsrUpscaler::AmdFsrVersion() {
+#ifdef _WIN32
+    static const std::string version = []() -> std::string {
+        if (!Present(Runtime::AmdFsr))
+            return {};
+        const auto path = (AmdFsrDirectory() / "amd_fidelityfx_upscaler_vk.dll").wstring();
+        DWORD handle{};
+        const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
+        if (size == 0)
+            return {};
+        std::string data(size, '\0');
+        VS_FIXEDFILEINFO* info{};
+        UINT length{};
+        if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data()) ||
+            !VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &length) || !info)
+            return {};
+        return fmt::format("{}.{}.{}", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+                           HIWORD(info->dwFileVersionLS));
+    }();
+    return version;
+#else
+    return {};
+#endif
 }
 
 #if defined(_WIN32) || defined(__linux__)
@@ -125,9 +174,23 @@ FfxApiResource ToFfx(const DlssNgx::Resource& resource, bool writable) {
         writable ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS : FFX_API_RESOURCE_STATE_COMPUTE_READ;
     return result;
 }
+// FSR SDK 2.x renumbered the Vulkan backend description to
+// FFX_API_MAKE_BACKEND_SUB_ID(FFX_API_BACKEND_ID_VK, 0x03) and rejects the 1.x number. The struct
+// layout is unchanged, so the 1.1.4 headers serve both runtimes.
+constexpr ffxStructType_t AmdFsrBackendVkType = 0x01000003u;
+// SDK 2.1 and later want the upscaler API version the game was built against chained to the
+// context description (ffxCreateContextDescUpscaleVersion, absent from the 1.1.4 headers):
+// FFX_UPSCALER_VERSION of the pinned SDK 2.4.0, upscaler 4.1.2.
+struct AmdFsrUpscaleVersionDesc {
+    ffxCreateContextDescHeader header;
+    uint32_t version;
+};
+constexpr ffxStructType_t AmdFsrUpscaleVersionType = 0x0001000bu;
+constexpr uint32_t AmdFsrUpscalerVersion = (4u << 22) | (1u << 12) | 2u;
 } // namespace
 
 struct FsrUpscaler::Impl {
+    Runtime runtime{};
     void* module{};
     PfnFfxCreateContext create{};
     PfnFfxDestroyContext destroy{};
@@ -145,14 +208,17 @@ void* FsrUpscaler::FfxDeviceProcAddr() {
     return reinterpret_cast<void*>(&DeviceProcAddr);
 }
 
-std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance& instance) {
-    if (!Present())
+std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance& instance, Runtime runtime) {
+    if (!Present(runtime))
         return {};
     auto fsr = std::unique_ptr<FsrUpscaler>{new FsrUpscaler};
     auto& s = *fsr->impl;
-    s.module = BbLibrary::Load(BbLibrary::ExecutableDirectory() / FsrName);
+    s.runtime = runtime;
+    const auto path = LoaderPath(runtime);
+    const auto name = path.filename().string();
+    s.module = BbLibrary::Load(path);
     if (!s.module) {
-        LOG_WARNING(Render_Vulkan, "[FSR] {} could not be loaded", FsrName);
+        LOG_WARNING(Render_Vulkan, "[FSR] {} could not be loaded", name);
         return {};
     }
     s.create = BbLibrary::Find<PfnFfxCreateContext>(s.module, "ffxCreateContext");
@@ -160,7 +226,7 @@ std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance& instance) {
     s.query = BbLibrary::Find<PfnFfxQuery>(s.module, "ffxQuery");
     s.dispatch = BbLibrary::Find<PfnFfxDispatch>(s.module, "ffxDispatch");
     if (!s.create || !s.destroy || !s.query || !s.dispatch) {
-        LOG_WARNING(Render_Vulkan, "[FSR] {} is missing entry points", FsrName);
+        LOG_WARNING(Render_Vulkan, "[FSR] {} is missing entry points", name);
         BbLibrary::Free(s.module);
         s.module = {};
         return {};
@@ -168,7 +234,7 @@ std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance& instance) {
     s.device = instance.GetDevice();
     s.physical = instance.GetPhysicalDevice();
     BbTemporalDlssReportGpu(s.physical.getProperties().deviceName.data());
-    LOG_INFO(Render_Vulkan, "[FSR] Ready");
+    LOG_INFO(Render_Vulkan, "[FSR] Ready ({})", name);
     return fsr;
 }
 
@@ -184,13 +250,19 @@ bool FsrUpscaler::HasContext(const ContextDesc& desc) const {
 bool FsrUpscaler::CreateContext(const ContextDesc& desc) {
     DestroyContextAfterGpuDrain();
     ffxCreateBackendVKDesc backend{};
-    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+    backend.header.type = impl->runtime == Runtime::AmdFsr
+                              ? AmdFsrBackendVkType
+                              : FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     backend.vkDevice = impl->device;
     backend.vkPhysicalDevice = impl->physical;
     backend.vkDeviceProcAddr = DeviceProcAddr;
+    AmdFsrUpscaleVersionDesc version_desc{};
+    version_desc.header.type = AmdFsrUpscaleVersionType;
+    version_desc.header.pNext = &backend.header;
+    version_desc.version = AmdFsrUpscalerVersion;
     ffxCreateContextDescUpscale create{};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    create.header.pNext = &backend.header;
+    create.header.pNext = impl->runtime == Runtime::AmdFsr ? &version_desc.header : &backend.header;
     create.flags = (desc.hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
                                    (desc.auto_exposure ? FFX_UPSCALE_ENABLE_AUTO_EXPOSURE : 0u)
                              : FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE) |
@@ -260,7 +332,7 @@ bool FsrUpscaler::Evaluate(vk::CommandBuffer command, const DlssNgx::Resource& c
 struct FsrUpscaler::Impl {};
 FsrUpscaler::FsrUpscaler() = default;
 FsrUpscaler::~FsrUpscaler() = default;
-std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance&) {
+std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance&, Runtime) {
     return {};
 }
 bool FsrUpscaler::HasContext(const ContextDesc&) const {
