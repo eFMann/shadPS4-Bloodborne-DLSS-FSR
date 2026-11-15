@@ -26,9 +26,9 @@ struct BbDlss5Settings {
     float white_point_scale = 4.0f;
     float max_ratio = 2.0f;
     float working_scale = 1.0f;
-    u32 downscaler = 1; // 0 bilinear / area, 1 Lanczos 3
-    u32 debug_view = 0; // 1 what the model sees, 2 its answer, 3 the difference x20
-    u32 blending = 0;   // 0 default, 1 RenoDX's DLSS 5 add-on's (its SDR codec)
+    u32 downscaler = 1;    // 0 bilinear / area, 1 Lanczos 3
+    u32 debug_view = 0;    // 1 what the model sees, 2 its answer, 3 the difference x20
+    u32 blending = 0;      // 0 default, 1 RenoDX's DLSS 5 add-on's (its SDR codec)
     u32 black_restore = 1; // RenoDX: 0 off, 1 dark blocks, 2 every block, 3 dark blocks smoothly
     // Read by the model when it starts: a change starts it again (after a short pause).
     u32 preset = 1; // 1 the full network, 2 and 0 (NVIDIA's default) a smaller one, 3
