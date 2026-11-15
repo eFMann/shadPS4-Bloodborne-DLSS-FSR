@@ -24,6 +24,8 @@ class BbNeuralRendering {
 public:
     // A backend's files are present and SHADPS4_NR is not "0"; Windows only.
     static bool Present();
+    // A backend started on this GPU and is still loaded: DLSS 5 runs on it.
+    static bool Ready();
     // The loaded backend's installed networks, in the order automatic tries them; empty until
     // Load has run.
     static const std::vector<std::string>& Networks();

@@ -45,8 +45,9 @@ struct BbDlssStatus {
     std::string gpu;
     bool fsr4_installed{};
     std::string amd_fsr_label; // F1 name of the AMD FSR runtime, empty when it is not installed
-    bool nr_installed{};       // the DLSS 5 neural rendering add-on and its model are present
-    std::string nr_state;      // what neural rendering is doing, in plain words
+    bool nr_installed{};       // the AMD DLSS 5 add-on (dlssnr-amd) and its model are present
+    bool nr_ready{};           // it started on this GPU: DLSS 5 runs on it, not NVIDIA's model
+    std::string nr_state;      // what the AMD DLSS 5 engine is doing, in plain words
     bool decoupled{}; // the Decoupled UI patch: the scene is upscaled to the game's UI size
     u32 render_width{}, render_height{}, output_width{}, output_height{};
 };

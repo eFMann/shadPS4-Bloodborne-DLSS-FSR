@@ -104,7 +104,7 @@ bool ParseBbDlss5Setting(BbDlss5Settings& s, std::string_view key, std::string_v
     else if (key == "dlss5_max_ratio")
         s.max_ratio = std::clamp(Number(value, 2.0f), 1.0f, 16.0f);
     else if (key == "dlss5_working_scale")
-        s.working_scale = std::clamp(Number(value, 1.0f), 0.5f, 2.0f);
+        s.working_scale = std::clamp(Number(value, 1.0f), 0.33f, 2.0f);
     else if (key == "dlss5_downscaler")
         s.downscaler = number != 0.0f ? 1 : 0;
     else if (key == "dlss5_debug_view")

@@ -140,14 +140,17 @@ Nothing from NVIDIA is included: the model comes from your own `nvngx_dlssnr.dll
 2. Drop your `nvngx_dlssnr.dll` (NVIDIA's own 310.9.16, for example from NBA 2K27, or 310.8.0;
    modified copies are refused) or a zip that contains it on `dlssnr-amd\install-model.bat`. It
    makes the model in that folder; 310.9.16 gives both networks, 310.8.0 CC_SILVER_AARDWOLD only.
-3. Pick AMD FSR in F1 and tick *Neural rendering*, or set `nr=1` in `dlss.ini`. F1 also sets the
-   network, its resolution (`nr_scale`, 0.33 to 1) and the intensity (`nr_intensity`, 0 to 2).
+3. Pick AMD FSR in F1's Main tab, then tick *DLSS 5* in F1's DLSS 5 tab. It takes the same
+   settings as on NVIDIA: Preset 1 is the CC_SILVER_AARDWOLD network and Preset 2 CC_SMALL_FP8,
+   plus model strength, resolution (0.33 to 1 of the render size), style, detail, local contrast,
+   skin detail, auto mask, passes, colour blend and black level. What has no AMD counterpart is
+   greyed out; the rest of `dlssnr-amd.ini`'s `[RenoDX]` still applies.
 
 The first start builds the network while the game runs normally (about 80 seconds on an
 RX 9070 XT); it is cached in `dlssnr-amd`, so later starts take a few seconds. F1 shows when it is
 ready and what it costs. Delete `dlssnr-amd\shadps4_nr.dll` to remove it. While that
-file is there, the GPU device is set up for the network even with *Neural rendering* off in F1,
-which only skips the pass; to compare a problem without NR, rename the file instead.
+file is there, the GPU device is set up for the network even with *DLSS 5* off in F1, which only
+skips the pass; to compare a problem without it, rename the file instead.
 
 ### Frame generation
 

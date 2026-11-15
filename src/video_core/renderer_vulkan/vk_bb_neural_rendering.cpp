@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -28,6 +29,7 @@ struct BackendFiles {
 constexpr std::array Backends{BackendFiles{"dlssnr-amd", "dlssnr.bin"}};
 
 std::vector<std::string> loaded_networks;
+std::atomic<bool> ready{false};
 
 std::filesystem::path Folder(const BackendFiles& backend) {
     return BbLibrary::ExecutableDirectory() / backend.folder;
@@ -67,6 +69,10 @@ void UnlockQueue(void*) {
 
 bool BbNeuralRendering::Present() {
     return Installed() != nullptr;
+}
+
+bool BbNeuralRendering::Ready() {
+    return ready.load(std::memory_order_relaxed);
 }
 
 const std::vector<std::string>& BbNeuralRendering::Networks() {
@@ -122,6 +128,7 @@ std::unique_ptr<BbNeuralRendering> BbNeuralRendering::Load() {
 }
 
 BbNeuralRendering::~BbNeuralRendering() {
+    ready.store(false, std::memory_order_relaxed);
     if (api.shutdown)
         api.shutdown();
     // Once the device was made through it, the model's detached threads may still run its code:
@@ -148,12 +155,13 @@ bool BbNeuralRendering::Init(vk::Instance instance, vk::PhysicalDevice physical,
     const auto result =
         api.init(static_cast<VkInstance>(instance), static_cast<VkPhysicalDevice>(physical),
                  static_cast<VkDevice>(device), queue_family, LockQueue, UnlockQueue, nullptr);
-    const bool ready = result == 0;
-    if (ready)
+    const bool started = result == 0;
+    if (started)
         LOG_INFO(Render_Vulkan, "[NR] Ready on queue family {}", queue_family);
     else
         LOG_WARNING(Render_Vulkan, "[NR] {} did not start (see its log); NR off", info.name);
-    return ready;
+    ready.store(started, std::memory_order_relaxed);
+    return started;
 }
 
 bool BbNeuralRendering::Evaluate(vk::CommandBuffer command, const ShadNrFrame& frame,

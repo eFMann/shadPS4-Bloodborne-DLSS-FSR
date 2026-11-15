@@ -21,7 +21,7 @@
 #define SHADPS4_NR_API
 #endif
 
-#define SHADPS4_NR_ABI_VERSION 3u
+#define SHADPS4_NR_ABI_VERSION 4u
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,10 +42,21 @@ typedef struct ShadNrFrame {
     uint32_t depth_inverted, reset;
 } ShadNrFrame;
 
+// F1's DLSS 5 tab, the same settings NVIDIA's model takes (OptiScaler's [DlssNr] names).
 typedef struct ShadNrSettings {
-    int32_t network; // index into ShadNrInfo.networks; -1 automatic (the first)
-    float scale;     // the network's resolution, 0.33 to 1 of the frame
-    float intensity; // 0 to 2
+    int32_t network;       // index into ShadNrInfo.networks; -1 automatic (the first)
+    float scale;           // the network's resolution, 0.33 to 1 of the frame
+    float intensity;       // 0 to 2 (Intensity)
+    uint32_t style;        // 0 to 2 (Style)
+    float local_structure; // 0 to 2 (LocalStructure)
+    float local_tone;      // 0 to 2 (LocalTone)
+    float skin_structure;  // below 0: the stock (SkinStructure)
+    uint32_t auto_mask;    // (AutoMask)
+    uint32_t passes;       // 1 to 4, each over the last one's answer (Passes)
+    float colour_strength; // 0: only the network's brightness, 1: its answer as it is
+    // The grey the network lifts into blacks taken out again: 0 off, 1 in dark blocks, 2 in every
+    // block, 3 in dark blocks with a smooth edge (RenoDX's NRSdrBlackRestore 0, 1, 2 plus off).
+    uint32_t black_restore;
 } ShadNrSettings;
 
 enum { SHADNR_IDLE = 0, SHADNR_BUILDING = 1, SHADNR_RUNNING = 2, SHADNR_FAILED = 3 };
@@ -63,7 +74,7 @@ enum {
 typedef struct ShadNrInfo {
     char name[32];      // for the log, e.g. "DLSSNR-AMD"
     uint32_t upscalers; // SHADNR_BEFORE_* bits
-    // The installed networks by name (what F1 lists and dlss.ini's nr_network holds), in the order
+    // The installed networks by name (what F1's DLSS 5 presets pick from), in the order
     // automatic tries them.
     uint32_t network_count;
     char networks[SHADNR_MAX_NETWORKS][32];
@@ -106,7 +117,7 @@ SHADPS4_NR_API void shadps4_nr_shutdown(void);
 }
 static_assert(sizeof(ShadNrImage) == 32, "ShadNrImage layout");
 static_assert(sizeof(ShadNrFrame) == 128, "ShadNrFrame layout");
-static_assert(sizeof(ShadNrSettings) == 12, "ShadNrSettings layout");
+static_assert(sizeof(ShadNrSettings) == 44, "ShadNrSettings layout");
 static_assert(sizeof(ShadNrStatus) == 276, "ShadNrStatus layout");
 static_assert(sizeof(ShadNrInfo) == 296, "ShadNrInfo layout");
 #endif

@@ -228,9 +228,32 @@ SHADPS4_NR_API int32_t shadps4_nr_evaluate(VkCommandBuffer cmd, const ShadNrFram
             g_width = frame->width;
             g_height = frame->height;
         }
+        // dlssnr-amd.ini's [RenoDX] for everything F1's DLSS 5 tab does not set.
         nr::renodx::Settings values = RenoDXSettings();
         values.intensity = settings->intensity;
         values.resolution_scale = settings->scale;
+        values.style = settings->style;
+        values.local_structure = settings->local_structure;
+        values.local_tone = settings->local_tone;
+        values.skin_structure = settings->skin_structure;
+        values.auto_mask = settings->auto_mask != 0;
+        values.passes = settings->passes < 1 ? 1u : settings->passes > 4 ? 4u : settings->passes;
+        for (int k = 0; k < 3; ++k) {
+            values.pass_follow[k] = true; // every pass with pass 1's controls, as on NVIDIA
+            values.pass_intensity[k] = settings->intensity;
+            values.pass_color[k] = settings->colour_strength;
+        }
+        values.color_strength = settings->colour_strength;
+        // The black-level restore runs with the codec on (NRCodecMode not 0).
+        if (settings->black_restore == 0) {
+            values.codec_mode = 0;
+        } else {
+            if (values.codec_mode == 0)
+                values.codec_mode = 2;
+            values.sdr_black_restore = settings->black_restore == 2 ? 1u
+                                       : settings->black_restore == 3 ? 2u
+                                                                      : 0u;
+        }
         g_network = NetworkChoice(settings->network);
 
         namespace route = nr::pe::renodx_route;

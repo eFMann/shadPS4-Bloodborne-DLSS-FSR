@@ -40,8 +40,6 @@
 #include "input/input_mouse.h"
 #include "video_core/renderer_vulkan/vk_bb_dlss5.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
-#include "video_core/renderer_vulkan/vk_bb_neural_rendering.h"
-#include "video_core/renderer_vulkan/vk_bb_nr_settings.h"
 #include "video_core/renderer_vulkan/vk_bb_perf_meter.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
@@ -209,22 +207,35 @@ const char* Dlss5Fallback(const char* key) {
 // Each setting's tooltip ends with its name in OptiScaler's [DlssNr], to compare with guides.
 void DrawDlss5Tab(SettingsFile& settings) {
     const auto status = Vulkan::BbDlss5GetStatus();
-    if (status.running) {
-        TextColored({0.4f, 1.0f, 0.4f, 1.0f}, "Running");
-        SameLine();
-        Text("model %ux%u on the %ux%u image", status.model_width, status.model_height,
-             status.width, status.height);
-    } else if (status.enabled) {
-        TextColored({1.0f, 0.75f, 0.3f, 1.0f}, "Not running");
-        if (!status.problem.empty())
-            TextWrapped("%s", status.problem.c_str());
-    }
-    TextWrapped("NVIDIA's neural rendering model over the game's image, before the HUD and frame "
-                "generation. It needs an RTX card and nvngx_dlssnr.dll next to shadPS4.exe, which "
-                "is not included. It costs a lot of GPU time, and it runs only while upscaling is "
-                "active (Main tab).");
-
+    // The AMD engine (the dlssnr-amd add-on, DLSSNR-AMD's network) when it started on this GPU.
+    const auto upscaling = Vulkan::BbTemporalDlssStatus();
+    const bool amd = upscaling.nr_ready;
     bool enabled = settings.Get("dlss5", "0") == "1";
+    if (amd) {
+        if (enabled && !upscaling.nr_state.empty())
+            TextWrapped("AMD engine: %s", upscaling.nr_state.c_str());
+        TextWrapped("DLSSNR-AMD's version of NVIDIA's neural rendering model (mochizuki0323, "
+                    "MIT; the dlssnr-amd add-on) on the image before upscaling. Settings it has no "
+                    "counterpart for are greyed out. It costs a lot of GPU time, and it runs only "
+                    "while upscaling is active (Main tab).");
+    } else {
+        if (status.running) {
+            TextColored({0.4f, 1.0f, 0.4f, 1.0f}, "Running");
+            SameLine();
+            Text("model %ux%u on the %ux%u image", status.model_width, status.model_height,
+                 status.width, status.height);
+        } else if (status.enabled) {
+            TextColored({1.0f, 0.75f, 0.3f, 1.0f}, "Not running");
+            if (!status.problem.empty())
+                TextWrapped("%s", status.problem.c_str());
+        }
+        TextWrapped("NVIDIA's neural rendering model over the game's image, before the HUD and "
+                    "frame generation. It needs an RTX card and nvngx_dlssnr.dll next to "
+                    "shadPS4.exe, which is not included (on a Radeon RX 9000: the dlssnr-amd "
+                    "add-on). It costs a lot of GPU time, and it runs only while upscaling is "
+                    "active (Main tab).");
+    }
+
     if (Checkbox("DLSS 5", &enabled))
         settings.Set("dlss5", enabled ? "1" : "0");
 
@@ -254,7 +265,9 @@ void DrawDlss5Tab(SettingsFile& settings) {
     SeparatorText("The model (it restarts after a change)");
     static constexpr std::array WhereNames{"Before upscaling (faster)", "After upscaling"};
     {
-        int index = number("dlss5_before_upscale") != 0.0f ? 0 : 1;
+        // The AMD engine always runs before upscaling.
+        BeginDisabled(amd);
+        int index = amd || number("dlss5_before_upscale") != 0.0f ? 0 : 1;
         SetNextItemWidth(Px(200.0f));
         if (Combo("Runs", &index, WhereNames.data(), int(WhereNames.size())))
             settings.Set("dlss5_before_upscale", index == 0 ? "1" : "0");
@@ -264,7 +277,9 @@ void DrawDlss5Tab(SettingsFile& settings) {
                        "upscaling: on the full output image.\nWith a Decoupled UI patch it always "
                        "runs on the game's finished frame before the HUD; Before upscaling then "
                        "runs the model at the render size, as cheap as before.\n"
+                       "AMD: always before upscaling.\n"
                        "(DLSS5OneClick's ReShade NRHookPoint: Render / Upscaled)");
+        EndDisabled();
     }
     static constexpr std::array StyleNames{"Standard (default)", "Natural", "Cinematic"};
     choice("Style", "dlss5_style", StyleNames, 0,
@@ -284,15 +299,19 @@ void DrawDlss5Tab(SettingsFile& settings) {
         for (size_t i = 0; i < Dlss5PresetValues.size(); ++i)
             if (Dlss5PresetValues[i] == preset)
                 index = int(i);
+        // The AMD engine has the networks of presets 1 and 2 only.
+        const int listed = amd ? 2 : int(Dlss5PresetNames.size());
         SetNextItemWidth(Px(200.0f));
-        if (Combo("Preset", &index, Dlss5PresetNames.data(), int(Dlss5PresetNames.size())))
+        if (Combo("Preset", &index, Dlss5PresetNames.data(), listed))
             settings.Set("dlss5_preset", std::to_string(Dlss5PresetValues[index]));
         if (IsItemHovered())
             SetTooltip("Which network the model runs. Preset 1 is the full network (the one of "
                        "the older 310.8 library): by far the most visible, especially on faces, "
                        "and the most GPU time. Preset 2, NVIDIA's default, is a smaller, faster "
                        "network that changes much less. Preset 3 is undocumented and "
-                       "looks like the smaller one.\n(Preset)");
+                       "looks like the smaller one.\nAMD: the same two networks "
+                       "(CC_SILVER_AARDWOLD and CC_SMALL_FP8), when the add-on's model has "
+                       "them.\n(Preset)");
     }
     slider("Model strength", "dlss5_intensity", 0.0f, 2.0f,
            "How strongly the model reworks the image: the main strength setting.\n(Intensity)");
@@ -324,18 +343,21 @@ void DrawDlss5Tab(SettingsFile& settings) {
            "model of its own: more video memory too.\n(Passes, NRPasses)");
     {
         // In steps of 0.05: a size just off the image's (0.99) shifted the model's colours.
-        float scale = number("dlss5_working_scale");
+        // The AMD engine runs at a part of the render size, at most all of it.
+        const float low = amd ? 0.33f : 0.5f, high = amd ? 1.0f : 2.0f;
+        float scale = std::clamp(number("dlss5_working_scale"), low, high);
         SetNextItemWidth(Px(200.0f));
-        if (SliderFloat("Model resolution", &scale, 0.5f, 2.0f, "%.2f"))
+        if (SliderFloat("Model resolution", &scale, low, high, "%.2f"))
             settings.Set("dlss5_working_scale",
                          fmt::format("{:.2f}", std::round(scale * 20.0f) / 20.0f));
         if (IsItemHovered())
             SetTooltip("The model's resolution against the image: below 1 faster, above 1 "
                        "supersampled. Keep it at 1 unless you need the speed: other sizes can "
-                       "change the colours.\n(WorkingScale)");
+                       "change the colours.\nAMD: 0.33 to 1 of the render size.\n"
+                       "(WorkingScale, NRResolutionScale)");
     }
     static constexpr std::array DownscalerNames{"Bilinear", "Lanczos 3"};
-    BeginDisabled(number("dlss5_working_scale") == 1.0f);
+    BeginDisabled(amd || number("dlss5_working_scale") == 1.0f);
     choice("Resize filter", "dlss5_downscaler", DownscalerNames, 0,
            "How the image is resized for the model and back when Model resolution isn't "
            "1.\n(ScalingDownscaler)");
@@ -343,15 +365,26 @@ void DrawDlss5Tab(SettingsFile& settings) {
 
     SeparatorText("Blending into the image (applies at once)");
     static constexpr std::array BlendingNames{"Default", "RenoDX"};
-    choice("Blending", "dlss5_blending", BlendingNames, 0,
-           "How the model is shown the image and how its answer goes back in.\nDefault: shown in "
-           "light scaled to a white point; only the change it makes to brightness and colour is "
-           "applied to the image.\nRenoDX: the way RenoDX's DLSS 5 add-on (Carlos Lopez Jr., "
-           "MIT) does it for an SDR game: shown the picture as displayed, its answer goes in "
-           "whole, and the grey it lifts into dark areas is taken out again.\n(RenoDX)");
-    const bool renodx = number("dlss5_blending") != 0.0f;
+    // The AMD engine blends the RenoDX way only.
+    BeginDisabled(amd);
+    if (amd) {
+        int renodx_index = 1;
+        SetNextItemWidth(Px(200.0f));
+        Combo("Blending", &renodx_index, BlendingNames.data(), int(BlendingNames.size()));
+    } else {
+        choice(
+            "Blending", "dlss5_blending", BlendingNames, 0,
+            "How the model is shown the image and how its answer goes back in.\nDefault: shown in "
+            "light scaled to a white point; only the change it makes to brightness and colour is "
+            "applied to the image.\nRenoDX: the way RenoDX's DLSS 5 add-on (Carlos Lopez Jr., "
+            "MIT) does it for an SDR game: shown the picture as displayed, its answer goes in "
+            "whole, and the grey it lifts into dark areas is taken out again.\nAMD: RenoDX "
+            "only.\n(RenoDX)");
+    }
+    EndDisabled();
+    const bool renodx = amd || number("dlss5_blending") != 0.0f;
     // RenoDX's SDR codec has no brightness blend, limit or white point; an HDR image uses two.
-    BeginDisabled(renodx && !status.hdr);
+    BeginDisabled(renodx && (amd || !status.hdr));
     slider("Brightness blend", "dlss5_transfer_strength", 0.0f, 2.0f,
            "How much of the model's change to brightness is kept: 0 none, 1 all of it, above 1 "
            "exaggerated. Not the model's strength (that's Model strength above). RenoDX: HDR "
@@ -367,7 +400,7 @@ void DrawDlss5Tab(SettingsFile& settings) {
            "The most the model may brighten a pixel, so lamps don't turn into flat patches. "
            "RenoDX: fixed at 4.\n(MaxRatio)");
     EndDisabled();
-    BeginDisabled(renodx && !status.hdr);
+    BeginDisabled(renodx && (amd || !status.hdr));
     slider("Input white point", "dlss5_white_point_scale", 0.5f, 16.0f,
            "How bright the image shown to the model is. Higher: it sees a darker image and "
            "darkens less in return (faces stop going dark). Lower: the opposite. RenoDX: HDR "
@@ -385,8 +418,11 @@ void DrawDlss5Tab(SettingsFile& settings) {
     }
     static constexpr std::array DebugNames{"Off", "What the model sees", "The model's answer",
                                            "Difference x20"};
+    BeginDisabled(amd);
     choice("Debug view", "dlss5_debug_view", DebugNames, 0,
-           "Shows the model's input, its raw answer, or how much it changed.\n(DebugView)");
+           "Shows the model's input, its raw answer, or how much it changed. NVIDIA only.\n"
+           "(DebugView)");
+    EndDisabled();
     if (Button("Reset to defaults"))
         for (const auto& entry : Dlss5Defaults)
             settings.Set(entry.key, entry.value);
@@ -1137,42 +1173,6 @@ void DlssLayer::DrawWindow() {
         float sharpness = float(std::atof(settings.Get("sharpness", "0.6").c_str()));
         if (SliderFloat("Sharpness", &sharpness, 0.0f, 1.0f, "%.2f"))
             settings.Set("sharpness", fmt::format("{:.2f}", sharpness));
-
-        if (status.nr_installed) {
-            SeparatorText("DLSS 5 NR");
-            bool nr = settings.Get("nr", "0") != "0";
-            if (Checkbox("Neural rendering", &nr))
-                settings.Set("nr", nr ? "1" : "0");
-            Vulkan::BbNrSettings nr_settings;
-            for (const char* key : {"nr_network", "nr_scale", "nr_intensity"})
-                Vulkan::ParseBbNrSetting(key, settings.Get(key, ""), nr_settings);
-            // The backend's installed networks, as it names them.
-            const auto& networks = Vulkan::BbNeuralRendering::Networks();
-            const int network = Vulkan::BbNeuralRendering::NetworkIndex(nr_settings.network);
-            if (BeginCombo("Network", network < 0 ? "Automatic" : networks[network].c_str())) {
-                if (Selectable("Automatic", network < 0))
-                    settings.Set("nr_network", "auto");
-                for (int i = 0; i < int(networks.size()); ++i)
-                    if (Selectable(networks[i].c_str(), i == network))
-                        settings.Set("nr_network", networks[i]);
-                EndCombo();
-            }
-            float nr_scale = nr_settings.scale;
-            if (SliderFloat("Network resolution", &nr_scale, Vulkan::BbNrScaleMin,
-                            Vulkan::BbNrScaleMax, "%.2f", ImGuiSliderFlags_AlwaysClamp))
-                settings.Set("nr_scale", fmt::format("{:.2f}", nr_scale));
-            float nr_intensity = nr_settings.intensity;
-            if (SliderFloat("Intensity", &nr_intensity, 0.0f, Vulkan::BbNrIntensityMax, "%.2f",
-                            ImGuiSliderFlags_AlwaysClamp))
-                settings.Set("nr_intensity", fmt::format("{:.2f}", nr_intensity));
-            // Wrapped: the add-on's messages run longer than the window is wide.
-            if (!status.nr_state.empty()) {
-                PushStyleColor(ImGuiCol_Text, GetStyleColorVec4(ImGuiCol_TextDisabled));
-                TextWrapped("%s", status.nr_state.c_str());
-                PopStyleColor();
-            }
-            Separator();
-        }
 
         if (Vulkan::RenoDxLoaded()) {
             bool hdr_compat = settings.Get("hdr_mod_compat", "1") != "0";

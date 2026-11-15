@@ -39,7 +39,6 @@
 #include "video_core/renderer_vulkan/vk_bb_dlss5.h"
 #include "video_core/renderer_vulkan/vk_bb_library.h"
 #include "video_core/renderer_vulkan/vk_bb_neural_rendering.h"
-#include "video_core/renderer_vulkan/vk_bb_nr_settings.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
 #include "video_core/renderer_vulkan/vk_bb_stage_census.h"
@@ -112,6 +111,7 @@ BbDlssStatus BbTemporalDlssStatus() {
     copy.fsr4_installed = Fsr4Addon::Present();
     copy.amd_fsr_label = amd_fsr_label;
     copy.nr_installed = BbNeuralRendering::Present();
+    copy.nr_ready = BbNeuralRendering::Ready();
     if (!BbTemporalDlssRequested())
         copy.reason =
             "No upscaler files were found next to " BB_LIBRARY_NAME("shadPS4.exe", "shadps4") ".";
@@ -445,15 +445,6 @@ enabled=1
 # or dlss, fsr4, fsr, amdfsr (AMD FSR 4.1, never picked by auto)
 upscaler=auto
 
-# DLSS 5 neural rendering before the upscaler, from a backend folder next to shadPS4.exe
-# (dlssnr-amd: RX 9000, before AMD FSR 4.1):
-# 1 = on; network auto or one F1 lists (e.g. CC_SMALL_FP8); scale 0.33 to 1 (the network's
-# resolution); intensity 0 to 2
-nr=0
-nr_network=auto
-nr_scale=0.67
-nr_intensity=1
-
 # DLSS model: 13 = M, 11 = K, 10 = J, 12 = L, 0 = NVIDIA default
 preset=13
 
@@ -513,7 +504,6 @@ struct Tune {
     BbDlss5Settings dlss5;
     // Picture tuning (bb_picture.comp): 1, 1, 1 and 0 leave the picture alone.
     float brightness = 1.0f, contrast = 1.0f, saturation = 1.0f, black = 0.0f;
-    BbNrSettings nr; // DLSS 5 neural rendering before AMD FSR
 };
 
 enum class Backend { None, Dlss, Fsr, Fsr4, AmdFsr };
@@ -777,13 +767,10 @@ struct BbTemporalDlss::Impl {
             const auto key = line.substr(0, eq);
             const auto value = line.substr(eq + 1);
             const int number = std::atoi(value.c_str());
-            if (ParseBbDlss5Setting(next.dlss5, key, value) ||
-                ParseBbNrSetting(key, value, next.nr))
+            if (ParseBbDlss5Setting(next.dlss5, key, value))
                 continue;
             if (key == "enabled")
                 next.enabled = number != 0;
-            else if (key == "nr")
-                next.nr.enabled = number != 0;
             else if (key == "jitter")
                 next.jitter = number != 0;
             else if (key == "jitter_small")
@@ -867,12 +854,10 @@ struct BbTemporalDlss::Impl {
         LOG_INFO(Render_Vulkan,
                  "[DLSS-TEMPORAL] Settings: enabled={} upscaler={} jitter={} sign=({},{}) "
                  "object_motion={} character_motion={} texture_lod_bias={} hud={} "
-                 "debug_motion={} quality={} output={}x{} nr={} nr_network={} nr_scale={:.2f} "
-                 "nr_intensity={:.2f}",
+                 "debug_motion={} quality={} output={}x{}",
                  tune.enabled, tune.upscaler, tune.jitter, tune.sign_x, tune.sign_y, tune.mirror,
                  tune.character_motion, tune.texture_lod_bias, tune.hud, tune.debug_motion,
-                 tune.quality, tune.output.width, tune.output.height, tune.nr.enabled,
-                 tune.nr.network, tune.nr.scale, tune.nr.intensity);
+                 tune.quality, tune.output.width, tune.output.height);
     }
 
     // The network's frame: a copy of the upscaler's input in nr_color (GENERAL), which the network
@@ -927,8 +912,34 @@ struct BbTemporalDlss::Impl {
         };
     }
 
+    // F1's DLSS 5 settings for the AMD engine. Its two networks are NVIDIA's presets 1 and 2
+    // (DLSSNR-AMD's notes); preset 3 has none, so the add-on's automatic choice. It runs at a
+    // part of the render size, at most all of it.
     ShadNrSettings NrSettings() const {
-        return {BbNeuralRendering::NetworkIndex(tune.nr.network), tune.nr.scale, tune.nr.intensity};
+        const auto& d = tune.dlss5;
+        const char* network = d.preset == 1   ? "CC_SILVER_AARDWOLD"
+                              : d.preset == 3 ? ""
+                                              : "CC_SMALL_FP8";
+        return ShadNrSettings{
+            .network = BbNeuralRendering::NetworkIndex(network),
+            .scale = std::clamp(d.working_scale, 0.33f, 1.0f),
+            .intensity = d.intensity,
+            .style = d.style,
+            .local_structure = d.local_structure,
+            .local_tone = d.local_tone,
+            .skin_structure = d.skin_structure,
+            .auto_mask = d.auto_mask ? 1u : 0u,
+            .passes = d.passes,
+            .colour_strength = d.colour_strength,
+            .black_restore = d.black_restore,
+        };
+    }
+
+    // NVIDIA's DLSS 5 settings: off when the AMD engine runs DLSS 5 instead.
+    BbDlss5Settings NvidiaDlss5(const Instance& instance) const {
+        auto settings = tune.dlss5;
+        settings.enabled = settings.enabled && !instance.GetNeuralRendering();
+        return settings;
     }
 
     void StopNeuralRendering(BbNeuralRendering& neural) {
@@ -956,7 +967,7 @@ struct BbTemporalDlss::Impl {
             return "did not start (see the log)";
         if (nr_failure)
             return "failed: " + *nr_failure;
-        if (!tune.nr.enabled)
+        if (!tune.dlss5.enabled)
             return "off";
         if (!neural->RunsBefore(NrUpscaler(backend)))
             return fmt::format("not with {}", BackendName(backend));
@@ -1528,7 +1539,7 @@ struct BbTemporalDlss::Impl {
     void FinishFrame(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
                      VideoCore::TextureCache& cache, VideoCore::Image& target) {
         finished_done = true;
-        if (!guides.valid || !last_copy_view || (!tune.dlss5.enabled && !PictureTuned()))
+        if (!guides.valid || !last_copy_view || (!NvidiaDlss5(instance).enabled && !PictureTuned()))
             return;
         const auto& read_info = *last_copy_view;
         const bool srgb_view = read_info.format == vk::Format::eR8G8B8A8Srgb ||
@@ -1604,7 +1615,7 @@ struct BbTemporalDlss::Impl {
                                      .depth_inverted = tune.depth_inverted,
                                      .reset = guides.reset};
         // "Before upscaling" keeps its cost here: the model works at the render size.
-        auto settings = tune.dlss5;
+        auto settings = NvidiaDlss5(instance);
         if (settings.before_upscale && render.width && render.width < size.width)
             settings.working_scale *= float(render.width) / float(size.width);
         dlss5.Apply(instance, scheduler, settings, neural);
@@ -2187,7 +2198,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     // picture tuning work on its finished frame instead (FinishFrame). RenoDX's float target
     // keeps the old way.
     const bool on_finished = upscale_to.has_value() && !RenoDxLoaded();
-    const bool neural_before = !on_finished && tune.dlss5.enabled && tune.dlss5.before_upscale;
+    const auto nvidia_dlss5 = NvidiaDlss5(instance);
+    const bool neural_before = !on_finished && nvidia_dlss5.enabled && nvidia_dlss5.before_upscale;
     const bool own_input = linear || neural_before;
     if (own_input) {
         linear_color->Transit(command, vk::ImageLayout::eGeneral,
@@ -2232,8 +2244,9 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     auto* const neural = instance.GetNeuralRendering();
     OwnedImage& upscaler_input = *(own_input ? linear_color : snapshot);
     const bool nr_input_matches = nr_color && nr_color->format == upscaler_input.format;
-    const bool nr_active = tune.nr.enabled && neural && neural->RunsBefore(NrUpscaler(backend)) &&
-                           nr_input_matches && !nr_failure;
+    const bool nr_active = tune.dlss5.enabled && neural &&
+                           neural->RunsBefore(NrUpscaler(backend)) && nr_input_matches &&
+                           !nr_failure;
     if (nr_active != nr_was_active)
         history_valid = false;
     nr_was_active = nr_active;
@@ -2257,7 +2270,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                                      .motion = motion->Resource(),
                                      .depth_inverted = tune.depth_inverted,
                                      .reset = reset};
-        if (dlss5.Apply(instance, scheduler, tune.dlss5, neural))
+        if (dlss5.Apply(instance, scheduler, nvidia_dlss5, neural))
             scheduler.GetDynamicState().Invalidate();
         linear_color->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
                               vk::PipelineStageFlagBits2::eComputeShader,
@@ -2343,7 +2356,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                                      .motion = motion->Resource(),
                                      .depth_inverted = tune.depth_inverted,
                                      .reset = reset};
-        if (dlss5.Apply(instance, scheduler, tune.dlss5, neural))
+        if (dlss5.Apply(instance, scheduler, nvidia_dlss5, neural))
             scheduler.GetDynamicState().Invalidate();
     }
     if (!on_finished)
